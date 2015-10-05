@@ -14,6 +14,9 @@
 #include <linux/module.h>
 #include <linux/ftrace.h>
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/core.h>
+
 #include "trace.h"
 
 static struct trace_array		*irqsoff_trace __read_mostly;
@@ -328,6 +331,8 @@ check_critical_timing(struct trace_array *tr,
 		/* Skip 5 functions to get to the irq/preempt enable function */
 		__trace_stack(tr, flags, 5, pc);
 	}
+	trace_core_critical_timing_hit(CALLER_ADDR0, parent_ip,
+			data->critical_start, flags, pc, delta);
 
 	if (data->critical_sequence != max_sequence)
 		goto out_unlock;
@@ -354,7 +359,7 @@ out:
 static inline void
 start_critical_timing(unsigned long ip, unsigned long parent_ip)
 {
-	int cpu;
+	int cpu, pc;
 	struct trace_array *tr = irqsoff_trace;
 	struct trace_array_cpu *data;
 	unsigned long flags;
@@ -380,9 +385,10 @@ start_critical_timing(unsigned long ip, unsigned long parent_ip)
 
 	local_save_flags(flags);
 
+	pc = preempt_count();
 	if (!is_quiet(tr))
-		__trace_function(tr, ip, parent_ip, flags, preempt_count());
-
+		__trace_function(tr, ip, parent_ip, flags, pc);
+	trace_core_critical_timing_start(ip, parent_ip, flags, pc);
 	per_cpu(tracing_cpu, cpu) = 1;
 
 	atomic_dec(&data->disabled);
@@ -391,7 +397,7 @@ start_critical_timing(unsigned long ip, unsigned long parent_ip)
 static inline void
 stop_critical_timing(unsigned long ip, unsigned long parent_ip)
 {
-	int cpu;
+	int cpu, pc;
 	struct trace_array *tr = irqsoff_trace;
 	struct trace_array_cpu *data;
 	unsigned long flags;
@@ -415,8 +421,10 @@ stop_critical_timing(unsigned long ip, unsigned long parent_ip)
 	atomic_inc(&data->disabled);
 
 	local_save_flags(flags);
+	pc = preempt_count();
 	if (!is_quiet(tr))
-		__trace_function(tr, ip, parent_ip, flags, preempt_count());
+		__trace_function(tr, ip, parent_ip, flags, pc);
+	trace_core_critical_timing_stop(ip, parent_ip, flags, pc);
 	check_critical_timing(tr, data, parent_ip ? : ip, cpu);
 	data->critical_start = 0;
 	atomic_dec(&data->disabled);
