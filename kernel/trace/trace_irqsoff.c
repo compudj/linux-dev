@@ -67,6 +67,8 @@ static inline int irqsoff_display_graph(struct trace_array *tr, int set)
 # define is_graph(tr) false
 #endif
 
+#define is_quiet(tr)	((tr)->trace_flags & TRACE_ITER_QUIET)
+
 /*
  * Sequence count - we record it when starting a measurement and
  * skip the latency if the sequence has changed - some other section
@@ -321,9 +323,11 @@ check_critical_timing(struct trace_array *tr,
 	if (!report_latency(tr, delta))
 		goto out_unlock;
 
-	__trace_function(tr, CALLER_ADDR0, parent_ip, flags, pc);
-	/* Skip 5 functions to get to the irq/preempt enable function */
-	__trace_stack(tr, flags, 5, pc);
+	if (!is_quiet(tr)) {
+		__trace_function(tr, CALLER_ADDR0, parent_ip, flags, pc);
+		/* Skip 5 functions to get to the irq/preempt enable function */
+		__trace_stack(tr, flags, 5, pc);
+	}
 
 	if (data->critical_sequence != max_sequence)
 		goto out_unlock;
@@ -343,7 +347,8 @@ out_unlock:
 out:
 	data->critical_sequence = max_sequence;
 	data->preempt_timestamp = ftrace_now(cpu);
-	__trace_function(tr, CALLER_ADDR0, parent_ip, flags, pc);
+	if (!is_quiet(tr))
+		__trace_function(tr, CALLER_ADDR0, parent_ip, flags, pc);
 }
 
 static inline void
@@ -375,7 +380,8 @@ start_critical_timing(unsigned long ip, unsigned long parent_ip)
 
 	local_save_flags(flags);
 
-	__trace_function(tr, ip, parent_ip, flags, preempt_count());
+	if (!is_quiet(tr))
+		__trace_function(tr, ip, parent_ip, flags, preempt_count());
 
 	per_cpu(tracing_cpu, cpu) = 1;
 
@@ -409,7 +415,8 @@ stop_critical_timing(unsigned long ip, unsigned long parent_ip)
 	atomic_inc(&data->disabled);
 
 	local_save_flags(flags);
-	__trace_function(tr, ip, parent_ip, flags, preempt_count());
+	if (!is_quiet(tr))
+		__trace_function(tr, ip, parent_ip, flags, preempt_count());
 	check_critical_timing(tr, data, parent_ip ? : ip, cpu);
 	data->critical_start = 0;
 	atomic_dec(&data->disabled);

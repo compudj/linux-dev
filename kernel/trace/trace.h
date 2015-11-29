@@ -967,6 +967,7 @@ extern int trace_get_user(struct trace_parser *parser, const char __user *ubuf,
 		C(STOP_ON_FREE,		"disable_on_free"),	\
 		C(IRQ_INFO,		"irq-info"),		\
 		C(MARKERS,		"markers"),		\
+		C(QUIET,		"quiet"),		\
 		FUNCTION_FLAGS					\
 		FGRAPH_FLAGS					\
 		STACK_FLAGS					\
