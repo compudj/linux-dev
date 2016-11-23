@@ -49,6 +49,8 @@ static LIST_HEAD(tracepoint_module_list);
  */
 static DEFINE_MUTEX(tracepoints_mutex);
 
+struct srcu_struct tracepoint_srcu;
+
 /*
  * Note about RCU :
  * It is used to delay the free of multiple probes array until a quiescent
@@ -485,7 +487,7 @@ static struct notifier_block tracepoint_module_nb = {
 	.priority = 0,
 };
 
-static __init int init_tracepoints(void)
+static __init int init_tracepoints_modules(void)
 {
 	int ret;
 
@@ -495,8 +497,19 @@ static __init int init_tracepoints(void)
 
 	return ret;
 }
-__initcall(init_tracepoints);
+#else /* CONFIG_MODULES */
+static __init int init_tracepoints_modules(void)
+{
+	return 0;
+}
 #endif /* CONFIG_MODULES */
+
+static __init int init_tracepoints(void)
+{
+	init_srcu_struct(&tracepoint_srcu);
+	return init_tracepoints_modules();
+}
+__initcall(init_tracepoints);
 
 static void for_each_tracepoint_range(struct tracepoint * const *begin,
 		struct tracepoint * const *end,

@@ -19,6 +19,7 @@
 #include <linux/types.h>
 #include <linux/cpumask.h>
 #include <linux/rcupdate.h>
+#include <linux/srcu.h>
 #include <linux/tracepoint-defs.h>
 
 struct module;
@@ -32,6 +33,8 @@ struct trace_enum_map {
 };
 
 #define TRACEPOINT_DEFAULT_PRIO	10
+
+extern struct srcu_struct tracepoint_srcu;
 
 extern int
 tracepoint_probe_register(struct tracepoint *tp, void *probe, void *data);
@@ -77,6 +80,7 @@ int unregister_tracepoint_module_notifier(struct notifier_block *nb)
  */
 static inline void tracepoint_synchronize_unregister(void)
 {
+	synchronize_srcu(&tracepoint_srcu);
 	synchronize_sched();
 }
 
@@ -128,17 +132,24 @@ extern void syscall_unregfunc(void);
  * as "(void *, void)". The DECLARE_TRACE_NOARGS() will pass in just
  * "void *data", where as the DECLARE_TRACE() will pass in "void *data, proto".
  */
-#define __DO_TRACE(tp, proto, args, cond, prercu, postrcu)		\
+#define __DO_TRACE(tp, proto, args, cond, blocking, prercu, postrcu)	\
 	do {								\
 		struct tracepoint_func *it_func_ptr;			\
 		void *it_func;						\
 		void *__data;						\
+		int idx;						\
 									\
 		if (!(cond))						\
 			return;						\
 		prercu;							\
-		rcu_read_lock_sched_notrace();				\
-		it_func_ptr = rcu_dereference_sched((tp)->funcs);	\
+		if (blocking) {						\
+			idx = srcu_read_lock(&tracepoint_srcu);		\
+			it_func_ptr = srcu_dereference((tp)->funcs,	\
+				&tracepoint_srcu);			\
+		} else {						\
+			rcu_read_lock_sched_notrace();			\
+			it_func_ptr = rcu_dereference_sched((tp)->funcs); \
+		}							\
 		if (it_func_ptr) {					\
 			do {						\
 				it_func = (it_func_ptr)->func;		\
@@ -146,12 +157,16 @@ extern void syscall_unregfunc(void);
 				((void(*)(proto))(it_func))(args);	\
 			} while ((++it_func_ptr)->func);		\
 		}							\
-		rcu_read_unlock_sched_notrace();			\
+		if (blocking)						\
+			srcu_read_unlock(&tracepoint_srcu, idx);	\
+		else							\
+			rcu_read_unlock_sched_notrace();		\
 		postrcu;						\
 	} while (0)
 
 #ifndef MODULE
-#define __DECLARE_TRACE_RCU(name, proto, args, cond, data_proto, data_args)	\
+#define __DECLARE_TRACE_RCU(name, proto, args, cond, blocking,		\
+		data_proto, data_args)					\
 	static inline void trace_##name##_rcuidle(proto)		\
 	{								\
 		if (static_key_false(&__tracepoint_##name.key))		\
@@ -159,11 +174,13 @@ extern void syscall_unregfunc(void);
 				TP_PROTO(data_proto),			\
 				TP_ARGS(data_args),			\
 				TP_CONDITION(cond),			\
+				PARAMS(blocking),			\
 				rcu_irq_enter_irqson(),			\
 				rcu_irq_exit_irqson());			\
 	}
 #else
-#define __DECLARE_TRACE_RCU(name, proto, args, cond, data_proto, data_args)
+#define __DECLARE_TRACE_RCU(name, proto, args, cond, blocking,		\
+		data_proto, data_args)
 #endif
 
 /*
@@ -178,7 +195,8 @@ extern void syscall_unregfunc(void);
  * even when this tracepoint is off. This code has no purpose other than
  * poking RCU a bit.
  */
-#define __DECLARE_TRACE(name, proto, args, cond, data_proto, data_args) \
+#define __DECLARE_TRACE(name, proto, args, cond, blocking,		\
+		data_proto, data_args)					\
 	extern struct tracepoint __tracepoint_##name;			\
 	static inline void trace_##name(proto)				\
 	{								\
@@ -186,15 +204,25 @@ extern void syscall_unregfunc(void);
 			__DO_TRACE(&__tracepoint_##name,		\
 				TP_PROTO(data_proto),			\
 				TP_ARGS(data_args),			\
-				TP_CONDITION(cond),,);			\
+				TP_CONDITION(cond), PARAMS(blocking),,);\
 		if (IS_ENABLED(CONFIG_LOCKDEP) && (cond)) {		\
-			rcu_read_lock_sched_notrace();			\
-			rcu_dereference_sched(__tracepoint_##name.funcs);\
-			rcu_read_unlock_sched_notrace();		\
+			if (blocking) {					\
+				int idx;				\
+									\
+				idx = srcu_read_lock(&tracepoint_srcu);	\
+				srcu_dereference(__tracepoint_##name.funcs, \
+					&tracepoint_srcu);		\
+				srcu_read_unlock(&tracepoint_srcu, idx); \
+			} else {					\
+				rcu_read_lock_sched_notrace();		\
+				rcu_dereference_sched(__tracepoint_##name.funcs); \
+				rcu_read_unlock_sched_notrace();	\
+			}						\
 		}							\
 	}								\
 	__DECLARE_TRACE_RCU(name, PARAMS(proto), PARAMS(args),		\
-		PARAMS(cond), PARAMS(data_proto), PARAMS(data_args))	\
+		PARAMS(cond), PARAMS(blocking), PARAMS(data_proto),	\
+		PARAMS(data_args))					\
 	static inline int						\
 	register_trace_##name(void (*probe)(data_proto), void *data)	\
 	{								\
@@ -248,7 +276,8 @@ extern void syscall_unregfunc(void);
 	EXPORT_SYMBOL(__tracepoint_##name)
 
 #else /* !TRACEPOINTS_ENABLED */
-#define __DECLARE_TRACE(name, proto, args, cond, data_proto, data_args) \
+#define __DECLARE_TRACE(name, proto, args, cond, blocking,		\
+		data_proto, data_args)					\
 	static inline void trace_##name(proto)				\
 	{ }								\
 	static inline void trace_##name##_rcuidle(proto)		\
@@ -341,18 +370,37 @@ extern void syscall_unregfunc(void);
  */
 #define DECLARE_TRACE_NOARGS(name)					\
 	__DECLARE_TRACE(name, void, ,					\
-			cpu_online(raw_smp_processor_id()),		\
+			cpu_online(raw_smp_processor_id()), false,	\
 			void *__data, __data)
 
 #define DECLARE_TRACE(name, proto, args)				\
 	__DECLARE_TRACE(name, PARAMS(proto), PARAMS(args),		\
-			cpu_online(raw_smp_processor_id()),		\
+			cpu_online(raw_smp_processor_id()), false,	\
 			PARAMS(void *__data, proto),			\
 			PARAMS(__data, args))
 
 #define DECLARE_TRACE_CONDITION(name, proto, args, cond)		\
 	__DECLARE_TRACE(name, PARAMS(proto), PARAMS(args),		\
 			cpu_online(raw_smp_processor_id()) && (PARAMS(cond)), \
+			false,						\
+			PARAMS(void *__data, proto),			\
+			PARAMS(__data, args))
+
+#define DECLARE_TRACE_BLOCKING_NOARGS(name)				\
+	__DECLARE_TRACE(name, void, ,					\
+			cpu_online(raw_smp_processor_id()), true,	\
+			void *__data, __data)
+
+#define DECLARE_TRACE_BLOCKING(name, proto, args)			\
+	__DECLARE_TRACE(name, PARAMS(proto), PARAMS(args),		\
+			cpu_online(raw_smp_processor_id()), true,	\
+			PARAMS(void *__data, proto),			\
+			PARAMS(__data, args))
+
+#define DECLARE_TRACE_BLOCKING_CONDITION(name, proto, args, cond)	\
+	__DECLARE_TRACE(name, PARAMS(proto), PARAMS(args),		\
+			cpu_online(raw_smp_processor_id()) && (PARAMS(cond)), \
+			true,						\
 			PARAMS(void *__data, proto),			\
 			PARAMS(__data, args))
 
