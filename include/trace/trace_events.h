@@ -65,6 +65,14 @@ TRACE_MAKE_SYSTEM_STR();
 			     PARAMS(print));		       \
 	DEFINE_EVENT(name, name, PARAMS(proto), PARAMS(args));
 
+#undef TRACE_EVENT_BLOCKING
+#define TRACE_EVENT_BLOCKING(name, proto, args, tstruct, assign, print) \
+	TRACE_EVENT(name,				       \
+		     PARAMS(proto),			       \
+		     PARAMS(args),			       \
+		     PARAMS(tstruct),			       \
+		     PARAMS(assign),			       \
+		     PARAMS(print));
 
 #undef __field
 #define __field(type, item)		type	item;
@@ -125,6 +133,18 @@ TRACE_MAKE_SYSTEM_STR();
 
 #undef TRACE_EVENT_FN_COND
 #define TRACE_EVENT_FN_COND(name, proto, args, cond, tstruct,	\
+		assign, print, reg, unreg)				\
+	TRACE_EVENT_CONDITION(name, PARAMS(proto), PARAMS(args), PARAMS(cond),		\
+		PARAMS(tstruct), PARAMS(assign), PARAMS(print))		\
+
+#undef TRACE_EVENT_BLOCKING_FN
+#define TRACE_EVENT_BLOCKING_FN(name, proto, args, tstruct,		\
+		assign, print, reg, unreg)				\
+	TRACE_EVENT(name, PARAMS(proto), PARAMS(args),			\
+		PARAMS(tstruct), PARAMS(assign), PARAMS(print))		\
+
+#undef TRACE_EVENT_BLOCKING_FN_COND
+#define TRACE_EVENT_BLOCKING_FN_COND(name, proto, args, cond, tstruct,	\
 		assign, print, reg, unreg)				\
 	TRACE_EVENT_CONDITION(name, PARAMS(proto), PARAMS(args), PARAMS(cond),		\
 		PARAMS(tstruct), PARAMS(assign), PARAMS(print))		\

@@ -45,6 +45,29 @@
 		assign, print, reg, unreg)			\
 	DEFINE_TRACE_FN(name, reg, unreg)
 
+#undef TRACE_EVENT_BLOCKING
+#define TRACE_EVENT_BLOCKING(name, proto, args, tstruct, assign, print)	\
+	DEFINE_TRACE(name)
+
+#undef TRACE_EVENT_BLOCKING_CONDITION
+#define TRACE_EVENT_BLOCKING_CONDITION(name, proto, args, cond, tstruct, assign, print) \
+	TRACE_EVENT_BLOCKING(name,					\
+		PARAMS(proto),						\
+		PARAMS(args),						\
+		PARAMS(tstruct),					\
+		PARAMS(assign),						\
+		PARAMS(print))
+
+#undef TRACE_EVENT_BLOCKING_FN
+#define TRACE_EVENT_BLOCKING_FN(name, proto, args, tstruct,	\
+		assign, print, reg, unreg)			\
+	DEFINE_TRACE_FN(name, reg, unreg)
+
+#undef TRACE_EVENT_BLOCKING_FN_COND
+#define TRACE_EVENT_BLOCKING_FN_COND(name, proto, args, cond, tstruct,		\
+		assign, print, reg, unreg)			\
+	DEFINE_TRACE_FN(name, reg, unreg)
+
 #undef DEFINE_EVENT
 #define DEFINE_EVENT(template, name, proto, args) \
 	DEFINE_TRACE(name)
@@ -63,6 +86,10 @@
 
 #undef DECLARE_TRACE
 #define DECLARE_TRACE(name, proto, args)	\
+	DEFINE_TRACE(name)
+
+#undef DECLARE_TRACE_BLOCKING
+#define DECLARE_TRACE_BLOCKING(name, proto, args)	\
 	DEFINE_TRACE(name)
 
 #undef TRACE_INCLUDE
@@ -100,6 +127,10 @@
 #undef TRACE_EVENT_FN
 #undef TRACE_EVENT_FN_COND
 #undef TRACE_EVENT_CONDITION
+#undef TRACE_EVENT_BLOCKING
+#undef TRACE_EVENT_BLOCKING_FN
+#undef TRACE_EVENT_BLOCKING_FN_COND
+#undef TRACE_EVENT_BLOCKING_CONDITION
 #undef DECLARE_EVENT_CLASS
 #undef DEFINE_EVENT
 #undef DEFINE_EVENT_FN
@@ -107,6 +138,7 @@
 #undef DEFINE_EVENT_CONDITION
 #undef TRACE_HEADER_MULTI_READ
 #undef DECLARE_TRACE
+#undef DECLARE_TRACE_BLOCKING
 
 /* Only undef what we defined in this file */
 #ifdef UNDEF_TRACE_INCLUDE_FILE

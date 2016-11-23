@@ -542,6 +542,20 @@ extern void syscall_unregfunc(void);
 	DECLARE_TRACE_CONDITION(name, PARAMS(proto),		\
 				PARAMS(args), PARAMS(cond))
 
+#define TRACE_EVENT_BLOCKING(name, proto, args, struct, assign, print)	\
+	DECLARE_TRACE_BLOCKING(name, PARAMS(proto), PARAMS(args))
+#define TRACE_EVENT_BLOCKING_FN(name, proto, args, struct,	\
+		assign, print, reg, unreg)			\
+	DECLARE_TRACE_BLOCKING(name, PARAMS(proto), PARAMS(args))
+#define TRACE_EVENT_BLOCKING_FN_COND(name, proto, args, cond, struct,	\
+		assign, print, reg, unreg)			\
+	DECLARE_TRACE_BLOCKING_CONDITION(name, PARAMS(proto),	\
+			PARAMS(args), PARAMS(cond))
+#define TRACE_EVENT_BLOCKING_CONDITION(name, proto, args, cond,	\
+			      struct, assign, print)		\
+	DECLARE_TRACE_BLOCKING_CONDITION(name, PARAMS(proto),	\
+				PARAMS(args), PARAMS(cond))
+
 #define TRACE_EVENT_FLAGS(event, flag)
 
 #define TRACE_EVENT_PERF_PERM(event, expr...)
