@@ -40,6 +40,10 @@
  *                          (non-running threads are de facto in such a
  *                          state). This covers threads from all processes
  *                          running on the system. This command returns 0.
+ * @MEMBARRIER_CMD_REGISTER_EXPEDITED:
+ *                          TODO
+ * @MEMBARRIER_CMD_UNREGISTER_EXPEDITED:
+ *                          TODO
  *
  * Command to be passed to the membarrier system call. The commands need to
  * be a single bit each, except for MEMBARRIER_CMD_QUERY which is assigned to
@@ -48,6 +52,8 @@
 enum membarrier_cmd {
 	MEMBARRIER_CMD_QUERY = 0,
 	MEMBARRIER_CMD_SHARED = (1 << 0),
+	MEMBARRIER_CMD_REGISTER_EXPEDITED = (1 << 1),
+	MEMBARRIER_CMD_UNREGISTER_EXPEDITED = (1 << 2),
 };
 
 #endif /* _UAPI_LINUX_MEMBARRIER_H */

@@ -1998,6 +1998,9 @@ struct task_struct {
 	/* A live task holds one reference. */
 	atomic_t stack_refcount;
 #endif
+#ifdef CONFIG_MEMBARRIER
+	unsigned int membarrier_expedited;
+#endif
 /* CPU-specific state of this task */
 	struct thread_struct thread;
 /*
@@ -3670,5 +3673,29 @@ void cpufreq_add_update_util_hook(int cpu, struct update_util_data *data,
 				    unsigned int flags));
 void cpufreq_remove_update_util_hook(int cpu);
 #endif /* CONFIG_CPU_FREQ */
+
+#ifdef CONFIG_MEMBARRIER
+static inline void membarrier_fork(struct task_struct *t,
+		unsigned long clone_flags)
+{
+	if (clone_flags & CLONE_THREAD)
+		t->membarrier_expedited = 0;
+	else
+		t->membarrier_expedited = current->membarrier_expedited;
+}
+
+static inline void membarrier_execve(struct task_struct *t)
+{
+	t->membarrier_expedited = 0;
+}
+#else
+static inline void membarrier_fork(struct task_struct *t,
+		unsigned long clone_flags)
+{
+}
+static inline void membarrier_execve(struct task_struct *t)
+{
+}
+#endif
 
 #endif
