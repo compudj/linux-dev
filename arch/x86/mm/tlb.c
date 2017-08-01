@@ -105,6 +105,10 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	this_cpu_write(cpu_tlbstate.loaded_mm, next);
 
 	WARN_ON_ONCE(cpumask_test_cpu(cpu, mm_cpumask(next)));
+	/*
+	 * The full memory barrier implied by mm_cpumask update
+	 * operations is required by the membarrier system call.
+	 */
 	cpumask_set_cpu(cpu, mm_cpumask(next));
 
 	/*
@@ -132,8 +136,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 * due to instruction fetches or for no reason at all,
 	 * and neither LOCK nor MFENCE orders them.
 	 * Fortunately, load_cr3() is serializing and gives the
-	 * ordering guarantee we need. This full barrier is also
-	 * required by the membarrier system call.
+	 * ordering guarantee we need.
 	 */
 	load_cr3(next->pgd);
 
