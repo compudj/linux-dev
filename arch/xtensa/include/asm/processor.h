@@ -248,5 +248,14 @@ static inline unsigned long get_er(unsigned long addr)
 
 #endif /* XCHAL_HAVE_EXTERN_REGS */
 
+static inline void sync_core(void)
+{
+	/*
+	 * Synchronize the core execution pipeline. Acts as a compiler
+	 * barrier.
+	 */
+	asm volatile ("extw" : : : "memory");
+}
+
 #endif	/* __ASSEMBLY__ */
 #endif	/* _XTENSA_PROCESSOR_H */
