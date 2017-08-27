@@ -1086,6 +1086,9 @@ struct task_struct {
 	/* Used by LSM modules for access restriction: */
 	void				*security;
 #endif
+#ifdef CONFIG_MEMBARRIER
+	int membarrier_sync_core;
+#endif
 
 	/*
 	 * New fields for task_struct should be added above here, so that
@@ -1621,6 +1624,85 @@ extern long sched_getaffinity(pid_t pid, struct cpumask *mask);
 
 #ifndef TASK_SIZE_OF
 #define TASK_SIZE_OF(tsk)	TASK_SIZE
+#endif
+
+#ifdef CONFIG_ARCH_HAS_MEMBARRIER_USER_ICACHE_FLUSH
+/*
+ * Architectures with incoherent data and instruction caches are
+ * required to implement arch_membarrier_user_icache_flush() if they
+ * want to support the MEMBARRIER_FLAG_SYNC_CORE flag.
+ */
+extern void arch_membarrier_user_icache_flush(void);
+#else
+static inline void arch_membarrier_user_icache_flush(void)
+{
+}
+#endif
+
+#if defined(CONFIG_MEMBARRIER) && defined(CONFIG_ARCH_HAS_MEMBARRIER_SYNC_CORE)
+extern atomic_long_t membarrier_sync_core_active;
+
+static inline void membarrier_fork(struct task_struct *t,
+		unsigned long clone_flags)
+{
+	/*
+	 * Coherence of membarrier_sync_core against thread fork is
+	 * protected by siglock. membarrier_fork is called with siglock
+	 * held.
+	 */
+	t->membarrier_sync_core = current->membarrier_sync_core;
+}
+static inline void membarrier_execve(struct task_struct *t)
+{
+	t->membarrier_sync_core = 0;
+}
+static inline void membarrier_sched_out(struct task_struct *t)
+{
+	/*
+	 * Core serialization is performed before the memory barrier
+	 * preceding the store to rq->curr. A non-zero sync_core_active
+	 * implies that a core serializing shared membarrier is in
+	 * progress.
+	 */
+	if (unlikely(READ_ONCE(t->membarrier_sync_core)
+			|| atomic_long_read(&membarrier_sync_core_active)))
+		sync_core();
+	/*
+	 * Flushing icache on each scheduler entry when a shared
+	 * membarrier requiring core serialization is in progress.
+	 */
+	if (unlikely(atomic_long_read(&membarrier_sync_core_active)))
+		arch_membarrier_user_icache_flush();
+}
+static inline void membarrier_sched_in(struct task_struct *prev,
+		struct task_struct *next)
+{
+	/*
+	 * Core serialization is performed after the memory barrier
+	 * following the store to rq->curr.
+	 */
+	if (unlikely(READ_ONCE(next->membarrier_sync_core))) {
+		if (unlikely(prev->mm != next->mm)) {
+			sync_core();
+			arch_membarrier_user_icache_flush();
+		}
+	}
+}
+#else
+static inline void membarrier_fork(struct task_struct *t,
+		unsigned long clone_flags)
+{
+}
+static inline void membarrier_execve(struct task_struct *t)
+{
+}
+static inline void membarrier_sched_out(struct task_struct *t)
+{
+}
+static inline void membarrier_sched_in(struct task_struct *prev,
+		struct task_struct *next)
+{
+}
 #endif
 
 #endif

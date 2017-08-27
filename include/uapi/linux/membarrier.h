@@ -54,19 +54,41 @@
  *                          same processes as the caller thread. This
  *                          command returns 0. The "expedited" commands
  *                          complete faster than the non-expedited ones,
- *                          they never block, but have the downside of
- *                          causing extra overhead.
+ *                          they usually never block, but have the
+ *                          downside of causing extra overhead. The only
+ *                          case where it can block is the first time it
+ *                          is called by a process with the
+ *                          MEMBARRIER_FLAG_SYNC_CORE flag, if there has
+ *                          not been any prior registration of that
+ *                          process with
+ *                          MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+ *                          and the same flag.
+ * @MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED:
+ *                          When used with MEMBARRIER_FLAG_SYNC_CORE,
+ *                          register the current process as requiring
+ *                          core serialization when a private expedited
+ *                          membarrier is issued. It may block. It can
+ *                          be used to ensure
+ *                          MEMBARRIER_CMD_PRIVATE_EXPEDITED never
+ *                          blocks, even the first time it is invoked by
+ *                          a process with the MEMBARRIER_FLAG_SYNC_CORE
+ *                          flag.
  *
  * Command to be passed to the membarrier system call. The commands need to
  * be a single bit each, except for MEMBARRIER_CMD_QUERY which is assigned to
  * the value 0.
  */
 enum membarrier_cmd {
-	MEMBARRIER_CMD_QUERY			= 0,
-	MEMBARRIER_CMD_SHARED			= (1 << 0),
+	MEMBARRIER_CMD_QUERY				= 0,
+	MEMBARRIER_CMD_SHARED				= (1 << 0),
 	/* reserved for MEMBARRIER_CMD_SHARED_EXPEDITED (1 << 1) */
 	/* reserved for MEMBARRIER_CMD_PRIVATE (1 << 2) */
-	MEMBARRIER_CMD_PRIVATE_EXPEDITED	= (1 << 3),
+	MEMBARRIER_CMD_PRIVATE_EXPEDITED		= (1 << 3),
+	MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED	= (1 << 4),
+};
+
+enum membarrier_flags {
+	MEMBARRIER_FLAG_SYNC_CORE			= (1 << 0),
 };
 
 #endif /* _UAPI_LINUX_MEMBARRIER_H */

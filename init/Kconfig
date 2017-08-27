@@ -615,6 +615,12 @@ config ARCH_SUPPORTS_INT128
 config ARCH_WANT_NUMA_VARIABLE_LOCALITY
 	bool
 
+# For architectures implementing membarrier core synchronization,
+# required by the membarrier sync_core registration.
+#
+config ARCH_HAS_MEMBARRIER_SYNC_CORE
+	bool
+
 config NUMA_BALANCING
 	bool "Memory placement aware NUMA scheduler"
 	depends on ARCH_SUPPORTS_NUMA_BALANCING

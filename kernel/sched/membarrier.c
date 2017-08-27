@@ -18,6 +18,7 @@
 #include <linux/membarrier.h>
 #include <linux/tick.h>
 #include <linux/cpumask.h>
+#include <linux/atomic.h>
 
 #include "sched.h"	/* for cpu_rq(). */
 
@@ -25,22 +26,118 @@
  * Bitmask made from a "or" of all commands within enum membarrier_cmd,
  * except MEMBARRIER_CMD_QUERY.
  */
-#define MEMBARRIER_CMD_BITMASK	\
-	(MEMBARRIER_CMD_SHARED | MEMBARRIER_CMD_PRIVATE_EXPEDITED)
+#define MEMBARRIER_CMD_BITMASK			\
+	(MEMBARRIER_CMD_SHARED			\
+	| MEMBARRIER_CMD_PRIVATE_EXPEDITED	\
+	| MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED)
+
+#ifdef CONFIG_ARCH_HAS_MEMBARRIER_SYNC_CORE
+atomic_long_t membarrier_sync_core_active;
+
+static void membarrier_shared_sync_core_begin(int flags)
+{
+	if (flags & MEMBARRIER_FLAG_SYNC_CORE)
+		atomic_long_inc(&membarrier_sync_core_active);
+}
+
+static void membarrier_shared_sync_core_end(int flags)
+{
+	if (flags & MEMBARRIER_FLAG_SYNC_CORE)
+		atomic_long_dec(&membarrier_sync_core_active);
+}
+
+static int membarrier_register_private_expedited_sync_core(void)
+{
+	struct task_struct *p = current, *t;
+
+	if (READ_ONCE(p->membarrier_sync_core))
+		return 0;
+	if (get_nr_threads(p) == 1) {
+		p->membarrier_sync_core = 1;
+		return 0;
+	}
+
+	/*
+	 * Coherence of membarrier_sync_core against thread fork is
+	 * protected by siglock.
+	 */
+	spin_lock(&p->sighand->siglock);
+	for_each_thread(p, t)
+		WRITE_ONCE(t->membarrier_sync_core, 1);
+	spin_unlock(&p->sighand->siglock);
+	/*
+	 * Ensure all future scheduler execution will observe the new
+	 * membarrier_sync_core state for this process.
+	 */
+	synchronize_sched();
+	return 0;
+}
+static void membarrier_sync_core(void)
+{
+	sync_core();
+}
+#else
+static void membarrier_shared_sync_core_begin(int flags)
+{
+}
+static void membarrier_shared_sync_core_end(int flags)
+{
+}
+static int membarrier_register_private_expedited_sync_core(void)
+{
+	return -EINVAL;
+}
+static void membarrier_sync_core(void)
+{
+}
+#endif
+
+static int membarrier_shared(int flags)
+{
+	if (unlikely(flags & ~MEMBARRIER_FLAG_SYNC_CORE))
+		return -EINVAL;
+	/* MEMBARRIER_CMD_SHARED is not compatible with nohz_full. */
+	if (tick_nohz_full_enabled())
+		return -EINVAL;
+	if (num_online_cpus() == 1)
+		return 0;
+
+	membarrier_shared_sync_core_begin(flags);
+	synchronize_sched();
+	membarrier_shared_sync_core_end(flags);
+
+	return 0;
+}
 
 static void ipi_mb(void *info)
 {
-	smp_mb();	/* IPIs should be serializing but paranoid. */
+	/* IPIs should be serializing but paranoid. */
+	smp_mb();
+	membarrier_sync_core();
+	arch_membarrier_user_icache_flush();
 }
 
-static void membarrier_private_expedited(void)
+static int membarrier_private_expedited(int flags)
 {
 	int cpu;
 	bool fallback = false;
 	cpumask_var_t tmpmask;
 
+	if (unlikely(flags & ~MEMBARRIER_FLAG_SYNC_CORE))
+		return -EINVAL;
+	/*
+	 * Do the process registration ourself if it has not been
+	 * performed by an explicit register command.
+	 */
+	if (unlikely(flags & MEMBARRIER_FLAG_SYNC_CORE)) {
+		int ret;
+
+		ret = membarrier_register_private_expedited_sync_core();
+		if (ret)
+			return ret;
+	}
 	if (num_online_cpus() == 1 || get_nr_threads(current) == 1)
-		return;
+		return 0;
 
 	/*
 	 * Matches memory barriers around rq->curr modification in
@@ -94,6 +191,16 @@ static void membarrier_private_expedited(void)
 	 * rq->curr modification in scheduler.
 	 */
 	smp_mb();	/* exit from system call is not a mb */
+	return 0;
+}
+
+static int membarrier_register_private_expedited(int flags)
+{
+	if (unlikely(flags & ~MEMBARRIER_FLAG_SYNC_CORE))
+		return -EINVAL;
+	if (flags & MEMBARRIER_FLAG_SYNC_CORE)
+		return membarrier_register_private_expedited_sync_core();
+	return 0;
 }
 
 /**
@@ -125,27 +232,23 @@ static void membarrier_private_expedited(void)
  */
 SYSCALL_DEFINE2(membarrier, int, cmd, int, flags)
 {
-	if (unlikely(flags))
-		return -EINVAL;
 	switch (cmd) {
 	case MEMBARRIER_CMD_QUERY:
 	{
 		int cmd_mask = MEMBARRIER_CMD_BITMASK;
 
+		if (unlikely(flags))
+			return -EINVAL;
 		if (tick_nohz_full_enabled())
 			cmd_mask &= ~MEMBARRIER_CMD_SHARED;
 		return cmd_mask;
 	}
 	case MEMBARRIER_CMD_SHARED:
-		/* MEMBARRIER_CMD_SHARED is not compatible with nohz_full. */
-		if (tick_nohz_full_enabled())
-			return -EINVAL;
-		if (num_online_cpus() > 1)
-			synchronize_sched();
-		return 0;
+		return membarrier_shared(flags);
 	case MEMBARRIER_CMD_PRIVATE_EXPEDITED:
-		membarrier_private_expedited();
-		return 0;
+		return membarrier_private_expedited(flags);
+	case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED:
+		return membarrier_register_private_expedited(flags);
 	default:
 		return -EINVAL;
 	}
