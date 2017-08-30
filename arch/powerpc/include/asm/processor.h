@@ -445,6 +445,11 @@ do {								\
 #define cpu_relax()	barrier()
 #endif
 
+static inline void sync_core(void)
+{
+	isync();
+}
+
 /* Check that a certain kernel stack pointer is valid in task_struct p */
 int validate_sp(unsigned long sp, struct task_struct *p,
                        unsigned long nbytes);
