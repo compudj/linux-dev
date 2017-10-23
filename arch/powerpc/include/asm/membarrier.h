@@ -21,6 +21,12 @@ static inline void membarrier_arch_switch_mm(struct mm_struct *prev,
 	 */
 	smp_mb();
 }
-void membarrier_arch_register_private_expedited(struct task_struct *t);
+
+static inline void membarrier_arch_mm_sync_core(void)
+{
+}
+
+void membarrier_arch_register_private_expedited(struct task_struct *t,
+		int flags);
 
 #endif /* _ASM_POWERPC_MEMBARRIER_H */

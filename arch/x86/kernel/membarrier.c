@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2010-2017 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
  *
- * membarrier system call - PowerPC architecture code
+ * membarrier system call - x86 architecture code
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,7 +26,9 @@ void membarrier_arch_register_private_expedited(struct task_struct *p,
 {
 	struct mm_struct *mm = p->mm;
 
-	atomic_or(MEMBARRIER_STATE_SWITCH_MM, &mm->membarrier_state);
+	if (!(flags & MEMBARRIER_FLAG_SYNC_CORE))
+		return;
+	atomic_or(MEMBARRIER_STATE_SYNC_CORE, &mm->membarrier_state);
 	if (atomic_read(&mm->mm_users) == 1 && get_nr_threads(p) == 1)
 		return;
 	/*

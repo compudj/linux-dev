@@ -222,6 +222,7 @@ enum {
 	MEMBARRIER_STATE_PRIVATE_EXPEDITED_READY		= (1U << 0),
 	MEMBARRIER_STATE_SWITCH_MM				= (1U << 1),
 	MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY	= (1U << 2),
+	MEMBARRIER_STATE_SYNC_CORE				= (1U << 3),
 };
 
 enum {
@@ -232,7 +233,10 @@ enum {
 #include <asm/membarrier.h>
 #else
 static inline void membarrier_arch_register_private_expedited(
-		struct task_struct *p)
+		struct task_struct *p, int flags)
+{
+}
+static inline void membarrier_arch_mm_sync_core(struct mm_struct *mm)
 {
 }
 #endif
@@ -249,6 +253,9 @@ static inline void membarrier_arch_switch_mm(struct mm_struct *prev,
 }
 #endif
 static inline void membarrier_execve(struct task_struct *t)
+{
+}
+static inline void membarrier_arch_mm_sync_core(struct mm_struct *mm)
 {
 }
 #endif

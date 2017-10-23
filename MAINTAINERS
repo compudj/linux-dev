@@ -8831,6 +8831,8 @@ F:	kernel/sched/membarrier.c
 F:	include/uapi/linux/membarrier.h
 F:	arch/powerpc/kernel/membarrier.c
 F:	arch/powerpc/include/asm/membarrier.h
+F:	arch/x86/kernel/membarrier.c
+F:	arch/x86/include/asm/membarrier.h
 
 MEMORY MANAGEMENT
 L:	linux-mm@kvack.org
