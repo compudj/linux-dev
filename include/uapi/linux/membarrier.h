@@ -40,6 +40,10 @@
  *                          (non-running threads are de facto in such a
  *                          state). This covers threads from all processes
  *                          running on the system. This command returns 0.
+ * @MEMBARRIER_CMD_SHARED_EXPEDITED:
+ *                          TODO
+ * @MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED:
+ *                          TODO
  * @MEMBARRIER_CMD_PRIVATE_EXPEDITED:
  *                          Execute a memory barrier on each running
  *                          thread belonging to the same process as the current
@@ -76,8 +80,8 @@
 enum membarrier_cmd {
 	MEMBARRIER_CMD_QUERY					= 0,
 	MEMBARRIER_CMD_SHARED					= (1 << 0),
-	/* reserved for MEMBARRIER_CMD_SHARED_EXPEDITED (1 << 1) */
-	/* reserved for MEMBARRIER_CMD_PRIVATE (1 << 2) */
+	MEMBARRIER_CMD_SHARED_EXPEDITED				= (1 << 1),
+	MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED		= (1 << 2),
 	MEMBARRIER_CMD_PRIVATE_EXPEDITED			= (1 << 3),
 	MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED		= (1 << 4),
 	MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE		= (1 << 5),

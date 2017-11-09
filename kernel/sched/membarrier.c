@@ -35,13 +35,80 @@
 #endif
 
 #define MEMBARRIER_CMD_BITMASK	\
-	(MEMBARRIER_CMD_SHARED | MEMBARRIER_CMD_PRIVATE_EXPEDITED	\
+	(MEMBARRIER_CMD_SHARED | MEMBARRIER_CMD_SHARED_EXPEDITED \
+	| MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED \
+	| MEMBARRIER_CMD_PRIVATE_EXPEDITED	\
 	| MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED	\
 	| MEMBARRIER_PRIVATE_EXPEDITED_SYNC_CORE_BITMASK)
 
 static void ipi_mb(void *info)
 {
 	smp_mb();	/* IPIs should be serializing but paranoid. */
+}
+
+static int membarrier_shared_expedited(void)
+{
+	int cpu;
+	bool fallback = false;
+	cpumask_var_t tmpmask;
+
+	if (num_online_cpus() == 1)
+		return 0;
+
+	/*
+	 * Matches memory barriers around rq->curr modification in
+	 * scheduler.
+	 */
+	smp_mb();	/* system call entry is not a mb. */
+
+	/*
+	 * Expedited membarrier commands guarantee that they won't
+	 * block, hence the GFP_NOWAIT allocation flag and fallback
+	 * implementation.
+	 */
+	if (!zalloc_cpumask_var(&tmpmask, GFP_NOWAIT)) {
+		/* Fallback for OOM. */
+		fallback = true;
+	}
+
+	cpus_read_lock();
+	for_each_online_cpu(cpu) {
+		struct task_struct *p;
+
+		/*
+		 * Skipping the current CPU is OK even through we can be
+		 * migrated at any point. The current CPU, at the point
+		 * where we read raw_smp_processor_id(), is ensured to
+		 * be in program order with respect to the caller
+		 * thread. Therefore, we can skip this CPU from the
+		 * iteration.
+		 */
+		if (cpu == raw_smp_processor_id())
+			continue;
+		rcu_read_lock();
+		p = task_rcu_dereference(&cpu_rq(cpu)->curr);
+		if (p && (atomic_read(&p->mm->membarrier_state)
+				& MEMBARRIER_STATE_SHARED_EXPEDITED)) {
+			if (!fallback)
+				__cpumask_set_cpu(cpu, tmpmask);
+			else
+				smp_call_function_single(cpu, ipi_mb, NULL, 1);
+		}
+		rcu_read_unlock();
+	}
+	if (!fallback) {
+		smp_call_function_many(tmpmask, ipi_mb, NULL, 1);
+		free_cpumask_var(tmpmask);
+	}
+	cpus_read_unlock();
+
+	/*
+	 * Memory barrier on the caller thread _after_ we finished
+	 * waiting for the last IPI. Matches memory barriers around
+	 * rq->curr modification in scheduler.
+	 */
+	smp_mb();	/* exit from system call is not a mb */
+	return 0;
 }
 
 static int membarrier_private_expedited(int flags)
@@ -120,6 +187,25 @@ static int membarrier_private_expedited(int flags)
 	return 0;
 }
 
+static int membarrier_register_shared_expedited(void)
+{
+	struct task_struct *p = current;
+	struct mm_struct *mm = p->mm;
+
+	if (atomic_read(&mm->membarrier_state)
+			& MEMBARRIER_STATE_SHARED_EXPEDITED_READY)
+		return 0;
+	atomic_or(MEMBARRIER_STATE_SHARED_EXPEDITED, &mm->membarrier_state);
+	/*
+	 * Ensure all future scheduler executions will observe the new
+	 * thread flag state for this process.
+	 */
+	synchronize_sched();
+	atomic_or(MEMBARRIER_STATE_SHARED_EXPEDITED_READY,
+			&mm->membarrier_state);
+	return 0;
+}
+
 static int membarrier_register_private_expedited(int flags)
 {
 	struct task_struct *p = current;
@@ -191,6 +277,10 @@ SYSCALL_DEFINE2(membarrier, int, cmd, int, flags)
 		if (num_online_cpus() > 1)
 			synchronize_sched();
 		return 0;
+	case MEMBARRIER_CMD_SHARED_EXPEDITED:
+		return membarrier_shared_expedited();
+	case MEMBARRIER_CMD_REGISTER_SHARED_EXPEDITED:
+		return membarrier_register_shared_expedited();
 	case MEMBARRIER_CMD_PRIVATE_EXPEDITED:
 		return membarrier_private_expedited(0);
 	case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED:
