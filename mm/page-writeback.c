@@ -125,27 +125,6 @@ EXPORT_SYMBOL(laptop_mode);
 
 struct wb_domain global_wb_domain;
 
-/* consolidated parameters for balance_dirty_pages() and its subroutines */
-struct dirty_throttle_control {
-#ifdef CONFIG_CGROUP_WRITEBACK
-	struct wb_domain	*dom;
-	struct dirty_throttle_control *gdtc;	/* only set in memcg dtc's */
-#endif
-	struct bdi_writeback	*wb;
-	struct fprop_local_percpu *wb_completions;
-
-	unsigned long		avail;		/* dirtyable */
-	unsigned long		dirty;		/* file_dirty + write + nfs */
-	unsigned long		thresh;		/* dirty threshold */
-	unsigned long		bg_thresh;	/* dirty background threshold */
-
-	unsigned long		wb_dirty;	/* per-wb counterparts */
-	unsigned long		wb_thresh;
-	unsigned long		wb_bg_thresh;
-
-	unsigned long		pos_ratio;
-};
-
 /*
  * Length of period for aging writeout fractions of bdis. This is an
  * arbitrarily chosen number. The longer the period, the slower fractions will
@@ -443,9 +422,8 @@ static void domain_dirty_limits(struct dirty_throttle_control *dtc)
 	dtc->thresh = thresh;
 	dtc->bg_thresh = bg_thresh;
 
-	/* we should eventually report the domain in the TP */
 	if (!gdtc)
-		trace_global_dirty_state(bg_thresh, thresh);
+		trace_global_dirty_state(&global_wb_domain, bg_thresh, thresh);
 }
 
 /**
@@ -1736,12 +1714,9 @@ static void balance_dirty_pages(struct bdi_writeback *wb,
 		 * do a reset, as it may be a light dirtier.
 		 */
 		if (pause < min_pause) {
-			trace_balance_dirty_pages(wb,
-						  sdtc->thresh,
-						  sdtc->bg_thresh,
-						  sdtc->dirty,
-						  sdtc->wb_thresh,
-						  sdtc->wb_dirty,
+			trace_balance_dirty_pages(&global_wb_domain,
+						  wb,
+						  sdtc,
 						  dirty_ratelimit,
 						  task_ratelimit,
 						  pages_dirtied,
@@ -1765,12 +1740,9 @@ static void balance_dirty_pages(struct bdi_writeback *wb,
 		}
 
 pause:
-		trace_balance_dirty_pages(wb,
-					  sdtc->thresh,
-					  sdtc->bg_thresh,
-					  sdtc->dirty,
-					  sdtc->wb_thresh,
-					  sdtc->wb_dirty,
+		trace_balance_dirty_pages(&global_wb_domain,
+					  wb,
+					  sdtc,
 					  dirty_ratelimit,
 					  task_ratelimit,
 					  pages_dirtied,

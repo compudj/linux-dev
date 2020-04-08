@@ -531,11 +531,13 @@ TRACE_EVENT(writeback_queue_io,
 
 TRACE_EVENT(global_dirty_state,
 
-	TP_PROTO(unsigned long background_thresh,
+	TP_PROTO(struct wb_domain *domain,
+		 unsigned long background_thresh,
 		 unsigned long dirty_thresh
 	),
 
-	TP_ARGS(background_thresh,
+	TP_ARGS(domain,
+		background_thresh,
 		dirty_thresh
 	),
 
@@ -558,7 +560,7 @@ TRACE_EVENT(global_dirty_state,
 		__entry->nr_written	= global_node_page_state(NR_WRITTEN);
 		__entry->background_thresh = background_thresh;
 		__entry->dirty_thresh	= dirty_thresh;
-		__entry->dirty_limit	= global_wb_domain.dirty_limit;
+		__entry->dirty_limit	= domain->dirty_limit;
 	),
 
 	TP_printk("dirty=%lu writeback=%lu unstable=%lu "
@@ -625,12 +627,9 @@ TRACE_EVENT(bdi_dirty_ratelimit,
 
 TRACE_EVENT(balance_dirty_pages,
 
-	TP_PROTO(struct bdi_writeback *wb,
-		 unsigned long thresh,
-		 unsigned long bg_thresh,
-		 unsigned long dirty,
-		 unsigned long bdi_thresh,
-		 unsigned long bdi_dirty,
+	TP_PROTO(struct wb_domain *domain,
+		 struct bdi_writeback *wb,
+		 struct dirty_throttle_control *sdtc,
 		 unsigned long dirty_ratelimit,
 		 unsigned long task_ratelimit,
 		 unsigned long dirtied,
@@ -638,7 +637,7 @@ TRACE_EVENT(balance_dirty_pages,
 		 long pause,
 		 unsigned long start_time),
 
-	TP_ARGS(wb, thresh, bg_thresh, dirty, bdi_thresh, bdi_dirty,
+	TP_ARGS(domain, wb, sdtc,
 		dirty_ratelimit, task_ratelimit,
 		dirtied, period, pause, start_time),
 
@@ -661,16 +660,16 @@ TRACE_EVENT(balance_dirty_pages,
 	),
 
 	TP_fast_assign(
-		unsigned long freerun = (thresh + bg_thresh) / 2;
+		unsigned long freerun = (sdtc->thresh + sdtc->bg_thresh) / 2;
 		strscpy_pad(__entry->bdi, bdi_dev_name(wb->bdi), 32);
 
-		__entry->limit		= global_wb_domain.dirty_limit;
-		__entry->setpoint	= (global_wb_domain.dirty_limit +
+		__entry->limit		= domain->dirty_limit;
+		__entry->setpoint	= (domain->dirty_limit +
 						freerun) / 2;
-		__entry->dirty		= dirty;
+		__entry->dirty		= sdtc->dirty;
 		__entry->bdi_setpoint	= __entry->setpoint *
-						bdi_thresh / (thresh + 1);
-		__entry->bdi_dirty	= bdi_dirty;
+						sdtc->wb_thresh / (sdtc->thresh + 1);
+		__entry->bdi_dirty	= sdtc->wb_dirty;
 		__entry->dirty_ratelimit = KBps(dirty_ratelimit);
 		__entry->task_ratelimit	= KBps(task_ratelimit);
 		__entry->dirtied	= dirtied;
