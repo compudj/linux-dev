@@ -4629,6 +4629,7 @@ int task_prio(const struct task_struct *p)
 {
 	return p->prio - MAX_RT_PRIO;
 }
+EXPORT_SYMBOL_GPL(task_prio);
 
 /**
  * idle_cpu - is a given CPU idle currently?
