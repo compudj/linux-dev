@@ -501,6 +501,7 @@ unsigned long get_pfnblock_flags_mask(struct page *page, unsigned long pfn,
 {
 	return __get_pfnblock_flags_mask(page, pfn, end_bitidx, mask);
 }
+EXPORT_SYMBOL_GPL(get_pfnblock_flags_mask);
 
 static __always_inline int get_pfnblock_migratetype(struct page *page, unsigned long pfn)
 {
