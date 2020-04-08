@@ -240,6 +240,7 @@ unsigned int stack_trace_save_user(unsigned long *store, unsigned int size)
 
 	return c.len;
 }
+EXPORT_SYMBOL_GPL(stack_trace_save_user);
 #endif
 
 #else /* CONFIG_ARCH_STACKWALK */
@@ -373,6 +374,7 @@ unsigned int stack_trace_save_user(unsigned long *store, unsigned int size)
 	save_stack_trace_user(&trace);
 	return trace.nr_entries;
 }
+EXPORT_SYMBOL_GPL(stack_trace_save_user);
 #endif /* CONFIG_USER_STACKTRACE_SUPPORT */
 
 #endif /* !CONFIG_ARCH_STACKWALK */
