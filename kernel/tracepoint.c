@@ -14,6 +14,7 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 #include <linux/static_key.h>
+#include <linux/vmalloc.h>
 
 extern tracepoint_ptr_t __start___tracepoints_ptrs[];
 extern tracepoint_ptr_t __stop___tracepoints_ptrs[];
@@ -308,6 +309,7 @@ int tracepoint_probe_register_prio(struct tracepoint *tp, void *probe,
 	struct tracepoint_func tp_func;
 	int ret;
 
+	vmalloc_sync_mappings();
 	mutex_lock(&tracepoints_mutex);
 	tp_func.func = probe;
 	tp_func.data = data;
