@@ -725,7 +725,7 @@ EXPORT_SYMBOL(bio_clone_fast);
 
 const char *bio_devname(struct bio *bio, char *buf)
 {
-	return disk_name(bio->bi_disk, bio->bi_partno, buf);
+	return gendisk_name(bio->bi_disk, bio->bi_partno, buf);
 }
 EXPORT_SYMBOL(bio_devname);
 

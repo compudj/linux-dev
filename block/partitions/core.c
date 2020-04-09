@@ -129,7 +129,7 @@ static struct parsed_partitions *check_partition(struct gendisk *hd,
 	state->pp_buf[0] = '\0';
 
 	state->bdev = bdev;
-	disk_name(hd, 0, state->name);
+	gendisk_name(hd, 0, state->name);
 	snprintf(state->pp_buf, PAGE_SIZE, " %s:", state->name);
 	if (isdigit(state->name[strlen(state->name)-1]))
 		sprintf(state->name, "p");

@@ -385,7 +385,7 @@ struct hd_struct *disk_map_sector_rcu(struct gendisk *disk, sector_t sector);
 int blk_alloc_devt(struct hd_struct *part, dev_t *devt);
 void blk_free_devt(dev_t devt);
 void blk_invalidate_devt(dev_t devt);
-char *disk_name(struct gendisk *hd, int partno, char *buf);
+char *gendisk_name(struct gendisk *hd, int partno, char *buf);
 #define ADDPART_FLAG_NONE	0
 #define ADDPART_FLAG_RAID	1
 #define ADDPART_FLAG_WHOLEDISK	2

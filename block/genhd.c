@@ -74,7 +74,7 @@ EXPORT_SYMBOL_GPL(set_capacity_revalidate_and_notify);
  * Format the device name of the indicated disk into the supplied buffer and
  * return a pointer to that same buffer for convenience.
  */
-char *disk_name(struct gendisk *hd, int partno, char *buf)
+char *gendisk_name(struct gendisk *hd, int partno, char *buf)
 {
 	if (!partno)
 		snprintf(buf, BDEVNAME_SIZE, "%s", hd->disk_name);
@@ -85,10 +85,11 @@ char *disk_name(struct gendisk *hd, int partno, char *buf)
 
 	return buf;
 }
+EXPORT_SYMBOL_GPL(gendisk_name);
 
 const char *bdevname(struct block_device *bdev, char *buf)
 {
-	return disk_name(bdev->bd_disk, bdev->bd_part->partno, buf);
+	return gendisk_name(bdev->bd_disk, bdev->bd_part->partno, buf);
 }
 EXPORT_SYMBOL(bdevname);
 
@@ -1081,8 +1082,8 @@ void __init printk_all_partitions(void)
 
 			printk("%s%s %10llu %s %s", is_part0 ? "" : "  ",
 			       bdevt_str(part_devt(part), devt_buf),
-			       (unsigned long long)part_nr_sects_read(part) >> 1
-			       , disk_name(disk, part->partno, name_buf),
+			       (unsigned long long)part_nr_sects_read(part) >> 1,
+			       gendisk_name(disk, part->partno, name_buf),
 			       part->info ? part->info->uuid : "");
 			if (is_part0) {
 				if (dev->parent && dev->parent->driver)
@@ -1175,7 +1176,7 @@ static int show_partition(struct seq_file *seqf, void *v)
 		seq_printf(seqf, "%4d  %7d %10llu %s\n",
 			   MAJOR(part_devt(part)), MINOR(part_devt(part)),
 			   (unsigned long long)part_nr_sects_read(part) >> 1,
-			   disk_name(sgp, part->partno, buf));
+			   gendisk_name(sgp, part->partno, buf));
 	disk_part_iter_exit(&piter);
 
 	return 0;
@@ -1583,7 +1584,7 @@ static int diskstats_show(struct seq_file *seqf, void *v)
 			   "%lu %u"
 			   "\n",
 			   MAJOR(part_devt(hd)), MINOR(part_devt(hd)),
-			   disk_name(gp, hd->partno, buf),
+			   gendisk_name(gp, hd->partno, buf),
 			   stat.ios[STAT_READ],
 			   stat.merges[STAT_READ],
 			   stat.sectors[STAT_READ],
