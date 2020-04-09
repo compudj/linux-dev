@@ -413,7 +413,7 @@ struct hd_struct *add_partition(struct gendisk *disk, int partno,
 		dev_set_name(pdev, "%s%d", dname, partno);
 
 	device_initialize(pdev);
-	pdev->class = &block_class;
+	pdev->class = gendisk_block_class();
 	pdev->type = &part_type;
 	pdev->parent = ddev;
 

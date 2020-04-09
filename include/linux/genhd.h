@@ -27,7 +27,6 @@
 #define part_to_dev(part)	(&((part)->__dev))
 
 extern struct device_type part_type;
-extern struct class block_class;
 
 #define DISK_MAX_PARTS			256
 #define DISK_NAME_LEN			32
@@ -354,6 +353,7 @@ extern void blk_register_region(dev_t devt, unsigned long range,
 extern void blk_unregister_region(dev_t devt, unsigned long range);
 
 extern const struct device_type *gendisk_device_type(void);
+extern struct class *gendisk_block_class(void);
 
 #define alloc_disk_node(minors, node_id)				\
 ({									\

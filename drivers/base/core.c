@@ -2062,13 +2062,14 @@ static struct kobject *get_device_parent(struct device *dev,
 		struct kobject *kobj = NULL;
 		struct kobject *parent_kobj;
 		struct kobject *k;
-
 #ifdef CONFIG_BLOCK
+		struct class *block_class = gendisk_block_class();
+
 		/* block disks show up in /sys/block */
-		if (sysfs_deprecated && dev->class == &block_class) {
-			if (parent && parent->class == &block_class)
+		if (sysfs_deprecated && dev->class == block_class) {
+			if (parent && parent->class == block_class)
 				return &parent->kobj;
-			return &block_class.p->subsys.kobj;
+			return &block_class->p->subsys.kobj;
 		}
 #endif
 
@@ -2228,7 +2229,7 @@ static int device_add_class_symlinks(struct device *dev)
 
 #ifdef CONFIG_BLOCK
 	/* /sys/block has directories and does not need symlinks */
-	if (sysfs_deprecated && dev->class == &block_class)
+	if (sysfs_deprecated && dev->class == gendisk_block_class())
 		return 0;
 #endif
 
@@ -2262,7 +2263,7 @@ static void device_remove_class_symlinks(struct device *dev)
 		sysfs_remove_link(&dev->kobj, "device");
 	sysfs_remove_link(&dev->kobj, "subsystem");
 #ifdef CONFIG_BLOCK
-	if (sysfs_deprecated && dev->class == &block_class)
+	if (sysfs_deprecated && dev->class == gendisk_block_class())
 		return;
 #endif
 	sysfs_delete_link(&dev->class->p->subsys.kobj, &dev->kobj, dev_name(dev));
@@ -3603,7 +3604,7 @@ int device_change_owner(struct device *dev, kuid_t kuid, kgid_t kgid)
 		goto out;
 
 #ifdef CONFIG_BLOCK
-	if (sysfs_deprecated && dev->class == &block_class)
+	if (sysfs_deprecated && dev->class == gendisk_block_class())
 		goto out;
 #endif
 
