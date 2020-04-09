@@ -40,6 +40,10 @@ static DEFINE_IDR(ext_devt_idr);
 
 static const struct device_type disk_type;
 
+static struct class block_class = {
+	.name		= "block",
+};
+
 static void disk_check_events(struct disk_events *ev,
 			      unsigned int *clearing_ptr);
 static void disk_alloc_events(struct gendisk *disk);
@@ -1525,9 +1529,15 @@ static void disk_release(struct device *dev)
 		blk_put_queue(disk->queue);
 	kfree(disk);
 }
-struct class block_class = {
-	.name		= "block",
-};
+
+/*
+ * Return the generic disk block class.
+ */
+struct class *gendisk_block_class(void)
+{
+	return &block_class;
+}
+EXPORT_SYMBOL_GPL(gendisk_block_class);
 
 static char *block_devnode(struct device *dev, umode_t *mode,
 			   kuid_t *uid, kgid_t *gid)

@@ -138,7 +138,7 @@ static dev_t devt_from_partuuid(const char *uuid_str)
 		goto done;
 	}
 
-	dev = class_find_device(&block_class, NULL, &cmp,
+	dev = class_find_device(gendisk_block_class(), NULL, &cmp,
 				&match_dev_by_uuid);
 	if (!dev)
 		goto done;
@@ -237,7 +237,7 @@ dev_t name_to_dev_t(const char *name)
 	} else if (strncmp(name, "PARTLABEL=", 10) == 0) {
 		struct device *dev;
 
-		dev = class_find_device(&block_class, NULL, name + 10,
+		dev = class_find_device(gendisk_block_class(), NULL, name + 10,
 					&match_dev_by_label);
 		if (!dev)
 			goto fail;
