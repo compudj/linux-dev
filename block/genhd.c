@@ -1546,6 +1546,15 @@ static const struct device_type disk_type = {
 	.devnode	= block_devnode,
 };
 
+/*
+ * Return the generic disk device type.
+ */
+const struct device_type *gendisk_device_type(void)
+{
+	return &disk_type;
+}
+EXPORT_SYMBOL_GPL(gendisk_device_type);
+
 #ifdef CONFIG_PROC_FS
 /*
  * aggregate disk stat collector.  Uses the same stats that the sysfs
