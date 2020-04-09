@@ -622,7 +622,7 @@ void disk_stack_limits(struct gendisk *disk, struct block_device *bdev,
 	if (bdev_stack_limits(&t->limits, bdev, offset >> 9) < 0) {
 		char top[BDEVNAME_SIZE], bottom[BDEVNAME_SIZE];
 
-		disk_name(disk, 0, top);
+		gendisk_name(disk, 0, top);
 		bdevname(bdev, bottom);
 
 		printk(KERN_NOTICE "%s: Warning: Device %s is misaligned\n",
