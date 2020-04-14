@@ -2032,6 +2032,20 @@ SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count,
 	return urandom_read_nowarn(NULL, buf, count, NULL);
 }
 
+static unsigned char kernel_boot_id[KERNEL_BOOT_ID_LEN];
+
+unsigned char *get_kernel_boot_id(void)
+{
+	static DEFINE_SPINLOCK(bootid_spinlock);
+
+	spin_lock(&bootid_spinlock);
+	if (!kernel_boot_id[8])
+		generate_random_uuid(kernel_boot_id);
+	spin_unlock(&bootid_spinlock);
+	return kernel_boot_id;
+}
+EXPORT_SYMBOL_GPL(get_kernel_boot_id);
+
 /********************************************************************
  *
  * Sysctl interface
@@ -2045,12 +2059,9 @@ SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count,
 static int min_write_thresh;
 static int max_write_thresh = INPUT_POOL_WORDS * 32;
 static int random_min_urandom_seed = 60;
-static char sysctl_bootid[16];
 
 /*
- * This function is used to return both the bootid UUID, and random
- * UUID.  The difference is in whether table->data is NULL; if it is,
- * then a new UUID is generated and returned to the user.
+ * This function is used to return a random UUID.
  *
  * If the user accesses this via the proc interface, the UUID will be
  * returned as an ASCII string in the standard UUID format; if via the
@@ -2060,23 +2071,32 @@ static int proc_do_uuid(struct ctl_table *table, int write,
 			void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	struct ctl_table fake_table;
-	unsigned char buf[64], tmp_uuid[16], *uuid;
+	unsigned char buf[64], uuid[16];
 
-	uuid = table->data;
-	if (!uuid) {
-		uuid = tmp_uuid;
-		generate_random_uuid(uuid);
-	} else {
-		static DEFINE_SPINLOCK(bootid_spinlock);
-
-		spin_lock(&bootid_spinlock);
-		if (!uuid[8])
-			generate_random_uuid(uuid);
-		spin_unlock(&bootid_spinlock);
-	}
+	generate_random_uuid(uuid);
 
 	sprintf(buf, "%pU", uuid);
+	fake_table.data = buf;
+	fake_table.maxlen = sizeof(buf);
 
+	return proc_dostring(&fake_table, write, buffer, lenp, ppos);
+}
+
+/*
+ * This function is used to return the boot_id UUID.
+ *
+ * If the user accesses this via the proc interface, the UUID will be
+ * returned as an ASCII string in the standard UUID format; if via the
+ * sysctl system call, as 16 bytes of binary data.
+ */
+static int proc_do_boot_id(struct ctl_table *table, int write,
+			void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table fake_table;
+	unsigned char buf[64], *uuid;
+
+	uuid = get_kernel_boot_id();
+	sprintf(buf, "%pU", uuid);
 	fake_table.data = buf;
 	fake_table.maxlen = sizeof(buf);
 
@@ -2135,10 +2155,10 @@ struct ctl_table random_table[] = {
 	},
 	{
 		.procname	= "boot_id",
-		.data		= &sysctl_bootid,
+		.data		= NULL,
 		.maxlen		= 16,
 		.mode		= 0444,
-		.proc_handler	= proc_do_uuid,
+		.proc_handler	= proc_do_boot_id,
 	},
 	{
 		.procname	= "uuid",

@@ -45,6 +45,9 @@ extern int add_random_ready_callback(struct random_ready_callback *rdy);
 extern void del_random_ready_callback(struct random_ready_callback *rdy);
 extern int __must_check get_random_bytes_arch(void *buf, int nbytes);
 
+#define KERNEL_BOOT_ID_LEN	16
+extern unsigned char *get_kernel_boot_id(void);
+
 #ifndef MODULE
 extern const struct file_operations random_fops, urandom_fops;
 #endif
