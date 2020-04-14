@@ -3,6 +3,17 @@
 #define __ASM_ARM_COMPILER_H
 
 /*
+ * Don't allow compiling with buggy compiler.
+ *
+ * http://gcc.gnu.org/bugzilla/show_bug.cgi?id=58854
+ */
+#ifdef GCC_VERSION
+# if GCC_VERSION >= 40800 && GCC_VERSION <= 40802
+#  error Your gcc version produces clobbered frame accesses
+# endif
+#endif
+
+/*
  * This is used to ensure the compiler did actually allocate the register we
  * asked it for some inline assembly sequences.  Apparently we can't trust
  * the compiler from one version to another so a bit of paranoia won't hurt.
