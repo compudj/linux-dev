@@ -1155,6 +1155,7 @@ static int de_thread(struct task_struct *tsk)
 	struct signal_struct *sig = tsk->signal;
 	struct sighand_struct *oldsighand = tsk->sighand;
 	spinlock_t *lock = &oldsighand->siglock;
+	pid_t old_pid, old_vpid;
 
 	if (thread_group_empty(tsk))
 		goto no_thread_group;
@@ -1187,6 +1188,11 @@ static int de_thread(struct task_struct *tsk)
 	}
 	spin_unlock_irq(lock);
 
+	old_pid = current->pid;
+	rcu_read_lock();
+	old_vpid = task_pid_nr_ns(current, task_active_pid_ns(current->parent));
+	rcu_read_unlock();
+
 	/*
 	 * At this point all other threads have exited, all we have to
 	 * do is to wait for the thread group leader to become inactive,
@@ -1212,6 +1218,8 @@ static int de_thread(struct task_struct *tsk)
 			if (__fatal_signal_pending(tsk))
 				goto killed;
 		}
+
+		ptrace_event(PTRACE_EVENT_EXEC_BEGIN, old_vpid);
 
 		/*
 		 * The only record we have of the real-time age of a
@@ -1265,6 +1273,8 @@ static int de_thread(struct task_struct *tsk)
 		cgroup_threadgroup_change_end(tsk);
 
 		release_task(leader);
+	} else {
+		ptrace_event(PTRACE_EVENT_EXEC_BEGIN, old_vpid);
 	}
 
 	sig->group_exit_task = NULL;

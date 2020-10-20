@@ -119,6 +119,7 @@ struct ptrace_syscall_info {
 #define PTRACE_EVENT_VFORK_DONE	5
 #define PTRACE_EVENT_EXIT	6
 #define PTRACE_EVENT_SECCOMP	7
+#define PTRACE_EVENT_EXEC_BEGIN	8
 /* Extended result codes which enabled by means other than options.  */
 #define PTRACE_EVENT_STOP	128
 
@@ -131,6 +132,7 @@ struct ptrace_syscall_info {
 #define PTRACE_O_TRACEVFORKDONE	(1 << PTRACE_EVENT_VFORK_DONE)
 #define PTRACE_O_TRACEEXIT	(1 << PTRACE_EVENT_EXIT)
 #define PTRACE_O_TRACESECCOMP	(1 << PTRACE_EVENT_SECCOMP)
+#define PTRACE_O_TRACEEXECBEGIN	(1 << PTRACE_EVENT_EXEC_BEGIN)
 
 /* eventless options */
 #define PTRACE_O_EXITKILL		(1 << 20)
