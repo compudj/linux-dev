@@ -393,7 +393,9 @@ static int tracepoint_remove_func(struct tracepoint *tp,
 		/* Set static call to first function */
 		tracepoint_update_call(tp, tp_funcs);
 		break;
-	case TP_FUNC_N:		/* N->N-1 (N>2) */
+	case TP_FUNC_2:		/* N->N-1 (N>2) */
+		fallthrough;
+	case TP_FUNC_N:
 		rcu_assign_pointer(tp->funcs, tp_funcs);
 		break;
 	default:
