@@ -17,14 +17,16 @@ TRACE_EVENT(rseq_update,
 	TP_STRUCT__entry(
 		__field(s32, cpu_id)
 		__field(s32, node_id)
+		__field(s32, vm_vcpu_id)
 	),
 
 	TP_fast_assign(
 		__entry->cpu_id = raw_smp_processor_id();
 		__entry->node_id = cpu_to_node(raw_smp_processor_id());
+		__entry->vm_vcpu_id = t->mm_vcpu;
 	),
 
-	TP_printk("cpu_id=%d node_id=%d", __entry->cpu_id, __entry->node_id)
+	TP_printk("cpu_id=%d node_id=%d vm_vcpu_id=%d", __entry->cpu_id, __entry->node_id, __entry->vm_vcpu_id)
 );
 
 TRACE_EVENT(rseq_ip_fixup,
