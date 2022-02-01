@@ -2040,6 +2040,7 @@ void activate_task(struct rq *rq, struct task_struct *p, int flags)
 
 void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
 {
+	rq_vcpu_cache_remove_mm(rq, p->mm);
 	p->on_rq = (flags & DEQUEUE_SLEEP) ? 0 : TASK_ON_RQ_MIGRATING;
 
 	dequeue_task(rq, p, flags);
@@ -4796,6 +4797,7 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
 	sched_info_switch(rq, prev, next);
 	perf_event_task_sched_out(prev, next);
 	rseq_preempt(prev);
+	switch_mm_vcpu(rq, prev, next);
 	fire_sched_out_preempt_notifiers(prev, next);
 	kmap_local_sched_out();
 	prepare_task(next);
@@ -10917,3 +10919,58 @@ void call_trace_sched_update_nr_running(struct rq *rq, int count)
 {
         trace_sched_update_nr_running_tp(rq, count);
 }
+
+#ifdef CONFIG_SCHED_MM_VCPU
+void sched_vcpu_release_mm(struct task_struct *t, struct mm_struct *mm)
+{
+	if (!mm)
+		return;
+	WARN_ON_ONCE(t != current);
+	preempt_disable();
+	t->vcpu_mm_active = 0;
+	/* Skip for single-threaded process. */
+	if (!t->mm_vcpu && !cpumask_test_cpu(0, mm_vcpumask(mm)))
+		schedstat_inc(this_rq()->nr_vcpu_put_skip_single_thread);
+	else
+		__mm_vcpu_put(mm, t->mm_vcpu);
+	t->mm_vcpu = -1;
+	preempt_enable();
+}
+
+void sched_vcpu_activate_mm(struct task_struct *t, struct mm_struct *mm)
+{
+	WARN_ON_ONCE(t != current);
+	WARN_ON_ONCE(atomic_read(&mm->mm_users) != 1);
+	preempt_disable();
+	t->vcpu_mm_active = 1;
+	/* No need to reserve in cpumask because single-threaded. */
+	t->mm_vcpu = 0;
+	preempt_enable();
+}
+
+void sched_vcpu_get_mm(struct task_struct *t, struct mm_struct *mm)
+{
+	preempt_disable();
+	t->vcpu_mm_active = 1;
+	t->mm_vcpu = -1;
+	/*
+	 * On transition from 1 to 2 mm users, reserve vcpu=0 in the cpumask
+	 * for the current task (parent of thread t).
+	 * Use mm_vcpu and mask rather than mm_users to not be fooled by
+	 * get_task_mm() also grabbing a mm_users reference.
+	 */
+	if (!current->mm_vcpu && !cpumask_test_cpu(0, mm_vcpumask(mm))) {
+		int vcpu = __mm_vcpu_get(mm);
+		WARN_ON_ONCE(vcpu != 0);
+	}
+	preempt_enable();
+}
+
+void sched_vcpu_dup_mm(struct task_struct *t, struct mm_struct *mm)
+{
+	preempt_disable();
+	t->vcpu_mm_active = 1;
+	t->mm_vcpu = -1;
+	preempt_enable();
+}
+#endif
