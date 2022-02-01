@@ -763,6 +763,14 @@ do {									\
 		P(sched_goidle);
 		P(ttwu_count);
 		P(ttwu_local);
+#undef P
+#define P(n) SEQ_printf(m, "  .%-30s: %Ld\n", #n, schedstat_val(rq->n));
+		P(nr_vcpu_atomic_get);
+		P(nr_vcpu_atomic_put);
+		P(nr_vcpu_transfer);
+		P(nr_vcpu_cache_hit);
+		P(nr_vcpu_get_skip_single_thread);
+		P(nr_vcpu_put_skip_single_thread);
 	}
 #undef P
 

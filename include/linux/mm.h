@@ -3398,5 +3398,30 @@ static inline int seal_check_future_write(int seals, struct vm_area_struct *vma)
 	return 0;
 }
 
+#ifdef CONFIG_SCHED_MM_VCPU
+void sched_vcpu_release_mm(struct task_struct *t, struct mm_struct *mm);
+void sched_vcpu_activate_mm(struct task_struct *t, struct mm_struct *mm);
+void sched_vcpu_get_mm(struct task_struct *t, struct mm_struct *mm);
+void sched_vcpu_dup_mm(struct task_struct *t, struct mm_struct *mm);
+static inline int task_mm_vcpu_id(struct task_struct *t)
+{
+	return t->mm_vcpu;
+}
+#else
+static inline void sched_vcpu_release_mm(struct task_struct *t, struct mm_struct *mm) { }
+static inline void sched_vcpu_activate_mm(struct task_struct *t, struct mm_struct *mm) { }
+static inline void sched_vcpu_get_mm(struct task_struct *t, struct mm_struct *mm) { }
+static inline void sched_vcpu_dup_mm(struct task_struct *t, struct mm_struct *mm) { }
+static inline int task_mm_vcpu_id(struct task_struct *t)
+{
+	/*
+	 * Use the processor id as a fall-back when the mm vcpu feature is
+	 * disabled. This provides functional per-cpu data structure accesses
+	 * in user-space, althrough it won't provide the memory usage benefits.
+	 */
+	return raw_smp_processor_id();
+}
+#endif
+
 #endif /* __KERNEL__ */
 #endif /* _LINUX_MM_H */
