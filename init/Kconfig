@@ -1023,6 +1023,10 @@ config RT_GROUP_SCHED
 
 endif #CGROUP_SCHED
 
+config VCPU_DOMAIN
+	def_bool y
+	depends on SMP && RSEQ
+
 config UCLAMP_TASK_GROUP
 	bool "Utilization clamping per group of tasks"
 	depends on CGROUP_SCHED

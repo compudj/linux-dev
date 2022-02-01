@@ -66,6 +66,7 @@
 #include <linux/io_uring.h>
 #include <linux/syscall_user_dispatch.h>
 #include <linux/coredump.h>
+#include <linux/vcpu.h>
 
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
@@ -1006,6 +1007,8 @@ static int exec_mmap(struct mm_struct *mm)
 	active_mm = tsk->active_mm;
 	tsk->active_mm = mm;
 	tsk->mm = mm;
+	vcpu_domain_init(mm_vcpu_domain(mm));
+	vcpu_domain_activate(tsk, mm_vcpu_domain(mm));
 	/*
 	 * This prevents preemption while active_mm is being loaded and
 	 * it and mm are being updated, which could cause problems for

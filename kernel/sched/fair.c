@@ -7817,6 +7817,7 @@ static void detach_task(struct task_struct *p, struct lb_env *env)
 	lockdep_assert_rq_held(env->src_rq);
 
 	deactivate_task(env->src_rq, p, DEQUEUE_NOCLOCK);
+	rq_vcpu_domain_migrate_locked(env->src_rq, p);
 	set_task_cpu(p, env->dst_cpu);
 }
 

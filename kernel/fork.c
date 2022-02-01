@@ -97,6 +97,7 @@
 #include <linux/scs.h>
 #include <linux/io_uring.h>
 #include <linux/bpf.h>
+#include <linux/vcpu.h>
 
 #include <asm/pgalloc.h>
 #include <linux/uaccess.h>
@@ -970,6 +971,11 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #ifdef CONFIG_MEMCG
 	tsk->active_memcg = NULL;
 #endif
+
+#ifdef CONFIG_VCPU_DOMAIN
+	tsk->mm_vcpu = 0;
+	tsk->vcpu_domain_active = 0;
+#endif
 	return tsk;
 
 free_stack:
@@ -1079,6 +1085,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 		goto fail_nocontext;
 
 	mm->user_ns = get_user_ns(user_ns);
+	vcpu_domain_init(mm_vcpu_domain(mm));
 	return mm;
 
 fail_nocontext:
@@ -1380,6 +1387,8 @@ static int wait_for_vfork_done(struct task_struct *child,
  */
 static void mm_release(struct task_struct *tsk, struct mm_struct *mm)
 {
+	vcpu_domain_release(tsk, mm_vcpu_domain(mm));
+
 	uprobe_free_utask(tsk);
 
 	/* Get rid of any cached register state */
@@ -1499,10 +1508,12 @@ static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
 	if (clone_flags & CLONE_VM) {
 		mmget(oldmm);
 		mm = oldmm;
+		vcpu_domain_get(tsk, mm_vcpu_domain(mm));
 	} else {
 		mm = dup_mm(tsk, current->mm);
 		if (!mm)
 			return -ENOMEM;
+		vcpu_domain_dup(tsk, mm_vcpu_domain(mm));
 	}
 
 	tsk->mm = mm;
@@ -2901,7 +2912,7 @@ void __init proc_caches_init(void)
 	 * dynamically sized based on the maximum CPU number this system
 	 * can have, taking hotplug into account (nr_cpu_ids).
 	 */
-	mm_size = sizeof(struct mm_struct) + cpumask_size();
+	mm_size = sizeof(struct mm_struct) + cpumask_size() + vcpu_domain_size();
 
 	mm_cachep = kmem_cache_create_usercopy("mm_struct",
 			mm_size, ARCH_MIN_MMSTRUCT_ALIGN,

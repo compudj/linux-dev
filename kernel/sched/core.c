@@ -16,6 +16,7 @@
 #include <linux/blkdev.h>
 #include <linux/kcov.h>
 #include <linux/scs.h>
+#include <linux/vcpu.h>
 
 #include <asm/switch_to.h>
 #include <asm/tlb.h>
@@ -2267,6 +2268,7 @@ static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 	lockdep_assert_rq_held(rq);
 
 	deactivate_task(rq, p, DEQUEUE_NOCLOCK);
+	rq_vcpu_domain_migrate_locked(rq, p);
 	set_task_cpu(p, new_cpu);
 	rq_unlock(rq, rf);
 
@@ -2454,6 +2456,7 @@ int push_cpu_stop(void *arg)
 	// XXX validate p is still the highest prio task
 	if (task_rq(p) == rq) {
 		deactivate_task(rq, p, 0);
+		rq_vcpu_domain_migrate_locked(rq, p);
 		set_task_cpu(p, lowest_rq->cpu);
 		activate_task(lowest_rq, p, 0);
 		resched_curr(lowest_rq);
@@ -3093,6 +3096,7 @@ static void __migrate_swap_task(struct task_struct *p, int cpu)
 		rq_pin_lock(dst_rq, &drf);
 
 		deactivate_task(src_rq, p, 0);
+		rq_vcpu_domain_migrate_locked(src_rq, p);
 		set_task_cpu(p, cpu);
 		activate_task(dst_rq, p, 0);
 		check_preempt_curr(dst_rq, p, 0);
@@ -3716,6 +3720,8 @@ static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags
 	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
 
 	WRITE_ONCE(rq->ttwu_pending, 1);
+	if (WARN_ON_ONCE(task_cpu(p) != cpu_of(rq)))
+		rq_vcpu_domain_migrate_locked(task_rq(p), p);
 	__smp_call_single_queue(cpu, &p->wake_entry.llist);
 }
 
@@ -4125,6 +4131,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 
 		wake_flags |= WF_MIGRATED;
 		psi_ttwu_dequeue(p);
+		rq_vcpu_domain_migrate(task_rq(p), p);
 		set_task_cpu(p, cpu);
 	}
 #else
@@ -4796,6 +4803,7 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
 	sched_info_switch(rq, prev, next);
 	perf_event_task_sched_out(prev, next);
 	rseq_preempt(prev);
+	switch_mm_vcpu(rq, prev, next);
 	fire_sched_out_preempt_notifiers(prev, next);
 	kmap_local_sched_out();
 	prepare_task(next);
@@ -5922,6 +5930,7 @@ static bool try_steal_cookie(int this, int that)
 			goto next;
 
 		deactivate_task(src, p, 0);
+		rq_vcpu_domain_migrate_locked(src, p);
 		set_task_cpu(p, this);
 		activate_task(dst, p, 0);
 
@@ -10927,3 +10936,77 @@ void call_trace_sched_update_nr_running(struct rq *rq, int count)
 {
         trace_sched_update_nr_running_tp(rq, count);
 }
+
+#ifdef CONFIG_VCPU_DOMAIN
+void vcpu_domain_release(struct task_struct *t, struct vcpu_domain *vcpu_domain)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+
+	if (!vcpu_domain)
+		return;
+	WARN_ON_ONCE(t != current);
+	preempt_disable();
+	rq = this_rq();
+	rq_lock_irqsave(rq, &rf);
+	t->vcpu_domain_active = 0;
+	atomic_dec(&vcpu_domain->users);
+	rq_vcpu_cache_remove_vcpu_domain_locked(rq, vcpu_domain, true);
+	rq_unlock_irqrestore(rq, &rf);
+	t->mm_vcpu = -1;
+	preempt_enable();
+}
+
+void vcpu_domain_activate(struct task_struct *t, struct vcpu_domain *vcpu_domain)
+{
+	WARN_ON_ONCE(t != current);
+	preempt_disable();
+	t->vcpu_domain_active = 1;
+	/* No need to reserve in cpumask because single-threaded. */
+	t->mm_vcpu = vcpu_domain_vcpu_first_node_vcpu(numa_node_id());
+	preempt_enable();
+}
+
+void vcpu_domain_get(struct task_struct *t, struct vcpu_domain *vcpu_domain)
+{
+	int vcpu, vcpu_users;
+	struct rq_flags rf;
+	struct rq *rq;
+
+	preempt_disable();
+	rq = this_rq();
+	t->vcpu_domain_active = 1;
+	vcpu_users = atomic_read(&vcpu_domain->users);
+	atomic_inc(&vcpu_domain->users);
+	t->mm_vcpu = -1;
+	vcpu = current->mm_vcpu;
+	rq_lock_irqsave(rq, &rf);
+	/* On transition from 1 to 2 vcpu domain users, reserve vcpu ids. */
+	if (vcpu_users == 1) {
+		vcpu_domain_vcpu_reserve_nodes(vcpu_domain);
+		rq_vcpu_cache_remove_vcpu_domain_locked(rq, vcpu_domain, true);
+		current->mm_vcpu = __vcpu_domain_vcpu_get(rq, vcpu_domain);
+		rq_vcpu_cache_add(rq, vcpu_domain, current->mm_vcpu);
+		/*
+		 * __vcpu_domain_vcpu_get could get a different vcpu after
+		 * going multi-threaded, then back single-threaded, then
+		 * multi-threaded on a NUMA configuration using the first CPU
+		 * matching the NUMA node as single-threaded vcpu, with
+		 * leftover vcpu_id matching the NUMA node set from when this
+		 * task was multithreaded.
+		 */
+		if (current->mm_vcpu != vcpu)
+			rseq_set_notify_resume(current);
+	}
+	rq_unlock_irqrestore(rq, &rf);
+	preempt_enable();
+}
+
+void vcpu_domain_dup(struct task_struct *t, struct vcpu_domain *vcpu_domain)
+{
+	preempt_disable();
+	t->vcpu_domain_active = 1;
+	t->mm_vcpu = -1;
+	preempt_enable();
+}
+#endif

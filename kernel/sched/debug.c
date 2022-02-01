@@ -763,6 +763,19 @@ do {									\
 		P(sched_goidle);
 		P(ttwu_count);
 		P(ttwu_local);
+#undef P
+#define P(n) SEQ_printf(m, "  .%-30s: %Ld\n", #n, schedstat_val(rq->n));
+		P(nr_vcpu_thread_transfer);
+		P(nr_vcpu_cache_hit);
+		P(nr_vcpu_cache_evict);
+		P(nr_vcpu_cache_discard_wrong_node);
+		P(nr_vcpu_allocate);
+		P(nr_vcpu_allocate_node_reuse);
+		P(nr_vcpu_allocate_node_new);
+		P(nr_vcpu_allocate_node_rebalance);
+		P(nr_vcpu_allocate_node_steal);
+		P(nr_vcpu_remove_release);
+		P(nr_vcpu_remove_migrate);
 	}
 #undef P
 

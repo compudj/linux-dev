@@ -3374,5 +3374,45 @@ madvise_set_anon_name(struct mm_struct *mm, unsigned long start,
 }
 #endif
 
+#ifdef CONFIG_VCPU_DOMAIN
+static inline struct vcpu_domain *mm_vcpu_domain(struct mm_struct *mm)
+{
+	unsigned long vcpu_bitmap = (unsigned long)mm;
+
+	if (!mm)
+		return NULL;
+	vcpu_bitmap += offsetof(struct mm_struct, cpu_bitmap);
+	/* Skip cpu_bitmap */
+	vcpu_bitmap += cpumask_size();
+	return (struct vcpu_domain *)vcpu_bitmap;
+}
+void vcpu_domain_release(struct task_struct *t, struct vcpu_domain *domain);
+void vcpu_domain_activate(struct task_struct *t, struct vcpu_domain *domain);
+void vcpu_domain_get(struct task_struct *t, struct vcpu_domain *domain);
+void vcpu_domain_dup(struct task_struct *t, struct vcpu_domain *domain);
+static inline int task_mm_vcpu_id(struct task_struct *t)
+{
+	return t->mm_vcpu;
+}
+#else
+static inline struct vcpu_domain *mm_vcpu_domain(struct mm_struct *mm)
+{
+	return NULL;
+}
+void vcpu_domain_release(struct task_struct *t, struct vcpu_domain *domain) { }
+void vcpu_domain_activate(struct task_struct *t, struct vcpu_domain *domain) { }
+void vcpu_domain_get(struct task_struct *t, struct vcpu_domain *domain) { }
+void vcpu_domain_dup(struct task_struct *t, struct vcpu_domain *domain) { }
+static inline int task_mm_vcpu_id(struct task_struct *t)
+{
+	/*
+	 * Use the processor id as a fall-back when the mm vcpu feature is
+	 * disabled. This provides functional per-cpu data structure accesses
+	 * in user-space, althrough it won't provide the memory usage benefits.
+	 */
+	return raw_smp_processor_id();
+}
+#endif
+
 #endif /* __KERNEL__ */
 #endif /* _LINUX_MM_H */
