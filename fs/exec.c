@@ -1006,6 +1006,10 @@ static int exec_mmap(struct mm_struct *mm)
 	active_mm = tsk->active_mm;
 	tsk->active_mm = mm;
 	tsk->mm = mm;
+	mm_init_vcpu_users(mm);
+	mm_init_vcpumask(mm);
+	mm_init_node_vcpumask(mm);
+	sched_vcpu_activate_mm(tsk, mm);
 	/*
 	 * This prevents preemption while active_mm is being loaded and
 	 * it and mm are being updated, which could cause problems for

@@ -916,6 +916,19 @@ struct uclamp_rq {
 DECLARE_STATIC_KEY_FALSE(sched_uclamp_used);
 #endif /* CONFIG_UCLAMP_TASK */
 
+#ifdef CONFIG_SCHED_MM_VCPU
+# define RQ_VCPU_CACHE_SIZE	8
+struct rq_vcpu_entry {
+	struct mm_struct *mm;	/* NULL if unset */
+	int vcpu_id;
+};
+
+struct rq_vcpu_cache {
+	struct rq_vcpu_entry entry[RQ_VCPU_CACHE_SIZE];
+	unsigned int head;
+};
+#endif
+
 /*
  * This is the main, per-CPU runqueue data structure.
  *
@@ -1086,6 +1099,19 @@ struct rq {
 	/* try_to_wake_up() stats */
 	unsigned int		ttwu_count;
 	unsigned int		ttwu_local;
+
+	unsigned long long 	nr_vcpu_single_thread;
+	unsigned long long 	nr_vcpu_thread_transfer;
+	unsigned long long	nr_vcpu_cache_hit;
+	unsigned long long	nr_vcpu_cache_evict;
+	unsigned long long	nr_vcpu_cache_discard_wrong_node;
+	unsigned long long	nr_vcpu_allocate;
+	unsigned long long	nr_vcpu_allocate_node_reuse;
+	unsigned long long	nr_vcpu_allocate_node_new;
+	unsigned long long	nr_vcpu_allocate_node_rebalance;
+	unsigned long long	nr_vcpu_allocate_node_steal;
+	unsigned long long	nr_vcpu_remove_release_mm;
+	unsigned long long	nr_vcpu_remove_migrate;
 #endif
 
 #ifdef CONFIG_CPU_IDLE
@@ -1115,6 +1141,10 @@ struct rq {
 	unsigned int		core_forceidle_seq;
 	unsigned int		core_forceidle_occupation;
 	u64			core_forceidle_start;
+#endif
+
+#ifdef CONFIG_SCHED_MM_VCPU
+	struct rq_vcpu_cache	vcpu_cache;
 #endif
 };
 
@@ -3118,3 +3148,329 @@ extern int sched_dynamic_mode(const char *str);
 extern void sched_dynamic_update(int mode);
 #endif
 
+#ifdef CONFIG_SCHED_MM_VCPU
+static inline int __mm_vcpu_get_single_node(struct mm_struct *mm)
+{
+	struct cpumask *cpumask;
+	int vcpu;
+
+	cpumask = mm_vcpumask(mm);
+	/* Atomically reserve lowest available vcpu number. */
+	do {
+		vcpu = cpumask_first_zero(cpumask);
+		if (vcpu >= nr_cpu_ids)
+			return -1;
+	} while (cpumask_test_and_set_cpu(vcpu, cpumask));
+	return vcpu;
+}
+
+#ifdef CONFIG_NUMA
+static inline bool mm_node_vcpumask_test_cpu(struct mm_struct *mm, int vcpu_id)
+{
+	if (num_possible_nodes() == 1)
+		return true;
+	return cpumask_test_cpu(vcpu_id, mm_node_vcpumask(mm, numa_node_id()));
+}
+
+static inline int __mm_vcpu_get(struct rq *rq, struct mm_struct *mm)
+{
+	struct cpumask *cpumask = mm_vcpumask(mm),
+		       *node_cpumask = mm_node_vcpumask(mm, numa_node_id()),
+		       *node_alloc_cpumask = mm_node_alloc_vcpumask(mm);
+	unsigned int node;
+	int vcpu;
+
+	if (num_possible_nodes() == 1)
+		return __mm_vcpu_get_single_node(mm);
+
+	/*
+	 * Try to atomically reserve lowest available vcpu number within those
+	 * already reserved for this NUMA node.
+	 */
+	do {
+		vcpu = cpumask_first_one_and_zero(node_cpumask, cpumask);
+		if (vcpu >= nr_cpu_ids)
+			goto alloc_numa;
+	} while (cpumask_test_and_set_cpu(vcpu, cpumask));
+	schedstat_inc(rq->nr_vcpu_allocate_node_reuse);
+	goto end;
+
+alloc_numa:
+	/*
+	 * Try to atomically reserve lowest available vcpu number within those
+	 * not already allocated for numa nodes.
+	 */
+	do {
+		vcpu = cpumask_first_zero_and_zero(node_alloc_cpumask, cpumask);
+		if (vcpu >= nr_cpu_ids)
+			goto numa_update;
+	} while (cpumask_test_and_set_cpu(vcpu, cpumask));
+	cpumask_set_cpu(vcpu, node_cpumask);
+	cpumask_set_cpu(vcpu, node_alloc_cpumask);
+	schedstat_inc(rq->nr_vcpu_allocate_node_new);
+	goto end;
+
+numa_update:
+	/*
+	 * NUMA node id configuration changed for at least one CPU in the system.
+	 * We need to steal a currently unused vcpu_id from an overprovisioned
+	 * node for our current node. Userspace must handle the fact that the
+	 * node id associated with this vcpu_id may change due to node ID
+	 * reconfiguration.
+	 *
+	 * Count how many possible cpus are attached to each (other) node id,
+	 * and compare this with the per-mm node vcpumask cpu count. Find one
+	 * which has too many cpus in its mask to steal from.
+	 */
+	for (node = 0; node < nr_node_ids; node++) {
+		struct cpumask *iter_cpumask;
+
+		if (node == numa_node_id())
+			continue;
+		iter_cpumask = mm_node_vcpumask(mm, node);
+		if (nr_cpus_node(node) < cpumask_weight(iter_cpumask)) {
+			/* Try to steal from this node. */
+			do {
+				vcpu = cpumask_first_one_and_zero(iter_cpumask, cpumask);
+				if (vcpu >= nr_cpu_ids)
+					goto steal_fail;
+			} while (cpumask_test_and_set_cpu(vcpu, cpumask));
+			cpumask_clear_cpu(vcpu, iter_cpumask);
+			cpumask_set_cpu(vcpu, node_cpumask);
+			schedstat_inc(rq->nr_vcpu_allocate_node_rebalance);
+			goto end;
+		}
+	}
+
+steal_fail:
+	/*
+	 * Our attempt at gracefully stealing a vcpu_id from another
+	 * overprovisioned NUMA node failed. Fallback to grabbing the first
+	 * available vcpu_id.
+	 */
+	do {
+		vcpu = cpumask_first_zero(cpumask);
+		if (vcpu >= nr_cpu_ids)
+			return -1;
+	} while (cpumask_test_and_set_cpu(vcpu, cpumask));
+	/* Steal vcpu from its numa node mask. */
+	for (node = 0; node < nr_node_ids; node++) {
+		struct cpumask *iter_cpumask;
+
+		if (node == numa_node_id())
+			continue;
+		iter_cpumask = mm_node_vcpumask(mm, node);
+		if (cpumask_test_cpu(vcpu, iter_cpumask)) {
+			cpumask_clear_cpu(vcpu, iter_cpumask);
+			break;
+		}
+	}
+	cpumask_set_cpu(vcpu, node_cpumask);
+	schedstat_inc(rq->nr_vcpu_allocate_node_steal);
+end:
+	return vcpu;
+}
+
+static inline int mm_vcpu_first_node_vcpu(int node)
+{
+	if (likely(nr_cpu_ids >= nr_node_ids))
+		return node;
+	else {
+		int vcpu;
+
+		vcpu = cpumask_first(cpumask_of_node(node));
+		if (vcpu >= nr_cpu_ids)
+			return -1;
+		return vcpu;
+	}
+}
+
+/*
+ * Single-threaded processes observe a mapping of vcpu_id->node_id where
+ * the vcpu_id returned corresponds to mm_vcpu_first_node_vcpu(). When going
+ * from single to multi-threaded, reserve this same mapping so it stays
+ * invariant.
+ */
+static inline void mm_vcpu_reserve_nodes(struct mm_struct *mm)
+{
+	struct cpumask *node_alloc_cpumask = mm_node_alloc_vcpumask(mm);
+	int node, other_node;
+
+	for (node = 0; node < nr_node_ids; node++) {
+		struct cpumask *iter_cpumask = mm_node_vcpumask(mm, node);
+		int vcpu = mm_vcpu_first_node_vcpu(node);
+
+		/* Skip nodes that have no CPU associated with them. */
+		if (vcpu < 0)
+			continue;
+		cpumask_set_cpu(vcpu, iter_cpumask);
+		cpumask_set_cpu(vcpu, node_alloc_cpumask);
+		for (other_node = 0; other_node < nr_node_ids; other_node++) {
+			if (other_node == node)
+				continue;
+			cpumask_clear_cpu(vcpu, mm_node_vcpumask(mm, other_node));
+		}
+	}
+}
+#else
+static inline bool mm_node_vcpumask_test_cpu(struct mm_struct *mm, int vcpu_id)
+{
+	return true;
+}
+static inline int __mm_vcpu_get(struct rq *rq, struct mm_struct *mm)
+{
+	return __mm_vcpu_get_single_node(mm);
+}
+static inline int mm_vcpu_first_node_vcpu(int node)
+{
+	return 0;
+}
+static inline void mm_vcpu_reserve_nodes(struct mm_struct *mm) { }
+#endif
+
+static inline void __mm_vcpu_put(struct mm_struct *mm, int vcpu)
+{
+	if (vcpu < 0)
+		return;
+	cpumask_clear_cpu(vcpu, mm_vcpumask(mm));
+}
+
+static inline struct rq_vcpu_entry *rq_vcpu_cache_lookup(struct rq *rq, struct mm_struct *mm)
+{
+	struct rq_vcpu_cache *vcpu_cache = &rq->vcpu_cache;
+	int i;
+
+	for (i = 0; i < RQ_VCPU_CACHE_SIZE; i++) {
+		struct rq_vcpu_entry *entry = &vcpu_cache->entry[i];
+
+		if (entry->mm == mm)
+			return entry;
+	}
+	return NULL;
+}
+
+/* Removal from cache simply leaves an unused hole. */
+static inline int rq_vcpu_cache_lookup_remove(struct rq *rq, struct mm_struct *mm)
+{
+	struct rq_vcpu_entry *entry = rq_vcpu_cache_lookup(rq, mm);
+
+	if (!entry)
+		return -1;
+	entry->mm = NULL;	/* Remove from cache */
+	return entry->vcpu_id;
+}
+
+static inline void rq_vcpu_cache_remove_mm_locked(struct rq *rq, struct mm_struct *mm, bool release_mm)
+{
+	int vcpu;
+
+	if (!mm)
+		return;
+	/*
+	 * Do not remove the cache entry for a runqueue that runs a task which
+	 * currently uses the target mm.
+	 */
+	if (!release_mm && rq->curr->mm == mm)
+		return;
+	vcpu = rq_vcpu_cache_lookup_remove(rq, mm);
+	if (vcpu < 0)
+		return;
+	if (release_mm)
+		schedstat_inc(rq->nr_vcpu_remove_release_mm);
+	else
+		schedstat_inc(rq->nr_vcpu_remove_migrate);
+	__mm_vcpu_put(mm, vcpu);
+}
+
+static inline void rq_vcpu_cache_remove_mm(struct rq *rq, struct mm_struct *mm, bool release_mm)
+{
+	struct rq_flags rf;
+
+	rq_lock_irqsave(rq, &rf);
+	rq_vcpu_cache_remove_mm_locked(rq, mm, release_mm);
+	rq_unlock_irqrestore(rq, &rf);
+}
+
+/*
+ * Add at head, move head forward. Cheap LRU cache.
+ * Only need to clear the vcpu mask bit from its own mm_vcpumask(mm) when we
+ * overwrite an old entry from the cache. Note that this is not needed if the
+ * overwritten entry is an unused hole. This access to the old_mm from an
+ * unrelated thread requires that cache entry for a given mm gets pruned from
+ * the cache when a task is dequeued from the runqueue.
+ */
+static inline void rq_vcpu_cache_add(struct rq *rq, struct mm_struct *mm, int vcpu_id)
+{
+	struct rq_vcpu_cache *vcpu_cache = &rq->vcpu_cache;
+	struct mm_struct *old_mm;
+	struct rq_vcpu_entry *entry;
+	unsigned int pos;
+
+	pos = vcpu_cache->head;
+	entry = &vcpu_cache->entry[pos];
+	old_mm = entry->mm;
+	if (old_mm) {
+		schedstat_inc(rq->nr_vcpu_cache_evict);
+		__mm_vcpu_put(old_mm, entry->vcpu_id);
+	}
+	entry->mm = mm;
+	entry->vcpu_id = vcpu_id;
+	vcpu_cache->head = (pos + 1) % RQ_VCPU_CACHE_SIZE;
+}
+
+static inline int mm_vcpu_get(struct rq *rq, struct task_struct *t)
+{
+	struct rq_vcpu_entry *entry;
+	struct mm_struct *mm = t->mm;
+	int vcpu;
+
+	/* Skip allocation if mm is single-threaded. */
+	if (atomic_read(&mm->mm_vcpu_users) == 1) {
+		schedstat_inc(rq->nr_vcpu_single_thread);
+		vcpu = mm_vcpu_first_node_vcpu(numa_node_id());
+		goto end;
+	}
+	entry = rq_vcpu_cache_lookup(rq, mm);
+	if (likely(entry)) {
+		vcpu = entry->vcpu_id;
+		if (likely(mm_node_vcpumask_test_cpu(mm, vcpu))) {
+			schedstat_inc(rq->nr_vcpu_cache_hit);
+			goto end;
+		} else {
+			schedstat_inc(rq->nr_vcpu_cache_discard_wrong_node);
+			entry->mm = NULL;	/* Remove from cache */
+			__mm_vcpu_put(mm, vcpu);
+		}
+	}
+	schedstat_inc(rq->nr_vcpu_allocate);
+	vcpu = __mm_vcpu_get(rq, mm);
+	rq_vcpu_cache_add(rq, mm, vcpu);
+end:
+	return vcpu;
+}
+
+static inline void switch_mm_vcpu(struct rq *rq, struct task_struct *prev, struct task_struct *next)
+{
+	if (!(next->flags & PF_EXITING) && !(next->flags & PF_KTHREAD) && next->mm && next->vcpu_mm_active) {
+		if (!(prev->flags & PF_EXITING) && !(prev->flags & PF_KTHREAD) && prev->mm == next->mm &&
+				prev->vcpu_mm_active &&
+				mm_node_vcpumask_test_cpu(next->mm, prev->mm_vcpu)) {
+			/*
+			 * Switching between threads with the same mm. Simply pass the
+			 * vcpu token along to the next thread.
+			 */
+			schedstat_inc(rq->nr_vcpu_thread_transfer);
+			next->mm_vcpu = prev->mm_vcpu;
+		} else {
+			next->mm_vcpu = mm_vcpu_get(rq, next);
+		}
+	}
+	if (!(prev->flags & PF_EXITING) && !(prev->flags & PF_KTHREAD) && prev->mm && prev->vcpu_mm_active)
+		prev->mm_vcpu = -1;
+}
+
+#else
+static inline void switch_mm_vcpu(struct rq *rq, struct task_struct *prev, struct task_struct *next) { }
+static inline void rq_vcpu_cache_remove_mm_locked(struct rq *rq, struct mm_struct *mm, bool release_mm) { }
+static inline void rq_vcpu_cache_remove_mm(struct rq *rq, struct mm_struct *mm, bool release_mm) { }
+#endif

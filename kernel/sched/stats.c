@@ -134,12 +134,24 @@ static int show_schedstat(struct seq_file *seq, void *v)
 
 		/* runqueue-specific stats */
 		seq_printf(seq,
-		    "cpu%d %u 0 %u %u %u %u %llu %llu %lu",
+		    "cpu%d %u 0 %u %u %u %u %llu %llu %lu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
 		    cpu, rq->yld_count,
 		    rq->sched_count, rq->sched_goidle,
 		    rq->ttwu_count, rq->ttwu_local,
 		    rq->rq_cpu_time,
-		    rq->rq_sched_info.run_delay, rq->rq_sched_info.pcount);
+		    rq->rq_sched_info.run_delay, rq->rq_sched_info.pcount,
+		    rq->nr_vcpu_single_thread,
+		    rq->nr_vcpu_thread_transfer,
+		    rq->nr_vcpu_cache_hit,
+		    rq->nr_vcpu_cache_evict,
+		    rq->nr_vcpu_cache_discard_wrong_node,
+		    rq->nr_vcpu_allocate,
+		    rq->nr_vcpu_allocate_node_reuse,
+		    rq->nr_vcpu_allocate_node_new,
+		    rq->nr_vcpu_allocate_node_rebalance,
+		    rq->nr_vcpu_allocate_node_steal,
+		    rq->nr_vcpu_remove_release_mm,
+		    rq->nr_vcpu_remove_migrate);
 
 		seq_printf(seq, "\n");
 

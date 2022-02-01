@@ -17,6 +17,7 @@
 #include <linux/page-flags-layout.h>
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
+#include <linux/nodemask.h>
 
 #include <asm/mmu.h>
 
@@ -503,6 +504,20 @@ struct mm_struct {
 		 */
 		atomic_t mm_count;
 
+#ifdef CONFIG_SCHED_MM_VCPU
+		/**
+		 * @mm_vcpu_users: The number of references to &struct mm_struct
+		 * from user-space threads.
+		 *
+		 * Initialized to 1 for the first thread with a reference with
+		 * the mm. Incremented for each thread getting a reference to the
+		 * mm, and decremented on mm release from user-space threads.
+		 * Used to enable single-threaded mm_vcpu accounting (when == 1).
+		 */
+
+		atomic_t mm_vcpu_users;
+#endif
+
 #ifdef CONFIG_MMU
 		atomic_long_t pgtables_bytes;	/* PTE page table pages */
 #endif
@@ -659,6 +674,102 @@ static inline cpumask_t *mm_cpumask(struct mm_struct *mm)
 {
 	return (struct cpumask *)&mm->cpu_bitmap;
 }
+
+#ifdef CONFIG_SCHED_MM_VCPU
+/* Future-safe accessor for struct mm_struct's vcpu_mask. */
+static inline cpumask_t *mm_vcpumask(struct mm_struct *mm)
+{
+	unsigned long vcpu_bitmap = (unsigned long)mm;
+
+	vcpu_bitmap += offsetof(struct mm_struct, cpu_bitmap);
+	/* Skip cpu_bitmap */
+	vcpu_bitmap += cpumask_size();
+	return (struct cpumask *)vcpu_bitmap;
+}
+
+static inline void mm_init_vcpu_users(struct mm_struct *mm)
+{
+	atomic_set(&mm->mm_vcpu_users, 1);
+}
+
+static inline void mm_init_vcpumask(struct mm_struct *mm)
+{
+	cpumask_clear(mm_vcpumask(mm));
+}
+
+static inline unsigned int mm_vcpumask_size(void)
+{
+	return cpumask_size();
+}
+
+#else
+static inline cpumask_t *mm_vcpumask(struct mm_struct *mm)
+{
+	return NULL;
+}
+
+static inline void mm_init_vcpu_users(struct mm_struct *mm) { }
+static inline void mm_init_vcpumask(struct mm_struct *mm) { }
+
+static inline unsigned int mm_vcpumask_size(void)
+{
+	return 0;
+}
+#endif
+
+#if defined(CONFIG_SCHED_MM_VCPU) && defined(CONFIG_NUMA)
+/*
+ * Layout of node vcpumasks:
+ * - node_alloc vcpumask:        cpumask tracking which vcpu_id were
+ *                               allocated (across nodes) in this
+ *                               memory space.
+ * - node vcpumask[nr_node_ids]: per-node cpumask tracking which vcpu_id
+ *                               were allocated in this memory space.
+ */
+static inline cpumask_t *mm_node_alloc_vcpumask(struct mm_struct *mm)
+{
+	unsigned long vcpu_bitmap = (unsigned long)mm_vcpumask(mm);
+
+	/* Skip mm_vcpumask */
+	vcpu_bitmap += cpumask_size();
+	return (struct cpumask *)vcpu_bitmap;
+}
+
+static inline cpumask_t *mm_node_vcpumask(struct mm_struct *mm, unsigned int node)
+{
+	unsigned long vcpu_bitmap = (unsigned long)mm_node_alloc_vcpumask(mm);
+
+	/* Skip node alloc vcpumask */
+	vcpu_bitmap += cpumask_size();
+	vcpu_bitmap += node * cpumask_size();
+	return (struct cpumask *)vcpu_bitmap;
+}
+
+static inline void mm_init_node_vcpumask(struct mm_struct *mm)
+{
+	unsigned int node;
+
+	if (num_possible_nodes() == 1)
+		return;
+	cpumask_clear(mm_node_alloc_vcpumask(mm));
+	for (node = 0; node < nr_node_ids; node++)
+		cpumask_clear(mm_node_vcpumask(mm, node));
+}
+
+static inline unsigned int mm_node_vcpumask_size(void)
+{
+	if (num_possible_nodes() == 1)
+		return 0;
+	return (nr_node_ids + 1) * cpumask_size();
+}
+#else
+static inline void mm_init_node_vcpumask(struct mm_struct *mm) { }
+
+static inline unsigned int mm_node_vcpumask_size(void)
+{
+	return 0;
+}
+#endif
 
 struct mmu_gather;
 extern void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm);
