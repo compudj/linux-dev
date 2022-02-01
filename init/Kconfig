@@ -1023,6 +1023,20 @@ config RT_GROUP_SCHED
 
 endif #CGROUP_SCHED
 
+config SCHED_MM_VCPU
+	bool "Provide per memory space virtual cpu id"
+	depends on SMP
+	default n
+	help
+	  This feature allows the scheduler to expose a current virtual cpu id
+	  to user-space. This virtual cpu id is within the possible cpus range,
+	  and is temporarily (and uniquely) assigned while threads are actively
+	  running within a memory space. If a memory space has fewer threads than
+	  cores, or is limited to run on few cores concurrently through sched
+	  affinity or cgroup cpusets, the virtual cpu ids will be values close
+	  to 0, thus allowing efficient use of user-space memory for per-cpu
+	  data structures.
+
 config UCLAMP_TASK_GROUP
 	bool "Utilization clamping per group of tasks"
 	depends on CGROUP_SCHED

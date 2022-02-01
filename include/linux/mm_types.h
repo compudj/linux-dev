@@ -633,6 +633,11 @@ struct mm_struct {
 #ifdef CONFIG_IOMMU_SUPPORT
 		u32 pasid;
 #endif
+
+#ifdef CONFIG_SCHED_MM_VCPU
+	/* Mask of allocated vcpu ids within the mm. */
+	cpumask_t			vcpu_mask;
+#endif
 	} __randomize_layout;
 
 	/*

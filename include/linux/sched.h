@@ -1300,6 +1300,10 @@ struct task_struct {
 	unsigned long rseq_event_mask;
 #endif
 
+#ifdef CONFIG_SCHED_MM_VCPU
+	int				mm_vcpu;	/* Current vcpu in mm */
+#endif
+
 	struct tlbflush_unmap_batch	tlb_ubc;
 
 	union {
