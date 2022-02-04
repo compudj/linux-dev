@@ -3375,53 +3375,13 @@ madvise_set_anon_name(struct mm_struct *mm, unsigned long start,
 #endif
 
 #ifdef CONFIG_SCHED_MM_VCPU
-static inline void mm_vcpu_get(struct task_struct *t)
-{
-	struct cpumask *cpumask;
-	unsigned int vcpu;
-
-	if ((t->flags & PF_KTHREAD) || !t->mm)
-		return;
-	cpumask = &t->mm->vcpu_mask;
-	/* Atomically reserve lowest available vcpu number. */
-	do {
-		vcpu = cpumask_first_zero(cpumask);
-		WARN_ON_ONCE(vcpu >= nr_cpu_ids);
-	} while (cpumask_test_and_set_cpu(vcpu, cpumask));
-	t->mm_vcpu = vcpu;
-}
-
-static inline void mm_vcpu_put(struct task_struct *t)
-{
-	if ((t->flags & PF_KTHREAD) || !t->mm)
-		return;
-	cpumask_clear_cpu(t->mm_vcpu, &t->mm->vcpu_mask);
-	t->mm_vcpu = 0;
-}
-
-static inline void switch_mm_vcpu(struct task_struct *prev, struct task_struct *next)
-{
-	if (!(prev->flags & PF_KTHREAD) && prev->mm == next->mm) {
-		/*
-		 * Switching between threads with the same mm. Simply pass the
-		 * vcpu token along to the next thread.
-		 */
-		next->mm_vcpu = prev->mm_vcpu;
-		prev->mm_vcpu = 0;
-	} else {
-		mm_vcpu_put(prev);
-		mm_vcpu_get(next);
-	}
-}
-
+void sched_mm_vcpu_reset(struct task_struct *t);
 static inline int task_mm_vcpu_id(struct task_struct *t)
 {
 	return t->mm_vcpu;
 }
 #else
-static inline void mm_vcpu_get(struct task_struct *t) { }
-static inline void mm_vcpu_put(struct task_struct *t) { }
-static inline void switch_mm_vcpu(struct task_struct *prev, struct task_struct *next) { }
+static inline void sched_mm_vcpu_reset(struct task_struct *t) { }
 static inline int task_mm_vcpu_id(struct task_struct *t)
 {
 	/*

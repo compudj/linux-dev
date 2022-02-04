@@ -1154,8 +1154,7 @@ static int de_thread(struct task_struct *tsk)
 	sig->notify_count = 0;
 
 	/* Release possibly high vcpu id, get vcpu id 0. */
-	mm_vcpu_put(tsk);
-	mm_vcpu_get(tsk);
+	sched_mm_vcpu_reset(tsk);
 
 no_thread_group:
 	/* we have changed execution domain */

@@ -2039,6 +2039,8 @@ void activate_task(struct rq *rq, struct task_struct *p, int flags)
 
 void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
 {
+	if (p->mm)
+		(void) rq_vcpu_cache_lookup_remove(rq, p->mm);
 	p->on_rq = (flags & DEQUEUE_SLEEP) ? 0 : TASK_ON_RQ_MIGRATING;
 
 	dequeue_task(rq, p, flags);
@@ -4795,7 +4797,7 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
 	sched_info_switch(rq, prev, next);
 	perf_event_task_sched_out(prev, next);
 	rseq_preempt(prev);
-	switch_mm_vcpu(prev, next);
+	switch_mm_vcpu(rq, prev, next);
 	fire_sched_out_preempt_notifiers(prev, next);
 	kmap_local_sched_out();
 	prepare_task(next);
@@ -10924,3 +10926,11 @@ void call_trace_sched_update_nr_running(struct rq *rq, int count)
 {
         trace_sched_update_nr_running_tp(rq, count);
 }
+
+#ifdef CONFIG_SCHED_MM_VCPU
+void sched_mm_vcpu_reset(struct task_struct *t)
+{
+	__mm_vcpu_put(t->mm, t->mm_vcpu);
+	t->mm_vcpu = __mm_vcpu_get(t->mm);
+}
+#endif

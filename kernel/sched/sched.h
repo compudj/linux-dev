@@ -916,6 +916,19 @@ struct uclamp_rq {
 DECLARE_STATIC_KEY_FALSE(sched_uclamp_used);
 #endif /* CONFIG_UCLAMP_TASK */
 
+#ifdef CONFIG_SCHED_MM_VCPU
+# define RQ_VCPU_CACHE_SIZE	8
+struct rq_vcpu_entry {
+	struct mm_struct *mm;	/* NULL if unset */
+	int vcpu_id;
+};
+
+struct rq_vcpu_cache {
+	struct rq_vcpu_entry entry[RQ_VCPU_CACHE_SIZE];
+	unsigned int head;
+};
+#endif
+
 /*
  * This is the main, per-CPU runqueue data structure.
  *
@@ -1115,6 +1128,10 @@ struct rq {
 	unsigned int		core_forceidle_seq;
 	unsigned int		core_forceidle_occupation;
 	u64			core_forceidle_start;
+#endif
+
+#ifdef CONFIG_SCHED_MM_VCPU
+	struct rq_vcpu_cache	vcpu_cache;
 #endif
 };
 
@@ -3118,3 +3135,109 @@ extern int sched_dynamic_mode(const char *str);
 extern void sched_dynamic_update(int mode);
 #endif
 
+#ifdef CONFIG_SCHED_MM_VCPU
+static inline int __mm_vcpu_get(struct mm_struct *mm)
+{
+	struct cpumask *cpumask;
+	int vcpu;
+
+	/* Cache miss. */
+	cpumask = &mm->vcpu_mask;
+	/* Atomically reserve lowest available vcpu number. */
+	do {
+		vcpu = cpumask_first_zero(cpumask);
+		WARN_ON_ONCE(vcpu >= nr_cpu_ids);
+	} while (cpumask_test_and_set_cpu(vcpu, cpumask));
+	return vcpu;
+}
+
+static inline void __mm_vcpu_put(struct mm_struct *mm, int vcpu)
+{
+	cpumask_clear_cpu(vcpu, &mm->vcpu_mask);
+}
+
+/* Removal from cache simply leaves an unused hole. */
+static inline int rq_vcpu_cache_lookup_remove(struct rq *rq, struct mm_struct *mm)
+{
+	struct rq_vcpu_cache *vcpu_cache = &rq->vcpu_cache;
+	int i;
+
+	for (i = 0; i < RQ_VCPU_CACHE_SIZE; i++) {
+		struct rq_vcpu_entry *entry = &vcpu_cache->entry[i];
+
+		if (entry->mm == mm) {
+			entry->mm = NULL;	/* Remove from cache */
+			return entry->vcpu_id;
+		}
+	}
+	return -1;
+}
+
+/*
+ * Add at head, move head forward. Cheap LRU cache.
+ * Only need to clear the vcpu mask bit from its own mm->vcpu_mask when we
+ * overwrite an old entry from the cache. Note that this is not needed if the
+ * overwritten entry is an unused hole. This access to the old_mm from an
+ * unrelated thread requires that cache entry for a given mm gets pruned from
+ * the cache when a task is dequeued from the runqueue.
+ */
+static inline void rq_vcpu_cache_add(struct rq *rq, struct mm_struct *mm, int vcpu_id)
+{
+	struct rq_vcpu_cache *vcpu_cache = &rq->vcpu_cache;
+	struct mm_struct *old_mm;
+	struct rq_vcpu_entry *entry;
+	unsigned int pos;
+
+	pos = vcpu_cache->head;
+	entry = &vcpu_cache->entry[pos];
+	old_mm = entry->mm;
+	if (old_mm)
+		__mm_vcpu_put(old_mm, entry->vcpu_id);
+	entry->mm = mm;
+	entry->vcpu_id = vcpu_id;
+	vcpu_cache->head = (pos + 1) % RQ_VCPU_CACHE_SIZE;
+}
+
+static inline void mm_vcpu_get(struct rq *rq, struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+	unsigned int vcpu;
+
+	if ((t->flags & PF_KTHREAD) || !mm)
+		return;
+	vcpu = rq_vcpu_cache_lookup_remove(rq, mm);
+	if (unlikely(vcpu < 0))
+		vcpu = __mm_vcpu_get(mm);
+	t->mm_vcpu = vcpu;
+}
+
+static inline void mm_vcpu_put(struct rq *rq, struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+
+	if ((t->flags & PF_KTHREAD) || !mm)
+		return;
+	rq_vcpu_cache_add(rq, mm, t->mm_vcpu);
+	t->mm_vcpu = 0;
+}
+
+static inline void switch_mm_vcpu(struct rq *rq, struct task_struct *prev, struct task_struct *next)
+{
+	if (!(prev->flags & PF_KTHREAD) && prev->mm == next->mm) {
+		/*
+		 * Switching between threads with the same mm. Simply pass the
+		 * vcpu token along to the next thread.
+		 */
+		next->mm_vcpu = prev->mm_vcpu;
+		prev->mm_vcpu = 0;
+	} else {
+		mm_vcpu_put(rq, prev);
+		mm_vcpu_get(rq, next);
+	}
+}
+
+#else
+static inline void mm_vcpu_get(struct task_struct *t) { }
+static inline void mm_vcpu_put(struct task_struct *t) { }
+static inline void switch_mm_vcpu(struct rq *rq, struct task_struct *prev, struct task_struct *next) { }
+#endif
