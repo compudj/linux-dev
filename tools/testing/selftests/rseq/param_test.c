@@ -1265,7 +1265,8 @@ void *test_membarrier_manager_thread(void *arg)
 		/* Make list_b "active". */
 		atomic_store(&args->percpu_list_ptr, (intptr_t)&list_b);
 		if (sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ,
-					MEMBARRIER_CMD_FLAG_CPU, cpu_a) &&
+		//			MEMBARRIER_CMD_FLAG_CPU, cpu_a) &&
+					0, 0) &&
 				errno != ENXIO /* missing CPU */) {
 			perror("sys_membarrier");
 			abort();
@@ -1289,7 +1290,8 @@ void *test_membarrier_manager_thread(void *arg)
 		/* Make list_a "active". */
 		atomic_store(&args->percpu_list_ptr, (intptr_t)&list_a);
 		if (sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ,
-					MEMBARRIER_CMD_FLAG_CPU, cpu_b) &&
+		//			MEMBARRIER_CMD_FLAG_CPU, cpu_b) &&
+					0, 0) &&
 				errno != ENXIO /* missing CPU*/) {
 			perror("sys_membarrier");
 			abort();
