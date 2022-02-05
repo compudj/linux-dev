@@ -23,7 +23,7 @@
  */
 
 /* Offset of cpu_id and rseq_cs fields in struct rseq. */
-#define RSEQ_CPU_ID_OFFSET	4
+#define RSEQ_CPU_ID_OFFSET	24
 #define RSEQ_CS_OFFSET		8
 
 #ifdef __x86_64__

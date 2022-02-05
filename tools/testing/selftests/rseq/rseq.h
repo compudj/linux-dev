@@ -143,7 +143,7 @@ int32_t rseq_fallback_current_node(void);
  */
 static inline int32_t rseq_current_cpu_raw(void)
 {
-	return RSEQ_ACCESS_ONCE(rseq_get_abi()->cpu_id);
+	return RSEQ_ACCESS_ONCE(rseq_get_abi()->vm_vcpu_id);
 }
 
 /*
@@ -168,7 +168,7 @@ static inline uint32_t rseq_current_node_raw(void)
  */
 static inline uint32_t rseq_cpu_start(void)
 {
-	return RSEQ_ACCESS_ONCE(rseq_get_abi()->cpu_id_start);
+	return RSEQ_ACCESS_ONCE(rseq_get_abi()->vm_vcpu_id);
 }
 
 static inline uint32_t rseq_current_cpu(void)
