@@ -134,6 +134,18 @@ static inline unsigned int cpumask_first_and(const struct cpumask *srcp1,
 	return 0;
 }
 
+static inline unsigned int cpumask_first_one_and_zero(const struct cpumask *srcp1,
+					     const struct cpumask *srcp2)
+{
+	return 0;
+}
+
+static inline unsigned int cpumask_first_zero_and_zero(const struct cpumask *srcp1,
+					     const struct cpumask *srcp2)
+{
+	return 0;
+}
+
 static inline unsigned int cpumask_last(const struct cpumask *srcp)
 {
 	return 0;
@@ -153,6 +165,20 @@ static inline unsigned int cpumask_next_zero(int n, const struct cpumask *srcp)
 static inline unsigned int cpumask_next_and(int n,
 					    const struct cpumask *srcp,
 					    const struct cpumask *andp)
+{
+	return n+1;
+}
+
+static inline unsigned int cpumask_next_one_and_zero(int n,
+					     const struct cpumask *srcp1,
+					     const struct cpumask *srcp2)
+{
+	return n+1;
+}
+
+static inline unsigned int cpumask_next_zero_and_zero(int n,
+					     const struct cpumask *srcp1,
+					     const struct cpumask *srcp2)
 {
 	return n+1;
 }
@@ -231,6 +257,36 @@ unsigned int cpumask_first_and(const struct cpumask *srcp1, const struct cpumask
 }
 
 /**
+ * cpumask_first_one_and_zero - return the first cpu from *srcp1 & ~*srcp2
+ * @src1p: the first input
+ * @src2p: the second input
+ *
+ * Returns >= nr_cpu_ids if no cpus match in both.
+ */
+static inline
+unsigned int cpumask_first_one_and_zero(const struct cpumask *srcp1,
+					const struct cpumask *srcp2)
+{
+	return find_first_one_and_zero_bit(cpumask_bits(srcp1), cpumask_bits(srcp2),
+					   nr_cpumask_bits);
+}
+
+/**
+ * cpumask_first_zero_and_zero - return the first cpu from ~*srcp1 & ~*srcp2
+ * @src1p: the first input
+ * @src2p: the second input
+ *
+ * Returns >= nr_cpu_ids if no cpus match in both.
+ */
+static inline
+unsigned int cpumask_first_zero_and_zero(const struct cpumask *srcp1,
+					 const struct cpumask *srcp2)
+{
+	return find_first_zero_and_zero_bit(cpumask_bits(srcp1), cpumask_bits(srcp2),
+					    nr_cpumask_bits);
+}
+
+/**
  * cpumask_last - get the last CPU in a cpumask
  * @srcp:	- the cpumask pointer
  *
@@ -256,6 +312,44 @@ static inline unsigned int cpumask_next_zero(int n, const struct cpumask *srcp)
 	if (n != -1)
 		cpumask_check(n);
 	return find_next_zero_bit(cpumask_bits(srcp), nr_cpumask_bits, n+1);
+}
+
+/**
+ * cpumask_next_one_and_zero - return the next cpu from *srcp1 & ~*srcp2
+ * @n: the cpu prior to the place to search (ie. return will be > @n)
+ * @src1p: the first input
+ * @src2p: the second input
+ *
+ * Returns >= nr_cpu_ids if no cpus match in both.
+ */
+static inline
+unsigned int cpumask_next_one_and_zero(int n, const struct cpumask *srcp1,
+				       const struct cpumask *srcp2)
+{
+	/* -1 is a legal arg here. */
+	if (n != -1)
+		cpumask_check(n);
+	return find_next_one_and_zero_bit(cpumask_bits(srcp1), cpumask_bits(srcp2),
+					  nr_cpumask_bits, n+1);
+}
+
+/**
+ * cpumask_next_zero_and_zero - return the next cpu from ~*srcp1 & ~*srcp2
+ * @n: the cpu prior to the place to search (ie. return will be > @n)
+ * @src1p: the first input
+ * @src2p: the second input
+ *
+ * Returns >= nr_cpu_ids if no cpus match in both.
+ */
+static inline
+unsigned int cpumask_next_zero_and_zero(int n, const struct cpumask *srcp1,
+					const struct cpumask *srcp2)
+{
+	/* -1 is a legal arg here. */
+	if (n != -1)
+		cpumask_check(n);
+	return find_next_zero_and_zero_bit(cpumask_bits(srcp1), cpumask_bits(srcp2),
+					   nr_cpumask_bits, n+1);
 }
 
 int __pure cpumask_next_and(int n, const struct cpumask *, const struct cpumask *);
