@@ -10929,7 +10929,7 @@ void sched_vcpu_release_mm(struct task_struct *t, struct mm_struct *mm)
 	preempt_disable();
 	t->vcpu_mm_active = 0;
 	/* Skip for single-threaded process. */
-	if (!t->mm_vcpu && !cpumask_test_cpu(0, mm_vcpumask(mm)))
+	if (!cpumask_test_cpu(t->mm_vcpu, mm_vcpumask(mm)))
 		schedstat_inc(this_rq()->nr_vcpu_put_skip_single_thread);
 	else
 		__mm_vcpu_put(mm, t->mm_vcpu);
@@ -10944,24 +10944,28 @@ void sched_vcpu_activate_mm(struct task_struct *t, struct mm_struct *mm)
 	preempt_disable();
 	t->vcpu_mm_active = 1;
 	/* No need to reserve in cpumask because single-threaded. */
-	t->mm_vcpu = 0;
+	t->mm_vcpu = mm_vcpu_first_node_vcpu(numa_node_id());
 	preempt_enable();
 }
 
 void sched_vcpu_get_mm(struct task_struct *t, struct mm_struct *mm)
 {
+	int vcpu;
+
 	preempt_disable();
 	t->vcpu_mm_active = 1;
 	t->mm_vcpu = -1;
+	vcpu = current->mm_vcpu;
 	/*
-	 * On transition from 1 to 2 mm users, reserve vcpu=0 in the cpumask
-	 * for the current task (parent of thread t).
+	 * On transition from 1 to 2 mm users, reserve vcpu ids.
 	 * Use mm_vcpu and mask rather than mm_users to not be fooled by
 	 * get_task_mm() also grabbing a mm_users reference.
 	 */
-	if (!current->mm_vcpu && !cpumask_test_cpu(0, mm_vcpumask(mm))) {
-		int vcpu = __mm_vcpu_get(mm);
-		WARN_ON_ONCE(vcpu != 0);
+	if (!cpumask_test_cpu(vcpu, mm_vcpumask(mm))) {
+		mm_vcpu_reserve_nodes(mm);
+		current->mm_vcpu = __mm_vcpu_get(mm);
+		if (current->mm_vcpu != vcpu)
+			rseq_set_notify_resume(current);
 	}
 	preempt_enable();
 }

@@ -1085,6 +1085,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 
 	mm->user_ns = get_user_ns(user_ns);
 	mm_init_vcpumask(mm);
+	mm_init_node_vcpumask(mm);
 	return mm;
 
 fail_nocontext:
@@ -2911,7 +2912,8 @@ void __init proc_caches_init(void)
 	 * dynamically sized based on the maximum CPU number this system
 	 * can have, taking hotplug into account (nr_cpu_ids).
 	 */
-	mm_size = sizeof(struct mm_struct) + cpumask_size() + mm_vcpumask_size();
+	mm_size = sizeof(struct mm_struct) + cpumask_size() + mm_vcpumask_size() +
+		  mm_node_vcpumask_size();
 
 	mm_cachep = kmem_cache_create_usercopy("mm_struct",
 			mm_size, ARCH_MIN_MMSTRUCT_ALIGN,
