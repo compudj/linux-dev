@@ -13,7 +13,11 @@
 
 #include "rseq.h"
 
-void test_cpu_pointer(void)
+#define NR_LOOPS	10
+
+int cpu_numa_id[CPU_SETSIZE];
+
+void test_cpu_pointer_iter(int iter)
 {
 	cpu_set_t affinity, test_affinity;
 	int i;
@@ -22,22 +26,32 @@ void test_cpu_pointer(void)
 	CPU_ZERO(&test_affinity);
 	for (i = 0; i < CPU_SETSIZE; i++) {
 		if (CPU_ISSET(i, &affinity)) {
-			int node;
+			int node, vcpu_id;
 
 			CPU_SET(i, &test_affinity);
 			sched_setaffinity(0, sizeof(test_affinity),
 					&test_affinity);
-			assert(sched_getcpu() == i);
-			assert(rseq_current_cpu() == i);
-			assert(rseq_current_cpu_raw() == i);
-			assert(rseq_cpu_start() == i);
+			vcpu_id = rseq_current_cpu_raw();
 			node = rseq_fallback_current_node();
 			assert(rseq_current_node() == node);
 			assert(rseq_current_node_raw() == node);
+			printf("vcpu=%d node=%d\n", vcpu_id, node);
+			if (iter == 0)
+				cpu_numa_id[vcpu_id] = node;
+			else
+				assert(cpu_numa_id[vcpu_id] == node);
 			CPU_CLR(i, &test_affinity);
 		}
 	}
 	sched_setaffinity(0, sizeof(affinity), &affinity);
+}
+
+void test_cpu_pointer(void)
+{
+	int i;
+
+	for (i = 0; i < NR_LOOPS; i++)
+		test_cpu_pointer_iter(i);
 }
 
 int main(int argc, char **argv)

@@ -17,6 +17,8 @@
 #include <errno.h>
 #include <stddef.h>
 
+int cpu_numa_id[CPU_SETSIZE];
+
 static inline pid_t rseq_gettid(void)
 {
 	return syscall(__NR_gettid);
@@ -245,6 +247,14 @@ unsigned int yield_mod_cnt, nr_abort;
 
 #include "rseq.h"
 
+void numa_id_init(void)
+{
+	int i;
+
+	for (i = 0; i < CPU_SETSIZE; i++)
+		cpu_numa_id[i] = -1;
+}
+
 struct percpu_lock_entry {
 	intptr_t v;
 } __attribute__((aligned(128)));
@@ -448,7 +458,18 @@ void *test_percpu_inc_thread(void *arg)
 		int ret;
 
 		do {
+			int vcpu_id, node;
 			int cpu;
+
+			while (rseq_load_u32_u32((uint32_t *)&vcpu_id, &rseq_get_abi()->vm_vcpu_id,
+						 (uint32_t *)&node, &rseq_get_abi()->node_id) != 0) {
+				/* retry. */
+			}
+			if (cpu_numa_id[vcpu_id] == -1) {
+				cpu_numa_id[vcpu_id] = node;
+			} else {
+				assert(node == cpu_numa_id[vcpu_id]);
+			}
 
 			cpu = rseq_cpu_start();
 			ret = rseq_addv(&data->c[cpu].count, 1, cpu);
@@ -1516,6 +1537,9 @@ int main(int argc, char **argv)
 
 	if (!opt_disable_rseq && rseq_register_current_thread())
 		goto error;
+
+	numa_id_init();
+
 	switch (opt_test) {
 	case 's':
 		printf_verbose("spinlock\n");
