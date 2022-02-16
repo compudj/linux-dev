@@ -2040,7 +2040,6 @@ void activate_task(struct rq *rq, struct task_struct *p, int flags)
 
 void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
 {
-	rq_vcpu_cache_remove_mm(rq, p->mm);
 	p->on_rq = (flags & DEQUEUE_SLEEP) ? 0 : TASK_ON_RQ_MIGRATING;
 
 	dequeue_task(rq, p, flags);
@@ -2268,6 +2267,7 @@ static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 	lockdep_assert_rq_held(rq);
 
 	deactivate_task(rq, p, DEQUEUE_NOCLOCK);
+	rq_vcpu_cache_remove_mm_locked(rq, p->mm, false);
 	set_task_cpu(p, new_cpu);
 	rq_unlock(rq, rf);
 
@@ -2455,6 +2455,7 @@ int push_cpu_stop(void *arg)
 	// XXX validate p is still the highest prio task
 	if (task_rq(p) == rq) {
 		deactivate_task(rq, p, 0);
+		rq_vcpu_cache_remove_mm_locked(rq, p->mm, false);
 		set_task_cpu(p, lowest_rq->cpu);
 		activate_task(lowest_rq, p, 0);
 		resched_curr(lowest_rq);
@@ -3094,6 +3095,7 @@ static void __migrate_swap_task(struct task_struct *p, int cpu)
 		rq_pin_lock(dst_rq, &drf);
 
 		deactivate_task(src_rq, p, 0);
+		rq_vcpu_cache_remove_mm_locked(src_rq, p->mm, false);
 		set_task_cpu(p, cpu);
 		activate_task(dst_rq, p, 0);
 		check_preempt_curr(dst_rq, p, 0);
@@ -4126,6 +4128,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 
 		wake_flags |= WF_MIGRATED;
 		psi_ttwu_dequeue(p);
+		rq_vcpu_cache_remove_mm(task_rq(p), p->mm, false);
 		set_task_cpu(p, cpu);
 	}
 #else
@@ -5923,6 +5926,7 @@ static bool try_steal_cookie(int this, int that)
 			goto next;
 
 		deactivate_task(src, p, 0);
+		rq_vcpu_cache_remove_mm_locked(src, p->mm, false);
 		set_task_cpu(p, this);
 		activate_task(dst, p, 0);
 
@@ -10923,16 +10927,18 @@ void call_trace_sched_update_nr_running(struct rq *rq, int count)
 #ifdef CONFIG_SCHED_MM_VCPU
 void sched_vcpu_release_mm(struct task_struct *t, struct mm_struct *mm)
 {
+	struct rq_flags rf;
+	struct rq *rq;
+
 	if (!mm)
 		return;
 	WARN_ON_ONCE(t != current);
 	preempt_disable();
+	rq = this_rq();
+	rq_lock_irqsave(rq, &rf);
 	t->vcpu_mm_active = 0;
-	/* Skip for single-threaded process. */
-	if (!cpumask_test_cpu(t->mm_vcpu, mm_vcpumask(mm)))
-		schedstat_inc(this_rq()->nr_vcpu_put_skip_single_thread);
-	else
-		__mm_vcpu_put(mm, t->mm_vcpu);
+	rq_vcpu_cache_remove_mm_locked(rq, mm, true);
+	rq_unlock_irqrestore(rq, &rf);
 	t->mm_vcpu = -1;
 	preempt_enable();
 }
@@ -10950,12 +10956,16 @@ void sched_vcpu_activate_mm(struct task_struct *t, struct mm_struct *mm)
 
 void sched_vcpu_get_mm(struct task_struct *t, struct mm_struct *mm)
 {
+	struct rq_flags rf;
+	struct rq *rq;
 	int vcpu;
 
 	preempt_disable();
+	rq = this_rq();
 	t->vcpu_mm_active = 1;
 	t->mm_vcpu = -1;
 	vcpu = current->mm_vcpu;
+	rq_lock_irqsave(rq, &rf);
 	/*
 	 * On transition from 1 to 2 mm users, reserve vcpu ids.
 	 * Use mm_vcpu and mask rather than mm_users to not be fooled by
@@ -10963,10 +10973,13 @@ void sched_vcpu_get_mm(struct task_struct *t, struct mm_struct *mm)
 	 */
 	if (!cpumask_test_cpu(vcpu, mm_vcpumask(mm))) {
 		mm_vcpu_reserve_nodes(mm);
+		rq_vcpu_cache_remove_mm_locked(rq, mm, true);
 		current->mm_vcpu = __mm_vcpu_get(mm);
+		rq_vcpu_cache_add(rq, mm, current->mm_vcpu);
 		if (current->mm_vcpu != vcpu)
 			rseq_set_notify_resume(current);
 	}
+	rq_unlock_irqrestore(rq, &rf);
 	preempt_enable();
 }
 

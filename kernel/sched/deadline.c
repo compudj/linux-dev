@@ -655,6 +655,7 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 	__dl_add(dl_b, p->dl.dl_bw, cpumask_weight(later_rq->rd->span));
 	raw_spin_unlock(&dl_b->lock);
 
+	rq_vcpu_cache_remove_mm_locked(rq, p->mm, false);
 	set_task_cpu(p, later_rq->cpu);
 	double_unlock_balance(later_rq, rq);
 
@@ -2290,6 +2291,7 @@ retry:
 	}
 
 	deactivate_task(rq, next_task, 0);
+	rq_vcpu_cache_remove_mm_locked(rq, next_task->mm, false);
 	set_task_cpu(next_task, later_rq->cpu);
 
 	/*
@@ -2386,6 +2388,7 @@ static void pull_dl_task(struct rq *this_rq)
 				push_task = get_push_task(src_rq);
 			} else {
 				deactivate_task(src_rq, p, 0);
+				rq_vcpu_cache_remove_mm_locked(src_rq, p->mm, false);
 				set_task_cpu(p, this_cpu);
 				activate_task(this_rq, p, 0);
 				dmin = p->dl.deadline;

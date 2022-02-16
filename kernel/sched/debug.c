@@ -770,7 +770,6 @@ do {									\
 		P(nr_vcpu_transfer);
 		P(nr_vcpu_cache_hit);
 		P(nr_vcpu_get_skip_single_thread);
-		P(nr_vcpu_put_skip_single_thread);
 	}
 #undef P
 

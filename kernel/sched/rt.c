@@ -2106,6 +2106,7 @@ retry:
 	}
 
 	deactivate_task(rq, next_task, 0);
+	rq_vcpu_cache_remove_mm_locked(rq, next_task->mm, false);
 	set_task_cpu(next_task, lowest_rq->cpu);
 	activate_task(lowest_rq, next_task, 0);
 	resched_curr(lowest_rq);
@@ -2379,6 +2380,7 @@ static void pull_rt_task(struct rq *this_rq)
 				push_task = get_push_task(src_rq);
 			} else {
 				deactivate_task(src_rq, p, 0);
+				rq_vcpu_cache_remove_mm_locked(src_rq, p->mm, false);
 				set_task_cpu(p, this_cpu);
 				activate_task(this_rq, p, 0);
 				resched = true;
