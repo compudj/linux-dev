@@ -47,6 +47,9 @@ ENTRY(cpu_v7_switch_mm)
 	mmid	r2, r2
 	asid	r2, r2
 	orr	rpgdh, rpgdh, r2, lsl #(48 - 32)	@ upper 32-bits of pgd
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mcrr	p15, 0, rpgdl, rpgdh, c2		@ set TTB 0
 	isb
 #endif
@@ -128,6 +131,9 @@ ENDPROC(cpu_v7_set_pte_ext)
 	 * identity mapping set up in TTBR0.
 	 */
 	orrls	\tmp, \tmp, #TTBR1_SIZE				@ TTBCR.T1SZ
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mcr	p15, 0, \tmp, c2, c0, 2				@ TTBCR
 	mov	\tmp, \ttbr1, lsr #20
 	mov	\ttbr1, \ttbr1, lsl #12

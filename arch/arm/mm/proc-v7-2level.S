@@ -142,6 +142,9 @@ ENDPROC(cpu_v7_set_pte_ext)
 	 * - \ttb0 and \ttb1 updated with the corresponding flags.
 	 */
 	.macro	v7_ttb_setup, zero, ttbr0l, ttbr0h, ttbr1, tmp
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mcr	p15, 0, \zero, c2, c0, 2	@ TTB control register
 	ALT_SMP(orr	\ttbr0l, \ttbr0l, #TTB_FLAGS_SMP)
 	ALT_UP(orr	\ttbr0l, \ttbr0l, #TTB_FLAGS_UP)

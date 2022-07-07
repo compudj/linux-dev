@@ -85,6 +85,10 @@ void a15_erratum_get_cpumask(int this_cpu, struct mm_struct *mm,
 static void cpu_set_reserved_ttbr0(void)
 {
 	u32 ttb;
+
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb();
+#endif
 	/*
 	 * Copy TTBR1 into TTBR0.
 	 * This points at swapper_pg_dir, which contains only global

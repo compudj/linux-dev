@@ -895,6 +895,9 @@ __armv7_mmu_cache_on:
 		movne	r1, #0xfffffffd		@ domain 0 = client
 		bic     r6, r6, #1 << 31        @ 32-bit translation system
 		bic     r6, r6, #(7 << 0) | (1 << 4)	@ use only ttbr0
+#ifdef CONFIG_ARM_ERRATA_754322
+		dsb
+#endif
 		mcrne	p15, 0, r3, c2, c0, 0	@ load page table pointer
 		mcrne	p15, 0, r1, c3, c0, 0	@ load domain access control
 		mcrne   p15, 0, r6, c2, c0, 2   @ load ttb control
@@ -927,6 +930,9 @@ __common_mmu_cache_on:
 		orr	r0, r0, #0x000d		@ Write buffer, mmu
 #endif
 		mov	r1, #-1
+#ifdef CONFIG_ARM_ERRATA_754322
+		dsb
+#endif
 		mcr	p15, 0, r3, c2, c0, 0	@ load page table pointer
 		mcr	p15, 0, r1, c3, c0, 0	@ load domain access control
 		b	1f

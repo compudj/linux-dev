@@ -96,6 +96,9 @@ static __always_inline unsigned int get_domain(void)
 
 static __always_inline void set_domain(unsigned int val)
 {
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb();
+#endif
 	asm volatile(
 	"mcr	p15, 0, %0, c3, c0	@ set domain"
 	  : : "r" (val) : "memory");

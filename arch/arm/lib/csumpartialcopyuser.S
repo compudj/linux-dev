@@ -22,6 +22,9 @@
 
 		.macro	load_regs
 		ldmfd	sp!, {r1, r2, r4 - r8, ip, lr}
+#ifdef CONFIG_ARM_ERRATA_754322
+		dsb
+#endif
 		mcr	p15, 0, ip, c3, c0, 0
 		ret	lr
 		.endm

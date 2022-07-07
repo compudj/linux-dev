@@ -785,6 +785,9 @@ ENTRY(__switch_to)
 #endif
 	mov	r7, r2				@ Preserve 'next'
 #ifdef CONFIG_CPU_USE_DOMAINS
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mcr	p15, 0, r6, c3, c0, 0		@ Set domain register
 #endif
 	mov	r5, r0

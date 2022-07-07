@@ -123,6 +123,9 @@ cpu_resume_after_mmu:
 	@ Before using the vmap'ed stack, we have to switch to swapper_pg_dir
 	@ as the ID map does not cover the vmalloc region.
 	mrc	p15, 0, ip, c2, c0, 1	@ read TTBR1
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mcr	p15, 0, ip, c2, c0, 0	@ set TTBR0
 	instr_sync
 #endif

@@ -46,6 +46,9 @@
 	 * set appropriately.
 	 */
 	mov	\tmp, #DACR_UACCESS_DISABLE
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mcr	p15, 0, \tmp, c3, c0, 0		@ Set domain register
 	.if	\isb
 	instr_sync
@@ -60,6 +63,9 @@
 	 * set appropriately.
 	 */
 	mov	\tmp, #DACR_UACCESS_ENABLE
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mcr	p15, 0, \tmp, c3, c0, 0
 	.if	\isb
 	instr_sync
@@ -89,12 +95,18 @@
 	.if \disable && IS_ENABLED(CONFIG_CPU_SW_DOMAIN_PAN)
 	/* kernel=client, user=no access */
 	mov	\tmp2, #DACR_UACCESS_DISABLE
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mcr	p15, 0, \tmp2, c3, c0, 0
 	instr_sync
 	.elseif IS_ENABLED(CONFIG_CPU_USE_DOMAINS)
 	/* kernel=client */
 	bic	\tmp2, \tmp0, #domain_mask(DOMAIN_KERNEL)
 	orr	\tmp2, \tmp2, #domain_val(DOMAIN_KERNEL, DOMAIN_CLIENT)
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mcr	p15, 0, \tmp2, c3, c0, 0
 	instr_sync
 	.endif
@@ -103,6 +115,9 @@
 	/* Restore the user access state previously saved by uaccess_entry */
 	.macro	uaccess_exit, tsk, tmp0, tmp1
  DACR(	ldr	\tmp0, [sp, #SVC_DACR])
+#ifdef CONFIG_ARM_ERRATA_754322
+ DACR(	dsb)
+#endif
  DACR(	mcr	p15, 0, \tmp0, c3, c0, 0)
 	.endm
 

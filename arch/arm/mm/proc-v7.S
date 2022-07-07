@@ -135,6 +135,9 @@ ENTRY(cpu_v7_do_suspend)
 	mrc	p15, 0, r5, c13, c0, 3	@ User r/o thread ID
 	stmia	r0!, {r4 - r5}
 #ifdef CONFIG_MMU
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mrc	p15, 0, r6, c3, c0, 0	@ Domain ID
 #ifdef CONFIG_ARM_LPAE
 	mrrc	p15, 1, r5, r7, c2	@ TTB 1
@@ -159,6 +162,9 @@ ENTRY(cpu_v7_do_resume)
 	mcr	p15, 0, r5, c13, c0, 3	@ User r/o thread ID
 	ldmia	r0, {r5 - r11}
 #ifdef CONFIG_MMU
+#ifdef CONFIG_ARM_ERRATA_754322
+	dsb
+#endif
 	mcr	p15, 0, ip, c8, c7, 0	@ invalidate TLBs
 	mcr	p15, 0, r6, c3, c0, 0	@ Domain ID
 #ifdef CONFIG_ARM_LPAE
