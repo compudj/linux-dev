@@ -133,6 +133,10 @@ extern struct futex_hash_bucket *futex_hash(union futex_key *key);
  */
 static inline int futex_match(union futex_key *key1, union futex_key *key2)
 {
+	trace_printk("futex_match key1=%p key2=%p key1->both.word=%lu key2->both.word=%lu key1->both.ptr=%llX key2->both.ptr=%llX key1->both.offset=%u key2->both.offset=%u\n",
+			key1, key2, key1 ? key1->both.word : 0, key2 ? key2->both.word : 0,
+			key1 ? (unsigned long long)key1->both.ptr : 0, key2 ? (unsigned long long)key2->both.ptr : 0,
+			key1 ? key1->both.offset : 0, key2 ? key2->both.offset : 0);
 	return (key1 && key2
 		&& key1->both.word == key2->both.word
 		&& key1->both.ptr == key2->both.ptr

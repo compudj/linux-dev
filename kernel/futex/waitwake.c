@@ -148,31 +148,42 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 	int ret;
 	DEFINE_WAKE_Q(wake_q);
 
-	if (!bitset)
+	trace_printk("futex_wake begin uaddr=%p\n", uaddr);
+	if (!bitset) {
+		trace_printk("futex_wake end uaddr=%p !bitset\n", uaddr);
 		return -EINVAL;
+	}
 
 	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &key, FUTEX_READ);
-	if (unlikely(ret != 0))
+	if (unlikely(ret != 0)) {
+		trace_printk("futex_wake end (get_futex_key) ret=%d uaddr=%p\n", ret, uaddr);
 		return ret;
+	}
 
 	hb = futex_hash(&key);
 
 	/* Make sure we really have tasks to wakeup */
-	if (!futex_hb_waiters_pending(hb))
+	if (!futex_hb_waiters_pending(hb)) {
+		trace_printk("futex_wake end (!futex_hb_waiters_pending) ret=%d uaddr=%p\n", ret, uaddr);
 		return ret;
+	}
 
 	spin_lock(&hb->lock);
 
 	plist_for_each_entry_safe(this, next, &hb->chain, list) {
 		if (futex_match (&this->key, &key)) {
+			trace_printk("futex_wake match ret=%d nr_wake=%d uaddr=%p\n", ret, nr_wake, uaddr);
 			if (this->pi_state || this->rt_waiter) {
 				ret = -EINVAL;
+				trace_printk("futex_wake end (this->pi_state || this->rt_waiter) ret=%d uaddr=%p\n", ret, uaddr);
 				break;
 			}
 
 			/* Check if one of the bits is set in both bitsets */
-			if (!(this->bitset & bitset))
+			if (!(this->bitset & bitset)) {
+				trace_printk("futex_wake (!(this->bitset & bitset)) uaddr=%p\n", uaddr);
 				continue;
+			}
 
 			futex_wake_mark(&wake_q, this);
 			if (++ret >= nr_wake)
@@ -182,6 +193,7 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 
 	spin_unlock(&hb->lock);
 	wake_up_q(&wake_q);
+	trace_printk("futex_wake end ret=%d uaddr=%p\n", ret, uaddr);
 	return ret;
 }
 
@@ -598,22 +610,31 @@ int futex_wait_setup(u32 __user *uaddr, u32 val, unsigned int flags,
 	 * absorb a wakeup if *uaddr does not match the desired values
 	 * while the syscall executes.
 	 */
+	trace_printk("futex_wait_setup begin val=%u uaddr=%p\n", val, uaddr);
 retry:
 	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &q->key, FUTEX_READ);
-	if (unlikely(ret != 0))
+	if (unlikely(ret != 0)) {
+		trace_printk("futex_wait_setup end (get_futeX_key) ret=%d val=%u uaddr=%p\n", ret, val, uaddr);
 		return ret;
+	}
 
 retry_private:
 	*hb = futex_q_lock(q);
 
 	ret = futex_get_value_locked(&uval, uaddr);
+	trace_printk("futex_wait_setup futex_get_value_locked() ret=%d val=%u uval=%u uaddr=%p\n",
+			ret, val, uval, uaddr);
 
 	if (ret) {
 		futex_q_unlock(*hb);
 
 		ret = get_user(uval, uaddr);
-		if (ret)
+		if (ret) {
+			trace_printk("futex_wait_setup end (get_user) ret=%d val=%u uaddr=%p\n", ret, val, uaddr);
 			return ret;
+		}
+		trace_printk("futex_wait_setup get_user() ret=%d val=%u uval=%u uaddr=%p\n",
+				ret, val, uval, uaddr);
 
 		if (!(flags & FLAGS_SHARED))
 			goto retry_private;
@@ -625,6 +646,7 @@ retry_private:
 		futex_q_unlock(*hb);
 		ret = -EWOULDBLOCK;
 	}
+	trace_printk("futex_wait_setup end ret=%d val=%u uaddr=%p\n", ret, val, uaddr);
 
 	return ret;
 }
