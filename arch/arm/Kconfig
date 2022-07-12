@@ -239,6 +239,9 @@ config GENERIC_ISA_DMA
 config FIQ
 	bool
 
+config ARM_DISABLE_PREFETCHW
+	bool
+
 config ARCH_MTD_XIP
 	bool
 

@@ -121,6 +121,7 @@ static inline void prefetch(const void *ptr)
 #define ARCH_HAS_PREFETCHW
 static inline void prefetchw(const void *ptr)
 {
+#if !defined(CONFIG_ARM_DISABLE_PREFETCHW)
 	__asm__ __volatile__(
 		".arch_extension	mp\n"
 		__ALT_SMP_ASM(
@@ -128,6 +129,7 @@ static inline void prefetchw(const void *ptr)
 			"pld\t%a0"
 		)
 		:: "p" (ptr));
+#endif
 }
 #endif
 #endif
