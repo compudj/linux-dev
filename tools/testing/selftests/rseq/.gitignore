@@ -6,3 +6,6 @@ basic_rseq_op_test
 param_test
 param_test_benchmark
 param_test_compare_twice
+param_test_vm_vcpu_id
+param_test_vm_vcpu_id_benchmark
+param_test_vm_vcpu_id_compare_twice
