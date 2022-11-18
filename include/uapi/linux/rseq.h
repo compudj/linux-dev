@@ -149,6 +149,15 @@ struct rseq {
 	__u32 mm_cid;
 
 	/*
+	 * Restartable sequences mm_numa_cid field. Updated by the kernel.
+	 * Read by user-space with single-copy atomicity semantics. This field
+	 * should only be read by the thread which registered this data
+	 * structure.  Aligned on 32-bit. Contains the current thread's
+	 * NUMA-aware concurrency ID (allocated uniquely within a memory map).
+	 */
+	__u32 mm_numa_cid;
+
+	/*
 	 * Flexible array member at end of structure, after last feature field.
 	 */
 	char end[];
