@@ -1317,6 +1317,9 @@ struct task_struct {
 #ifdef CONFIG_SCHED_MM_CID
 	int				mm_cid;		/* Current cid in mm */
 	int				mm_cid_active;	/* Whether cid bitmap is active */
+#ifdef CONFIG_NUMA
+	int				mm_numa_cid;	/* Current numa_cid in mm */
+#endif
 #endif
 
 	struct tlbflush_unmap_batch	tlb_ubc;

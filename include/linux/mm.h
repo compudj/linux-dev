@@ -3484,6 +3484,20 @@ static inline int task_mm_cid(struct task_struct *t)
 {
 	return t->mm_cid;
 }
+#ifdef CONFIG_NUMA
+static inline int task_mm_numa_cid(struct task_struct *t)
+{
+	if (num_possible_nodes() == 1)
+		return task_mm_cid(t);
+	else
+		return t->mm_numa_cid;
+}
+#else
+static inline int task_mm_numa_cid(struct task_struct *t)
+{
+	return task_mm_cid(t);
+}
+#endif
 #else
 static inline void sched_mm_cid_before_execve(struct task_struct *t) { }
 static inline void sched_mm_cid_after_execve(struct task_struct *t) { }
@@ -3497,6 +3511,10 @@ static inline int task_mm_cid(struct task_struct *t)
 	 * in user-space, althrough it won't provide the memory usage benefits.
 	 */
 	return raw_smp_processor_id();
+}
+static inline int task_mm_numa_cid(struct task_struct *t)
+{
+	return task_mm_cid(t);
 }
 #endif
 

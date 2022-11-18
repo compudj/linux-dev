@@ -11284,8 +11284,7 @@ void sched_mm_cid_exit_signals(struct task_struct *t)
 	if (!mm)
 		return;
 	local_irq_save(flags);
-	mm_cid_put(mm, t->mm_cid);
-	t->mm_cid = -1;
+	mm_cid_put(mm, t);
 	t->mm_cid_active = 0;
 	local_irq_restore(flags);
 }
@@ -11298,8 +11297,7 @@ void sched_mm_cid_before_execve(struct task_struct *t)
 	if (!mm)
 		return;
 	local_irq_save(flags);
-	mm_cid_put(mm, t->mm_cid);
-	t->mm_cid = -1;
+	mm_cid_put(mm, t);
 	t->mm_cid_active = 0;
 	local_irq_restore(flags);
 }
@@ -11312,7 +11310,7 @@ void sched_mm_cid_after_execve(struct task_struct *t)
 	WARN_ON_ONCE((t->flags & PF_KTHREAD) || !t->mm);
 
 	local_irq_save(flags);
-	t->mm_cid = mm_cid_get(mm);
+	mm_cid_get(mm, t);
 	t->mm_cid_active = 1;
 	local_irq_restore(flags);
 	rseq_set_notify_resume(t);
