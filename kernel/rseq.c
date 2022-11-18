@@ -91,14 +91,17 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
 	u32 cpu_id = raw_smp_processor_id();
 	u32 node_id = cpu_to_node(cpu_id);
 	u32 vm_vcpu_id = task_mm_vcpu_id(t);
+	u32 vm_numa_vcpu_id = task_mm_numa_vcpu_id(t);
 
 	WARN_ON_ONCE((int) vm_vcpu_id < 0);
+	WARN_ON_ONCE((int) vm_numa_vcpu_id < 0);
 	if (!user_write_access_begin(rseq, t->rseq_len))
 		goto efault;
 	unsafe_put_user(cpu_id, &rseq->cpu_id_start, efault_end);
 	unsafe_put_user(cpu_id, &rseq->cpu_id, efault_end);
 	unsafe_put_user(node_id, &rseq->node_id, efault_end);
 	unsafe_put_user(vm_vcpu_id, &rseq->vm_vcpu_id, efault_end);
+	unsafe_put_user(vm_numa_vcpu_id, &rseq->vm_numa_vcpu_id, efault_end);
 	/*
 	 * Additional feature fields added after ORIG_RSEQ_SIZE
 	 * need to be conditionally updated only if
@@ -117,7 +120,7 @@ efault:
 static int rseq_reset_rseq_cpu_node_id(struct task_struct *t)
 {
 	u32 cpu_id_start = 0, cpu_id = RSEQ_CPU_ID_UNINITIALIZED, node_id = 0,
-	    vm_vcpu_id = 0;
+	    vm_vcpu_id = 0, vm_numa_vcpu_id = 0;
 
 	/*
 	 * Reset cpu_id_start to its initial state (0).
@@ -140,6 +143,11 @@ static int rseq_reset_rseq_cpu_node_id(struct task_struct *t)
 	 * Reset vm_vcpu_id to its initial state (0).
 	 */
 	if (put_user(vm_vcpu_id, &t->rseq->vm_vcpu_id))
+		return -EFAULT;
+	/*
+	 * Reset vm_numa_vcpu_id to its initial state (0).
+	 */
+	if (put_user(vm_numa_vcpu_id, &t->rseq->vm_numa_vcpu_id))
 		return -EFAULT;
 	/*
 	 * Additional feature fields added after ORIG_RSEQ_SIZE

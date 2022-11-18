@@ -149,6 +149,16 @@ struct rseq {
 	__u32 vm_vcpu_id;
 
 	/*
+	 * Restartable sequences vm_numa_vcpu_id field. Updated by the kernel.
+	 * Read by user-space with single-copy atomicity semantics. This field
+	 * should only be read by the thread which registered this data
+	 * structure.  Aligned on 32-bit. Contains the current thread's
+	 * NUMA-aware virtual CPU ID (allocated uniquely within a memory
+	 * space).
+	 */
+	__u32 vm_numa_vcpu_id;
+
+	/*
 	 * Flexible array member at end of structure, after last feature field.
 	 */
 	char end[];
