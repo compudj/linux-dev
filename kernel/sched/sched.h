@@ -3262,38 +3262,174 @@ static inline void update_current_exec_runtime(struct task_struct *curr,
 }
 
 #ifdef CONFIG_SCHED_MM_VCPU
-static inline int __mm_vcpu_get(struct mm_struct *mm)
+#ifdef CONFIG_NUMA
+static inline void __mm_numa_vcpu_get(struct mm_struct *mm, struct task_struct *t)
+{
+	struct cpumask *cpumask = mm_numa_vcpumask(mm),
+		       *node_cpumask = mm_node_vcpumask(mm, numa_node_id()),
+		       *node_alloc_cpumask = mm_node_alloc_vcpumask(mm);
+	unsigned int node;
+	int vcpu;
+
+	if (num_possible_nodes() == 1) {
+		vcpu = -1;
+		goto end;
+	}
+
+	/*
+	 * Try to reserve lowest available vcpu number within those already
+	 * reserved for this NUMA node.
+	 */
+	vcpu = cpumask_first_andnot(node_cpumask, cpumask);
+	if (vcpu >= nr_cpu_ids)
+		goto alloc_numa;
+	__cpumask_set_cpu(vcpu, cpumask);
+	goto end;
+
+alloc_numa:
+	/*
+	 * Try to reserve lowest available vcpu number within those not already
+	 * allocated for numa nodes.
+	 */
+	vcpu = cpumask_first_notandnot(node_alloc_cpumask, cpumask);
+	if (vcpu >= nr_cpu_ids)
+		goto numa_update;
+	__cpumask_set_cpu(vcpu, cpumask);
+	__cpumask_set_cpu(vcpu, node_cpumask);
+	__cpumask_set_cpu(vcpu, node_alloc_cpumask);
+	goto end;
+
+numa_update:
+	/*
+	 * NUMA node id configuration changed for at least one CPU in the system.
+	 * We need to steal a currently unused vcpu_id from an overprovisioned
+	 * node for our current node. Userspace must handle the fact that the
+	 * node id associated with this vcpu_id may change due to node ID
+	 * reconfiguration.
+	 *
+	 * Count how many possible cpus are attached to each (other) node id,
+	 * and compare this with the per-mm node vcpumask cpu count. Find one
+	 * which has too many cpus in its mask to steal from.
+	 */
+	for (node = 0; node < nr_node_ids; node++) {
+		struct cpumask *iter_cpumask;
+
+		if (node == numa_node_id())
+			continue;
+		iter_cpumask = mm_node_vcpumask(mm, node);
+		if (nr_cpus_node(node) < cpumask_weight(iter_cpumask)) {
+			/* Try to steal from this node. */
+			vcpu = cpumask_first_andnot(iter_cpumask, cpumask);
+			if (vcpu >= nr_cpu_ids)
+				goto steal_fail;
+			__cpumask_set_cpu(vcpu, cpumask);
+			__cpumask_clear_cpu(vcpu, iter_cpumask);
+			__cpumask_set_cpu(vcpu, node_cpumask);
+			goto end;
+		}
+	}
+
+steal_fail:
+	/*
+	 * Our attempt at gracefully stealing a vcpu_id from another
+	 * overprovisioned NUMA node failed. Fallback to grabbing the first
+	 * available vcpu_id.
+	 */
+	vcpu = cpumask_first_zero(cpumask);
+	if (vcpu >= nr_cpu_ids) {
+		vcpu = -1;
+		goto end;
+	}
+	__cpumask_set_cpu(vcpu, cpumask);
+	/* Steal vcpu from its numa node mask. */
+	for (node = 0; node < nr_node_ids; node++) {
+		struct cpumask *iter_cpumask;
+
+		if (node == numa_node_id())
+			continue;
+		iter_cpumask = mm_node_vcpumask(mm, node);
+		if (cpumask_test_cpu(vcpu, iter_cpumask)) {
+			__cpumask_clear_cpu(vcpu, iter_cpumask);
+			break;
+		}
+	}
+	__cpumask_set_cpu(vcpu, node_cpumask);
+end:
+	t->mm_numa_vcpu = vcpu;
+}
+
+static inline void __mm_numa_vcpu_put(struct mm_struct *mm, struct task_struct *t)
+{
+	int vcpu = t->mm_numa_vcpu;
+
+	if (num_possible_nodes() == 1)
+		return;
+	if (vcpu < 0)
+		return;
+	__cpumask_clear_cpu(vcpu, mm_numa_vcpumask(mm));
+	t->mm_numa_vcpu = -1;
+}
+
+static inline void mm_numa_transfer_vcpu_prev_next(struct task_struct *prev, struct task_struct *next)
+{
+	next->mm_numa_vcpu = prev->mm_numa_vcpu;
+	prev->mm_numa_vcpu = -1;
+}
+#else
+static inline void __mm_numa_vcpu_get(struct mm_struct *mm, struct task_struct *t) { }
+static inline void __mm_numa_vcpu_put(struct mm_struct *mm, struct task_struct *t) { }
+static inline void mm_numa_transfer_vcpu_prev_next(struct task_struct *prev, struct task_struct *next) { }
+#endif
+
+static inline void __mm_vcpu_get(struct mm_struct *mm, struct task_struct *t)
 {
 	struct cpumask *cpumask;
 	int vcpu;
 
 	cpumask = mm_vcpumask(mm);
 	vcpu = cpumask_first_zero(cpumask);
-	if (vcpu >= nr_cpu_ids)
-		return -1;
+	if (vcpu >= nr_cpu_ids) {
+		vcpu = -1;
+		goto end;
+	}
 	__cpumask_set_cpu(vcpu, cpumask);
-	return vcpu;
+end:
+	t->mm_vcpu = vcpu;
 }
 
-static inline void mm_vcpu_put(struct mm_struct *mm, int vcpu)
+static inline void mm_vcpu_get(struct mm_struct *mm, struct task_struct *t)
 {
 	lockdep_assert_irqs_disabled();
+	raw_spin_lock(&mm->vcpu_lock);
+	__mm_vcpu_get(mm, t);
+	__mm_numa_vcpu_get(mm, t);
+	raw_spin_unlock(&mm->vcpu_lock);
+}
+
+static inline void __mm_vcpu_put(struct mm_struct *mm, struct task_struct *t)
+{
+	int vcpu = t->mm_vcpu;
+
 	if (vcpu < 0)
 		return;
-	raw_spin_lock(&mm->vcpu_lock);
 	__cpumask_clear_cpu(vcpu, mm_vcpumask(mm));
+	t->mm_vcpu = -1;
+}
+
+static inline void mm_vcpu_put(struct mm_struct *mm, struct task_struct *t)
+{
+	lockdep_assert_irqs_disabled();
+	raw_spin_lock(&mm->vcpu_lock);
+	__mm_vcpu_put(mm, t);
+	__mm_numa_vcpu_put(mm, t);
 	raw_spin_unlock(&mm->vcpu_lock);
 }
 
-static inline int mm_vcpu_get(struct mm_struct *mm)
+static inline void mm_transfer_vcpu_prev_next(struct task_struct *prev, struct task_struct *next)
 {
-	int ret;
-
-	lockdep_assert_irqs_disabled();
-	raw_spin_lock(&mm->vcpu_lock);
-	ret = __mm_vcpu_get(mm);
-	raw_spin_unlock(&mm->vcpu_lock);
-	return ret;
+	next->mm_vcpu = prev->mm_vcpu;
+	prev->mm_vcpu = -1;
+	mm_numa_transfer_vcpu_prev_next(prev, next);
 }
 
 static inline void switch_mm_vcpu(struct task_struct *prev, struct task_struct *next)
@@ -3304,15 +3440,13 @@ static inline void switch_mm_vcpu(struct task_struct *prev, struct task_struct *
 			 * Context switch between threads in same mm, hand over
 			 * the mm_vcpu from prev to next.
 			 */
-			next->mm_vcpu = prev->mm_vcpu;
-			prev->mm_vcpu = -1;
+			mm_transfer_vcpu_prev_next(prev, next);
 			return;
 		}
-		mm_vcpu_put(prev->mm, prev->mm_vcpu);
-		prev->mm_vcpu = -1;
+		mm_vcpu_put(prev->mm, prev);
 	}
 	if (next->mm_vcpu_active)
-		next->mm_vcpu = mm_vcpu_get(next->mm);
+		mm_vcpu_get(next->mm, next);
 }
 
 #else

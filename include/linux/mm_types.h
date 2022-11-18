@@ -18,6 +18,7 @@
 #include <linux/page-flags-layout.h>
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
+#include <linux/nodemask.h>
 
 #include <asm/mmu.h>
 
@@ -848,15 +849,81 @@ static inline cpumask_t *mm_vcpumask(struct mm_struct *mm)
 	return (struct cpumask *)vcpu_bitmap;
 }
 
+#ifdef CONFIG_NUMA
+/*
+ * Layout of node vcpumasks:
+ * - mm_numa vcpumask:           cpumask of the currently used mm_numa vcpu
+ *                               ids.
+ * - node_alloc vcpumask:        cpumask tracking which vcpu_id were
+ *                               allocated (across nodes) in this
+ *                               memory space.
+ * - node vcpumask[nr_node_ids]: per-node cpumask tracking which vcpu_id
+ *                               were allocated in this memory space.
+ */
+static inline cpumask_t *mm_numa_vcpumask(struct mm_struct *mm)
+{
+	unsigned long vcpu_bitmap = (unsigned long)mm_vcpumask(mm);
+
+	/* Skip mm_vcpumask */
+	vcpu_bitmap += cpumask_size();
+	return (struct cpumask *)vcpu_bitmap;
+}
+
+static inline cpumask_t *mm_node_alloc_vcpumask(struct mm_struct *mm)
+{
+	unsigned long vcpu_bitmap = (unsigned long)mm_numa_vcpumask(mm);
+
+	/* Skip mm_numa_vcpumask */
+	vcpu_bitmap += cpumask_size();
+	return (struct cpumask *)vcpu_bitmap;
+}
+
+static inline cpumask_t *mm_node_vcpumask(struct mm_struct *mm, unsigned int node)
+{
+	unsigned long vcpu_bitmap = (unsigned long)mm_node_alloc_vcpumask(mm);
+
+	/* Skip node alloc vcpumask */
+	vcpu_bitmap += cpumask_size();
+	vcpu_bitmap += node * cpumask_size();
+	return (struct cpumask *)vcpu_bitmap;
+}
+
+static inline void mm_init_node_vcpumask(struct mm_struct *mm)
+{
+	unsigned int node;
+
+	if (num_possible_nodes() == 1)
+		return;
+	cpumask_clear(mm_numa_vcpumask(mm));
+	cpumask_clear(mm_node_alloc_vcpumask(mm));
+	for (node = 0; node < nr_node_ids; node++)
+		cpumask_clear(mm_node_vcpumask(mm, node));
+}
+
+static inline unsigned int mm_node_vcpumask_size(void)
+{
+	if (num_possible_nodes() == 1)
+		return 0;
+	return (nr_node_ids + 2) * cpumask_size();
+}
+#else /* CONFIG_NUMA */
+static inline void mm_init_node_vcpumask(struct mm_struct *mm) { }
+static inline unsigned int mm_node_vcpumask_size(void)
+{
+	return 0;
+}
+#endif /* CONFIG_NUMA */
+
 static inline void mm_init_vcpu(struct mm_struct *mm)
 {
 	raw_spin_lock_init(&mm->vcpu_lock);
 	cpumask_clear(mm_vcpumask(mm));
+	mm_init_node_vcpumask(mm);
 }
 
 static inline unsigned int mm_vcpu_size(void)
 {
-	return cpumask_size();
+	return cpumask_size() + mm_node_vcpumask_size();
 }
 #else /* CONFIG_SCHED_MM_VCPU */
 static inline void mm_init_vcpu(struct mm_struct *mm) { }

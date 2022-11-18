@@ -3484,6 +3484,20 @@ static inline int task_mm_vcpu_id(struct task_struct *t)
 {
 	return t->mm_vcpu;
 }
+#ifdef CONFIG_NUMA
+static inline int task_mm_numa_vcpu_id(struct task_struct *t)
+{
+	if (num_possible_nodes() == 1)
+		return task_mm_vcpu_id(t);
+	else
+		return t->mm_numa_vcpu;
+}
+#else
+static inline int task_mm_numa_vcpu_id(struct task_struct *t)
+{
+	return task_mm_vcpu_id(t);
+}
+#endif
 #else
 static inline void sched_vcpu_before_execve(struct task_struct *t) { }
 static inline void sched_vcpu_after_execve(struct task_struct *t) { }
@@ -3497,6 +3511,10 @@ static inline int task_mm_vcpu_id(struct task_struct *t)
 	 * in user-space, althrough it won't provide the memory usage benefits.
 	 */
 	return raw_smp_processor_id();
+}
+static inline int task_mm_numa_vcpu_id(struct task_struct *t)
+{
+	return task_mm_vcpu_id(t);
 }
 #endif
 

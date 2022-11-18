@@ -1050,6 +1050,9 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #ifdef CONFIG_SCHED_MM_VCPU
 	tsk->mm_vcpu = -1;
 	tsk->mm_vcpu_active = 0;
+#ifdef CONFIG_NUMA
+	tsk->mm_numa_vcpu = -1;
+#endif
 #endif
 	return tsk;
 

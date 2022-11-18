@@ -1317,6 +1317,9 @@ struct task_struct {
 #ifdef CONFIG_SCHED_MM_VCPU
 	int				mm_vcpu;	/* Current vcpu in mm */
 	int				mm_vcpu_active;	/* Whether vcpu bitmap is active */
+#ifdef CONFIG_NUMA
+	int				mm_numa_vcpu;	/* Current numa_vcpu in mm */
+#endif
 #endif
 
 	struct tlbflush_unmap_batch	tlb_ubc;
