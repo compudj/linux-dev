@@ -3261,4 +3261,62 @@ static inline void update_current_exec_runtime(struct task_struct *curr,
 	cgroup_account_cputime(curr, delta_exec);
 }
 
+#ifdef CONFIG_SCHED_MM_VCPU
+static inline int __mm_vcpu_get(struct mm_struct *mm)
+{
+	struct cpumask *cpumask;
+	int vcpu;
+
+	cpumask = mm_vcpumask(mm);
+	vcpu = cpumask_first_zero(cpumask);
+	if (vcpu >= nr_cpu_ids)
+		return -1;
+	__cpumask_set_cpu(vcpu, cpumask);
+	return vcpu;
+}
+
+static inline void mm_vcpu_put(struct mm_struct *mm, int vcpu)
+{
+	lockdep_assert_irqs_disabled();
+	if (vcpu < 0)
+		return;
+	raw_spin_lock(&mm->vcpu_lock);
+	__cpumask_clear_cpu(vcpu, mm_vcpumask(mm));
+	raw_spin_unlock(&mm->vcpu_lock);
+}
+
+static inline int mm_vcpu_get(struct mm_struct *mm)
+{
+	int ret;
+
+	lockdep_assert_irqs_disabled();
+	raw_spin_lock(&mm->vcpu_lock);
+	ret = __mm_vcpu_get(mm);
+	raw_spin_unlock(&mm->vcpu_lock);
+	return ret;
+}
+
+static inline void switch_mm_vcpu(struct task_struct *prev, struct task_struct *next)
+{
+	if (prev->mm_vcpu_active) {
+		if (next->mm_vcpu_active && next->mm == prev->mm) {
+			/*
+			 * Context switch between threads in same mm, hand over
+			 * the mm_vcpu from prev to next.
+			 */
+			next->mm_vcpu = prev->mm_vcpu;
+			prev->mm_vcpu = -1;
+			return;
+		}
+		mm_vcpu_put(prev->mm, prev->mm_vcpu);
+		prev->mm_vcpu = -1;
+	}
+	if (next->mm_vcpu_active)
+		next->mm_vcpu = mm_vcpu_get(next->mm);
+}
+
+#else
+static inline void switch_mm_vcpu(struct task_struct *prev, struct task_struct *next) { }
+#endif
+
 #endif /* _KERNEL_SCHED_SCHED_H */
