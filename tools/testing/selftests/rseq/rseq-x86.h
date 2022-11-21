@@ -26,10 +26,11 @@
  * address through a "r" input operand.
  */
 
-/* Offset of cpu_id, rseq_cs, and vm_vcpu_id fields in struct rseq. */
-#define RSEQ_CPU_ID_OFFSET	4
-#define RSEQ_CS_OFFSET		8
-#define RSEQ_VM_VCPU_ID_OFFSET	24
+/* Offset of cpu_id, rseq_cs, vm_vcpu_id, and vm_numa_vcpu_id fields in struct rseq. */
+#define RSEQ_CPU_ID_OFFSET		4
+#define RSEQ_CS_OFFSET			8
+#define RSEQ_VM_VCPU_ID_OFFSET		24
+#define RSEQ_VM_NUMA_VCPU_ID_OFFSET	28
 
 #ifdef __x86_64__
 
@@ -224,6 +225,18 @@ do {									\
 #include "rseq-x86-bits.h"
 #undef RSEQ_TEMPLATE_MO_RELEASE
 #undef RSEQ_TEMPLATE_VM_VCPU_ID
+
+/* Per-vm-numa-vcpu-id indexing. */
+
+#define RSEQ_TEMPLATE_VM_NUMA_VCPU_ID
+#define RSEQ_TEMPLATE_MO_RELAXED
+#include "rseq-x86-bits.h"
+#undef RSEQ_TEMPLATE_MO_RELAXED
+
+#define RSEQ_TEMPLATE_MO_RELEASE
+#include "rseq-x86-bits.h"
+#undef RSEQ_TEMPLATE_MO_RELEASE
+#undef RSEQ_TEMPLATE_VM_NUMA_VCPU_ID
 
 /* APIs which are not based on cpu ids. */
 

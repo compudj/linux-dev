@@ -172,6 +172,18 @@ do {									\
 #undef RSEQ_TEMPLATE_MO_RELEASE
 #undef RSEQ_TEMPLATE_VM_VCPU_ID
 
+/* Per-vm-numa-vcpu-id indexing. */
+
+#define RSEQ_TEMPLATE_VM_NUMA_VCPU_ID
+#define RSEQ_TEMPLATE_MO_RELAXED
+#include "rseq-mips-bits.h"
+#undef RSEQ_TEMPLATE_MO_RELAXED
+
+#define RSEQ_TEMPLATE_MO_RELEASE
+#include "rseq-mips-bits.h"
+#undef RSEQ_TEMPLATE_MO_RELEASE
+#undef RSEQ_TEMPLATE_VM_NUMA_VCPU_ID
+
 /* APIs which are not based on cpu ids. */
 
 #define RSEQ_TEMPLATE_CPU_ID_NONE

@@ -10,7 +10,7 @@
 #ifdef __x86_64__
 
 #if defined(RSEQ_TEMPLATE_MO_RELAXED) && \
-	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID))
+	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID) || defined(RSEQ_TEMPLATE_VM_NUMA_VCPU_ID))
 
 static inline __attribute__((always_inline))
 int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_storev)(intptr_t *v, intptr_t expect, intptr_t newv, int cpu)
@@ -328,10 +328,10 @@ error3:
 }
 
 #endif /* #if defined(RSEQ_TEMPLATE_MO_RELAXED) &&
-	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID)) */
+	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID) || defined(RSEQ_TEMPLATE_VM_NUMA_VCPU_ID)) */
 
 #if (defined(RSEQ_TEMPLATE_MO_RELAXED) || defined(RSEQ_TEMPLATE_MO_RELEASE)) && \
-	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID))
+	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID) || defined(RSEQ_TEMPLATE_VM_NUMA_VCPU_ID))
 
 static inline __attribute__((always_inline))
 int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_trystorev_storev)(intptr_t *v, intptr_t expect,
@@ -517,12 +517,12 @@ error2:
 }
 
 #endif /* #if (defined(RSEQ_TEMPLATE_MO_RELAXED) || defined(RSEQ_TEMPLATE_MO_RELEASE)) &&
-	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID)) */
+	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID) || defined(RSEQ_TEMPLATE_VM_NUMA_VCPU_ID)) */
 
 #elif defined(__i386__)
 
 #if defined(RSEQ_TEMPLATE_MO_RELAXED) && \
-	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID))
+	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID) || defined(RSEQ_TEMPLATE_VM_NUMA_VCPU_ID))
 
 static inline __attribute__((always_inline))
 int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_storev)(intptr_t *v, intptr_t expect, intptr_t newv, int cpu)
@@ -784,10 +784,10 @@ error3:
 }
 
 #endif /* #if defined(RSEQ_TEMPLATE_MO_RELAXED) &&
-	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID)) */
+	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID) || defined(RSEQ_TEMPLATE_VM_NUMA_VCPU_ID)) */
 
 #if (defined(RSEQ_TEMPLATE_MO_RELAXED) || defined(RSEQ_TEMPLATE_MO_RELEASE)) && \
-	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID))
+	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID) || defined(RSEQ_TEMPLATE_VM_NUMA_VCPU_ID))
 
 static inline __attribute__((always_inline))
 int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_trystorev_storev)(intptr_t *v, intptr_t expect,
@@ -986,7 +986,7 @@ error2:
 }
 
 #endif /* #if (defined(RSEQ_TEMPLATE_MO_RELAXED) || defined(RSEQ_TEMPLATE_MO_RELEASE)) &&
-	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID)) */
+	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_VM_VCPU_ID) || defined(RSEQ_TEMPLATE_VM_NUMA_VCPU_ID)) */
 
 #endif
 
