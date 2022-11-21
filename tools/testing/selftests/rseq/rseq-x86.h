@@ -26,10 +26,11 @@
  * address through a "r" input operand.
  */
 
-/* Offset of cpu_id, rseq_cs, and mm_cid fields in struct rseq. */
-#define RSEQ_CPU_ID_OFFSET	4
-#define RSEQ_CS_OFFSET		8
-#define RSEQ_MM_CID_OFFSET	24
+/* Offset of cpu_id, rseq_cs, mm_cid, and mm_numa_cid fields in struct rseq. */
+#define RSEQ_CPU_ID_OFFSET		4
+#define RSEQ_CS_OFFSET			8
+#define RSEQ_MM_CID_OFFSET		24
+#define RSEQ_MM_NUMA_CID_OFFSET		28
 
 #ifdef __x86_64__
 
@@ -224,6 +225,18 @@ do {									\
 #include "rseq-x86-bits.h"
 #undef RSEQ_TEMPLATE_MO_RELEASE
 #undef RSEQ_TEMPLATE_MM_CID
+
+/* Per-mm-numa-cid indexing. */
+
+#define RSEQ_TEMPLATE_MM_NUMA_CID
+#define RSEQ_TEMPLATE_MO_RELAXED
+#include "rseq-x86-bits.h"
+#undef RSEQ_TEMPLATE_MO_RELAXED
+
+#define RSEQ_TEMPLATE_MO_RELEASE
+#include "rseq-x86-bits.h"
+#undef RSEQ_TEMPLATE_MO_RELEASE
+#undef RSEQ_TEMPLATE_MM_NUMA_CID
 
 /* APIs which are not based on cpu ids. */
 

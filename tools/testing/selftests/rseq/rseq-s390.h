@@ -154,6 +154,18 @@ do {									\
 #undef RSEQ_TEMPLATE_MO_RELEASE
 #undef RSEQ_TEMPLATE_MM_CID
 
+/* Per-mm-cid indexing. */
+
+#define RSEQ_TEMPLATE_MM_NUMA_CID
+#define RSEQ_TEMPLATE_MO_RELAXED
+#include "rseq-s390-bits.h"
+#undef RSEQ_TEMPLATE_MO_RELAXED
+
+#define RSEQ_TEMPLATE_MO_RELEASE
+#include "rseq-s390-bits.h"
+#undef RSEQ_TEMPLATE_MO_RELEASE
+#undef RSEQ_TEMPLATE_MM_NUMA_CID
+
 /* APIs which are not based on cpu ids. */
 
 #define RSEQ_TEMPLATE_CPU_ID_NONE
