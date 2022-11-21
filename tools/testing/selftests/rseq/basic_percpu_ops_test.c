@@ -24,6 +24,18 @@ bool rseq_validate_cpu_id(void)
 {
 	return rseq_mm_cid_available();
 }
+#elif defined(BUILDOPT_RSEQ_PERCPU_MM_NUMA_CID)
+# define RSEQ_PERCPU	RSEQ_PERCPU_MM_NUMA_CID
+static
+int get_current_cpu_id(void)
+{
+	return rseq_current_mm_numa_cid();
+}
+static
+bool rseq_validate_cpu_id(void)
+{
+	return rseq_mm_numa_cid_available();
+}
 #else
 # define RSEQ_PERCPU	RSEQ_PERCPU_CPU_ID
 static
