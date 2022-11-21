@@ -86,6 +86,7 @@ enum rseq_mo {
 enum rseq_percpu_mode {
 	RSEQ_PERCPU_CPU_ID = 0,
 	RSEQ_PERCPU_VM_VCPU_ID = 1,
+	RSEQ_PERCPU_VM_NUMA_VCPU_ID = 2,
 };
 
 static inline struct rseq_abi *rseq_get_abi(void)
@@ -258,6 +259,8 @@ int rseq_cmpeqv_storev(enum rseq_mo rseq_mo, enum rseq_percpu_mode percpu_mode,
 		return rseq_cmpeqv_storev_relaxed_cpu_id(v, expect, newv, cpu);
 	case RSEQ_PERCPU_VM_VCPU_ID:
 		return rseq_cmpeqv_storev_relaxed_vm_vcpu_id(v, expect, newv, cpu);
+	case RSEQ_PERCPU_VM_NUMA_VCPU_ID:
+		return rseq_cmpeqv_storev_relaxed_vm_numa_vcpu_id(v, expect, newv, cpu);
 	}
 	return -1;
 }
@@ -278,6 +281,8 @@ int rseq_cmpnev_storeoffp_load(enum rseq_mo rseq_mo, enum rseq_percpu_mode percp
 		return rseq_cmpnev_storeoffp_load_relaxed_cpu_id(v, expectnot, voffp, load, cpu);
 	case RSEQ_PERCPU_VM_VCPU_ID:
 		return rseq_cmpnev_storeoffp_load_relaxed_vm_vcpu_id(v, expectnot, voffp, load, cpu);
+	case RSEQ_PERCPU_VM_NUMA_VCPU_ID:
+		return rseq_cmpnev_storeoffp_load_relaxed_vm_numa_vcpu_id(v, expectnot, voffp, load, cpu);
 	}
 	return -1;
 }
@@ -293,6 +298,8 @@ int rseq_addv(enum rseq_mo rseq_mo, enum rseq_percpu_mode percpu_mode,
 		return rseq_addv_relaxed_cpu_id(v, count, cpu);
 	case RSEQ_PERCPU_VM_VCPU_ID:
 		return rseq_addv_relaxed_vm_vcpu_id(v, count, cpu);
+	case RSEQ_PERCPU_VM_NUMA_VCPU_ID:
+		return rseq_addv_relaxed_vm_numa_vcpu_id(v, count, cpu);
 	}
 	return -1;
 }
@@ -313,6 +320,8 @@ int rseq_offset_deref_addv(enum rseq_mo rseq_mo, enum rseq_percpu_mode percpu_mo
 		return rseq_offset_deref_addv_relaxed_cpu_id(ptr, off, inc, cpu);
 	case RSEQ_PERCPU_VM_VCPU_ID:
 		return rseq_offset_deref_addv_relaxed_vm_vcpu_id(ptr, off, inc, cpu);
+	case RSEQ_PERCPU_VM_NUMA_VCPU_ID:
+		return rseq_offset_deref_addv_relaxed_vm_numa_vcpu_id(ptr, off, inc, cpu);
 	}
 	return -1;
 }
@@ -331,6 +340,8 @@ int rseq_cmpeqv_trystorev_storev(enum rseq_mo rseq_mo, enum rseq_percpu_mode per
 			return rseq_cmpeqv_trystorev_storev_relaxed_cpu_id(v, expect, v2, newv2, newv, cpu);
 		case RSEQ_PERCPU_VM_VCPU_ID:
 			return rseq_cmpeqv_trystorev_storev_relaxed_vm_vcpu_id(v, expect, v2, newv2, newv, cpu);
+		case RSEQ_PERCPU_VM_NUMA_VCPU_ID:
+			return rseq_cmpeqv_trystorev_storev_relaxed_vm_numa_vcpu_id(v, expect, v2, newv2, newv, cpu);
 		}
 		return -1;
 	case RSEQ_MO_RELEASE:
@@ -339,6 +350,8 @@ int rseq_cmpeqv_trystorev_storev(enum rseq_mo rseq_mo, enum rseq_percpu_mode per
 			return rseq_cmpeqv_trystorev_storev_release_cpu_id(v, expect, v2, newv2, newv, cpu);
 		case RSEQ_PERCPU_VM_VCPU_ID:
 			return rseq_cmpeqv_trystorev_storev_release_vm_vcpu_id(v, expect, v2, newv2, newv, cpu);
+		case RSEQ_PERCPU_VM_NUMA_VCPU_ID:
+			return rseq_cmpeqv_trystorev_storev_release_vm_numa_vcpu_id(v, expect, v2, newv2, newv, cpu);
 		}
 		return -1;
 	default:
@@ -359,6 +372,8 @@ int rseq_cmpeqv_cmpeqv_storev(enum rseq_mo rseq_mo, enum rseq_percpu_mode percpu
 		return rseq_cmpeqv_cmpeqv_storev_relaxed_cpu_id(v, expect, v2, expect2, newv, cpu);
 	case RSEQ_PERCPU_VM_VCPU_ID:
 		return rseq_cmpeqv_cmpeqv_storev_relaxed_vm_vcpu_id(v, expect, v2, expect2, newv, cpu);
+	case RSEQ_PERCPU_VM_NUMA_VCPU_ID:
+		return rseq_cmpeqv_cmpeqv_storev_relaxed_vm_numa_vcpu_id(v, expect, v2, expect2, newv, cpu);
 	}
 	return -1;
 }
@@ -376,6 +391,8 @@ int rseq_cmpeqv_trymemcpy_storev(enum rseq_mo rseq_mo, enum rseq_percpu_mode per
 			return rseq_cmpeqv_trymemcpy_storev_relaxed_cpu_id(v, expect, dst, src, len, newv, cpu);
 		case RSEQ_PERCPU_VM_VCPU_ID:
 			return rseq_cmpeqv_trymemcpy_storev_relaxed_vm_vcpu_id(v, expect, dst, src, len, newv, cpu);
+		case RSEQ_PERCPU_VM_NUMA_VCPU_ID:
+			return rseq_cmpeqv_trymemcpy_storev_relaxed_vm_numa_vcpu_id(v, expect, dst, src, len, newv, cpu);
 		}
 		return -1;
 	case RSEQ_MO_RELEASE:
@@ -384,6 +401,8 @@ int rseq_cmpeqv_trymemcpy_storev(enum rseq_mo rseq_mo, enum rseq_percpu_mode per
 			return rseq_cmpeqv_trymemcpy_storev_release_cpu_id(v, expect, dst, src, len, newv, cpu);
 		case RSEQ_PERCPU_VM_VCPU_ID:
 			return rseq_cmpeqv_trymemcpy_storev_release_vm_vcpu_id(v, expect, dst, src, len, newv, cpu);
+		case RSEQ_PERCPU_VM_NUMA_VCPU_ID:
+			return rseq_cmpeqv_trymemcpy_storev_release_vm_numa_vcpu_id(v, expect, dst, src, len, newv, cpu);
 		}
 		return -1;
 	default:

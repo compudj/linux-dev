@@ -14,7 +14,9 @@ OVERRIDE_TARGETS = 1
 
 TEST_GEN_PROGS = basic_test basic_numa_test basic_percpu_ops_test basic_percpu_ops_vm_vcpu_id_test param_test \
 		param_test_benchmark param_test_compare_twice param_test_vm_vcpu_id \
-		param_test_vm_vcpu_id_benchmark param_test_vm_vcpu_id_compare_twice
+		param_test_vm_vcpu_id_benchmark param_test_vm_vcpu_id_compare_twice \
+		param_test_vm_numa_vcpu_id param_test_vm_numa_vcpu_id_benchmark \
+		param_test_vm_numa_vcpu_id_compare_twice
 
 TEST_GEN_PROGS_EXTENDED = librseq.so
 
@@ -52,3 +54,15 @@ $(OUTPUT)/param_test_vm_vcpu_id_benchmark: param_test.c $(TEST_GEN_PROGS_EXTENDE
 $(OUTPUT)/param_test_vm_vcpu_id_compare_twice: param_test.c $(TEST_GEN_PROGS_EXTENDED) \
 					rseq.h rseq-*.h
 	$(CC) $(CFLAGS) -DBUILDOPT_RSEQ_PERCPU_VM_VCPU_ID -DRSEQ_COMPARE_TWICE $< $(LDLIBS) -lrseq -o $@
+
+$(OUTPUT)/param_test_vm_numa_vcpu_id: param_test.c $(TEST_GEN_PROGS_EXTENDED) \
+					rseq.h rseq-*.h
+	$(CC) $(CFLAGS) -DBUILDOPT_RSEQ_PERCPU_VM_NUMA_VCPU_ID $< $(LDLIBS) -lrseq -o $@
+
+$(OUTPUT)/param_test_vm_numa_vcpu_id_benchmark: param_test.c $(TEST_GEN_PROGS_EXTENDED) \
+					rseq.h rseq-*.h
+	$(CC) $(CFLAGS) -DBUILDOPT_RSEQ_PERCPU_VM_NUMA_VCPU_ID -DBENCHMARK $< $(LDLIBS) -lrseq -o $@
+
+$(OUTPUT)/param_test_vm_numa_vcpu_id_compare_twice: param_test.c $(TEST_GEN_PROGS_EXTENDED) \
+					rseq.h rseq-*.h
+	$(CC) $(CFLAGS) -DBUILDOPT_RSEQ_PERCPU_VM_NUMA_VCPU_ID -DRSEQ_COMPARE_TWICE $< $(LDLIBS) -lrseq -o $@

@@ -300,6 +300,30 @@ int rseq_membarrier_expedited(int cpu)
 			      0, 0);
 }
 # endif /* TEST_MEMBARRIER */
+#elif defined(BUILDOPT_RSEQ_PERCPU_VM_NUMA_VCPU_ID)
+# define RSEQ_PERCPU	RSEQ_PERCPU_VM_NUMA_VCPU_ID
+static
+int get_current_cpu_id(void)
+{
+	return rseq_current_vm_numa_vcpu_id();
+}
+static
+bool rseq_validate_cpu_id(void)
+{
+	return rseq_vm_numa_vcpu_id_available();
+}
+# ifdef TEST_MEMBARRIER
+/*
+ * Membarrier does not currently support targeting a vm_numa_vcpu_id, so
+ * issue the barrier on all cpus.
+ */
+static
+int rseq_membarrier_expedited(int cpu)
+{
+	return sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ,
+			      0, 0);
+}
+# endif /* TEST_MEMBARRIER */
 #else
 # define RSEQ_PERCPU	RSEQ_PERCPU_CPU_ID
 static
