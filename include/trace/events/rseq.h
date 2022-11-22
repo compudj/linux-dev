@@ -18,16 +18,18 @@ TRACE_EVENT(rseq_update,
 		__field(s32, cpu_id)
 		__field(s32, node_id)
 		__field(s32, mm_cid)
+		__field(s32, mm_numa_cid)
 	),
 
 	TP_fast_assign(
 		__entry->cpu_id = raw_smp_processor_id();
 		__entry->node_id = cpu_to_node(__entry->cpu_id);
 		__entry->mm_cid = task_mm_cid(t);
+		__entry->mm_numa_cid = task_mm_numa_cid(t);
 	),
 
-	TP_printk("cpu_id=%d node_id=%d mm_cid=%d", __entry->cpu_id,
-		  __entry->node_id, __entry->mm_cid)
+	TP_printk("cpu_id=%d node_id=%d mm_cid=%d mm_numa_cid=%d", __entry->cpu_id,
+		  __entry->node_id, __entry->mm_cid,  __entry->mm_numa_cid)
 );
 
 TRACE_EVENT(rseq_ip_fixup,
