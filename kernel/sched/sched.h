@@ -3249,7 +3249,47 @@ static inline void update_current_exec_runtime(struct task_struct *curr,
 }
 
 #ifdef CONFIG_SCHED_MM_CID
-static inline int __mm_cid_get(struct mm_struct *mm)
+extern int sched_mm_cid_migrate_from(struct rq *src_rq, struct task_struct *t);
+extern void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t, int cid);
+
+static inline void __mm_cid_put(struct mm_struct *mm, int cid)
+{
+	lockdep_assert_irqs_disabled();
+	if (cid < 0)
+		return;
+	raw_spin_lock(&mm->cid_lock);
+	__cpumask_clear_cpu(cid, mm_cidmask(mm));
+	raw_spin_unlock(&mm->cid_lock);
+}
+
+static inline void mm_cid_put(struct mm_struct *mm, int thread_cid)
+{
+	int *pcpu_cid, cid;
+
+	lockdep_assert_irqs_disabled();
+	if (thread_cid < 0)
+		return;
+	pcpu_cid = this_cpu_ptr(mm->pcpu_cid);
+	cid = *pcpu_cid;
+	if (cid == thread_cid)
+		*pcpu_cid = PCPU_CID_UNSET;
+	__mm_cid_put(mm, thread_cid);
+}
+
+static inline void mm_cid_put_lazy(struct mm_struct *mm, int thread_cid)
+{
+	int *pcpu_cid, cid;
+
+	lockdep_assert_irqs_disabled();
+	if (thread_cid < 0)
+		return;
+	pcpu_cid = this_cpu_ptr(mm->pcpu_cid);
+	cid = *pcpu_cid;
+	if (cid != thread_cid)
+		__mm_cid_put(mm, thread_cid);
+}
+
+static inline int __mm_cid_get_locked(struct mm_struct *mm)
 {
 	struct cpumask *cpumask;
 	int cid;
@@ -3262,40 +3302,38 @@ static inline int __mm_cid_get(struct mm_struct *mm)
 	return cid;
 }
 
-static inline void mm_cid_put(struct mm_struct *mm, int cid)
-{
-	lockdep_assert_irqs_disabled();
-	if (cid < 0)
-		return;
-	raw_spin_lock(&mm->cid_lock);
-	__cpumask_clear_cpu(cid, mm_cidmask(mm));
-	raw_spin_unlock(&mm->cid_lock);
-}
-
-static inline int mm_cid_get(struct mm_struct *mm)
+static inline int __mm_cid_get(struct mm_struct *mm)
 {
 	int ret;
 
 	lockdep_assert_irqs_disabled();
 	raw_spin_lock(&mm->cid_lock);
-	ret = __mm_cid_get(mm);
+	ret = __mm_cid_get_locked(mm);
 	raw_spin_unlock(&mm->cid_lock);
 	return ret;
+}
+
+static inline int mm_cid_get(struct mm_struct *mm)
+{
+	int *pcpu_cid, cid;
+
+	lockdep_assert_irqs_disabled();
+	pcpu_cid = this_cpu_ptr(mm->pcpu_cid);
+	cid = *pcpu_cid;
+	if (pcpu_cid_is_unset(cid)) {
+		raw_spin_lock(&mm->cid_lock);
+		cid = __mm_cid_get_locked(mm);
+		raw_spin_unlock(&mm->cid_lock);
+		*pcpu_cid = cid;
+		return cid;
+	}
+	return cid;
 }
 
 static inline void switch_mm_cid(struct task_struct *prev, struct task_struct *next)
 {
 	if (prev->mm_cid_active) {
-		if (next->mm_cid_active && next->mm == prev->mm) {
-			/*
-			 * Context switch between threads in same mm, hand over
-			 * the mm_cid from prev to next.
-			 */
-			next->mm_cid = prev->mm_cid;
-			prev->mm_cid = -1;
-			return;
-		}
-		mm_cid_put(prev->mm, prev->mm_cid);
+		mm_cid_put_lazy(prev->mm, prev->mm_cid);
 		prev->mm_cid = -1;
 	}
 	if (next->mm_cid_active)
@@ -3304,6 +3342,9 @@ static inline void switch_mm_cid(struct task_struct *prev, struct task_struct *n
 
 #else
 static inline void switch_mm_cid(struct task_struct *prev, struct task_struct *next) { }
+static inline void sched_mm_cid_migrate(struct rq *rq, struct task_struct *t, int new_cpu) { }
+static inline int sched_mm_cid_migrate_from(struct rq *src_rq, struct task_struct *t) { return 0; }
+static inline void sched_mm_cid_migrate_to(struct rq *src_rq, struct task_struct *t, int cid) { }
 #endif
 
 #endif /* _KERNEL_SCHED_SCHED_H */

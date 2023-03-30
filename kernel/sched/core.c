@@ -2326,16 +2326,20 @@ static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
 static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 				   struct task_struct *p, int new_cpu)
 {
+	int cid;
+
 	lockdep_assert_rq_held(rq);
 
 	deactivate_task(rq, p, DEQUEUE_NOCLOCK);
 	set_task_cpu(p, new_cpu);
+	cid = sched_mm_cid_migrate_from(rq, p);
 	rq_unlock(rq, rf);
 
 	rq = cpu_rq(new_cpu);
 
 	rq_lock(rq, rf);
 	WARN_ON_ONCE(task_cpu(p) != new_cpu);
+	sched_mm_cid_migrate_to(rq, p, cid);
 	activate_task(rq, p, 0);
 	check_preempt_curr(rq, p, 0);
 
@@ -11383,45 +11387,102 @@ void call_trace_sched_update_nr_running(struct rq *rq, int count)
 }
 
 #ifdef CONFIG_SCHED_MM_CID
+/*
+ * Migration is from src cpu to dst cpu. Always called from stopper thread on
+ * src cpu with rq lock held.
+ */
+int sched_mm_cid_migrate_from(struct rq *src_rq, struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+	int src_cpu, src_cid;
+	int *src_pcpu_cid;
+
+	if (!mm)
+		return PCPU_CID_UNSET;
+
+	src_cpu = cpu_of(src_rq);
+	src_pcpu_cid = per_cpu_ptr(mm->pcpu_cid, src_cpu);
+	src_cid = *src_pcpu_cid;
+	if (pcpu_cid_is_unset(src_cid)) {
+		/* src_cid is unset, nothing to clear/grab. */
+		return PCPU_CID_UNSET;
+	}
+	/* Set to PCPU_CID_UNSET, grab ownership. */
+	*src_pcpu_cid = PCPU_CID_UNSET;
+	return src_cid;
+}
+
+void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t, int src_cid)
+{
+	struct mm_struct *mm = t->mm;
+	int dst_cpu, dst_cid;
+	int *dst_pcpu_cid;
+
+	if (!mm || pcpu_cid_is_unset(src_cid))
+		return;
+
+	dst_cpu = cpu_of(dst_rq);
+	dst_pcpu_cid = per_cpu_ptr(mm->pcpu_cid, dst_cpu);
+
+	/* *dst_pcpu_cid = min(src_cid, *dst_pcpu_cid) */
+	dst_cid = *dst_pcpu_cid;
+	if (!pcpu_cid_is_unset(dst_cid) && dst_cid < src_cid) {
+		__mm_cid_put(mm, src_cid);
+		return;
+	}
+	*dst_pcpu_cid = src_cid;
+	if (!pcpu_cid_is_unset(dst_cid)) {
+		/*
+		 * Put dst_cid if not currently in use, else it will be
+		 * lazy put.
+		 */
+		if (dst_rq->curr->mm != mm)
+			__mm_cid_put(mm, dst_cid);
+	}
+}
+
 void sched_mm_cid_exit_signals(struct task_struct *t)
 {
 	struct mm_struct *mm = t->mm;
-	unsigned long flags;
+	struct rq *rq = this_rq();
+	struct rq_flags rf;
 
 	if (!mm)
 		return;
-	local_irq_save(flags);
+	rq_lock_irqsave(rq, &rf);
 	mm_cid_put(mm, t->mm_cid);
 	t->mm_cid = -1;
 	t->mm_cid_active = 0;
-	local_irq_restore(flags);
+	rq_unlock_irqrestore(rq, &rf);
 }
 
 void sched_mm_cid_before_execve(struct task_struct *t)
 {
 	struct mm_struct *mm = t->mm;
-	unsigned long flags;
+	struct rq *rq = this_rq();
+	struct rq_flags rf;
 
 	if (!mm)
 		return;
-	local_irq_save(flags);
+	rq_lock_irqsave(rq, &rf);
 	mm_cid_put(mm, t->mm_cid);
 	t->mm_cid = -1;
 	t->mm_cid_active = 0;
-	local_irq_restore(flags);
+	rq_unlock_irqrestore(rq, &rf);
 }
 
 void sched_mm_cid_after_execve(struct task_struct *t)
 {
 	struct mm_struct *mm = t->mm;
-	unsigned long flags;
+	struct rq *rq = this_rq();
+	struct rq_flags rf;
 
 	if (!mm)
 		return;
-	local_irq_save(flags);
+	rq_lock_irqsave(rq, &rf);
 	t->mm_cid = mm_cid_get(mm);
 	t->mm_cid_active = 1;
-	local_irq_restore(flags);
+	rq_unlock_irqrestore(rq, &rf);
 	rseq_set_notify_resume(t);
 }
 
