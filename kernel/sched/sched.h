@@ -3249,7 +3249,66 @@ static inline void update_current_exec_runtime(struct task_struct *curr,
 }
 
 #ifdef CONFIG_SCHED_MM_CID
-static inline int __mm_cid_get(struct mm_struct *mm)
+extern void sched_mm_cid_migrate_from(struct task_struct *t);
+extern void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t);
+
+static inline void __mm_cid_put(struct mm_struct *mm, int cid)
+{
+	if (cid < 0)
+		return;
+	cpumask_clear_cpu(cid, mm_cidmask(mm));
+}
+
+/*
+ * The per-mm/cpu cid can have the MM_CID_LAZY_PUT flag set or transition to the
+ * MM_CID_UNSET state without holding the rq lock, but the rq lock needs to be
+ * held to transition to other states.
+ */
+static inline void mm_cid_put_lazy(struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+	int *pcpu_cid, cid;
+
+	lockdep_assert_rq_held(this_rq());
+	pcpu_cid = this_cpu_ptr(mm->pcpu_cid);
+	cid = READ_ONCE(*pcpu_cid);
+	if (!mm_cid_is_lazy_put(cid))
+		return;
+	if (cmpxchg(pcpu_cid, cid, MM_CID_UNSET) != cid)
+		return;
+	__mm_cid_put(mm, mm_cid_clear_lazy_put(cid));
+}
+
+static inline void mm_cid_put(struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+	int *pcpu_cid, cid, res;
+
+	lockdep_assert_rq_held(this_rq());
+	WARN_ON_ONCE(t->mm_cid < 0);
+	pcpu_cid = this_cpu_ptr(mm->pcpu_cid);
+	cid = READ_ONCE(*pcpu_cid);
+	for (;;) {
+		if (mm_cid_is_unset(cid))
+			return;
+		WARN_ON_ONCE(mm_cid_clear_lazy_put(cid) != t->mm_cid);
+		/*
+		 * Attempt transition from valid or lazy-put to unset.
+		 */
+		res = cmpxchg(pcpu_cid, cid, MM_CID_UNSET);
+		if (res == cid)
+			break;
+		cid = res;
+	}
+	__mm_cid_put(mm, mm_cid_clear_lazy_put(cid));
+}
+
+/*
+ * Lookup/set of mm_cidmask are serialized by cid_lock. Clear of mm_cidmask
+ * uses atomic operations, therefore requiring the set to be done with atomic
+ * operations as well.
+ */
+static inline int __mm_cid_get_locked(struct mm_struct *mm)
 {
 	struct cpumask *cpumask;
 	int cid;
@@ -3258,52 +3317,55 @@ static inline int __mm_cid_get(struct mm_struct *mm)
 	cid = cpumask_first_zero(cpumask);
 	if (cid >= nr_cpu_ids)
 		return -1;
-	__cpumask_set_cpu(cid, cpumask);
+	cpumask_set_cpu(cid, cpumask);
 	return cid;
 }
 
-static inline void mm_cid_put(struct mm_struct *mm, int cid)
+static inline int __mm_cid_get(struct mm_struct *mm)
 {
-	lockdep_assert_irqs_disabled();
-	if (cid < 0)
-		return;
+	int ret;
+
+	lockdep_assert_rq_held(this_rq());
 	raw_spin_lock(&mm->cid_lock);
-	__cpumask_clear_cpu(cid, mm_cidmask(mm));
+	ret = __mm_cid_get_locked(mm);
 	raw_spin_unlock(&mm->cid_lock);
+	return ret;
 }
 
 static inline int mm_cid_get(struct mm_struct *mm)
 {
-	int ret;
+	int *pcpu_cid, cid;
 
-	lockdep_assert_irqs_disabled();
+	lockdep_assert_rq_held(this_rq());
+	pcpu_cid = this_cpu_ptr(mm->pcpu_cid);
+	cid = READ_ONCE(*pcpu_cid);
+	if (mm_cid_is_valid(cid))
+		return cid;
+	if (mm_cid_is_lazy_put(cid)) {
+		if (cmpxchg(pcpu_cid, cid, MM_CID_UNSET) == cid)
+			__mm_cid_put(mm, mm_cid_clear_lazy_put(cid));
+	}
 	raw_spin_lock(&mm->cid_lock);
-	ret = __mm_cid_get(mm);
+	cid = __mm_cid_get_locked(mm);
 	raw_spin_unlock(&mm->cid_lock);
-	return ret;
+	WRITE_ONCE(*pcpu_cid, cid);
+	return cid;
 }
 
 static inline void switch_mm_cid(struct task_struct *prev, struct task_struct *next)
 {
 	if (prev->mm_cid_active) {
-		if (next->mm_cid_active && next->mm == prev->mm) {
-			/*
-			 * Context switch between threads in same mm, hand over
-			 * the mm_cid from prev to next.
-			 */
-			next->mm_cid = prev->mm_cid;
-			prev->mm_cid = -1;
-			return;
-		}
-		mm_cid_put(prev->mm, prev->mm_cid);
+		mm_cid_put_lazy(prev);
 		prev->mm_cid = -1;
 	}
 	if (next->mm_cid_active)
-		next->mm_cid = mm_cid_get(next->mm);
+		next->last_mm_cid = next->mm_cid = mm_cid_get(next->mm);
 }
 
 #else
 static inline void switch_mm_cid(struct task_struct *prev, struct task_struct *next) { }
+static inline void sched_mm_cid_migrate_from(struct task_struct *t) { }
+static inline void sched_mm_cid_migrate_to(struct rq *src_rq, struct task_struct *t) { }
 #endif
 
 #endif /* _KERNEL_SCHED_SCHED_H */
