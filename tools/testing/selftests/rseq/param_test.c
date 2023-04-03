@@ -452,6 +452,8 @@ void *test_percpu_spinlock_thread(void *arg)
 	reps = thread_data->reps;
 	for (i = 0; i < reps; i++) {
 		int cpu = rseq_this_cpu_lock(&data->lock);
+		if (!(i % 10000000))
+			printf("cpu: %d\n", cpu);
 		data->c[cpu].count++;
 		rseq_percpu_unlock(&data->lock, cpu);
 #ifndef BENCHMARK
