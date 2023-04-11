@@ -2084,8 +2084,10 @@ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 
 void activate_task(struct rq *rq, struct task_struct *p, int flags)
 {
-	if (task_on_rq_migrating(p))
+	if (task_on_rq_migrating(p)) {
 		flags |= ENQUEUE_MIGRATED;
+		p->last_migration_time = sched_clock();
+	}
 
 	enqueue_task(rq, p, flags);
 
@@ -3544,17 +3546,47 @@ out:
 	return dest_cpu;
 }
 
+static inline
+bool migration_allowed(struct task_struct *p, u64 current_time)
+{
+	u64 delta = current_time - p->last_migration_time;
+
+	if (delta + p->migration_window_time_slice > SCHED_MIGRATION_WINDOW_NS ||
+	    p->migration_count < SCHED_MIGRATION_LIMIT)
+		return true;
+	return false;
+}
+
+static inline
+void migration_add_delta_to_slice(struct task_struct *p, u64 current_time)
+{
+	u64 delta = current_time - p->last_migration_time;
+
+	if (delta + p->migration_window_time_slice > SCHED_MIGRATION_WINDOW_NS) {
+		/* Reset the migration window if it has ended. */
+		p->migration_window_time_slice = 0;
+		p->migration_count = 0;
+		return;
+	}
+	p->migration_window_time_slice += delta;
+	p->migration_count++;
+}
+
 /*
  * The caller (fork, wakeup) owns p->pi_lock, ->cpus_ptr is stable.
  */
 static inline
-int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
+int select_task_rq(struct task_struct *p, int prev_cpu, int wake_flags)
 {
+	u64 current_time = sched_clock();
+	int cpu = prev_cpu;
+
 	lockdep_assert_held(&p->pi_lock);
 
-	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
-		cpu = p->sched_class->select_task_rq(p, cpu, wake_flags);
-	else
+	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p)) {
+		if (migration_allowed(p, current_time))
+			cpu = p->sched_class->select_task_rq(p, cpu, wake_flags);
+	} else
 		cpu = cpumask_any(p->cpus_ptr);
 
 	/*
@@ -3569,6 +3601,9 @@ int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
 	 */
 	if (unlikely(!is_cpu_allowed(p, cpu)))
 		cpu = select_fallback_rq(task_cpu(p), p);
+
+	if (prev_cpu != cpu)
+		migration_add_delta_to_slice(p, current_time);
 
 	return cpu;
 }
