@@ -104,6 +104,13 @@ struct cpuidle_state;
 #define TASK_ON_RQ_QUEUED	1
 #define TASK_ON_RQ_MIGRATING	2
 
+/*
+ * A task can be migrated at most SCHED_MIGRATION_WINDOW_LIMIT times per
+ * sched-migration window.
+ */
+#define SCHED_MIGRATION_WINDOW_NS	(10ULL * 1000000)	/* 10 ms */
+#define SCHED_MIGRATION_LIMIT		32
+
 extern __read_mostly int scheduler_running;
 
 extern unsigned long calc_load_update;
