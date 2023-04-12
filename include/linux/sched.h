@@ -1315,15 +1315,6 @@ struct task_struct {
 	int				mm_cid;		/* Current cid in mm */
 	int				mm_cid_active;	/* Whether cid bitmap is active */
 #endif
-	/*
-	 * Keep track of last migration time to compare sched_clock
-	 * locally from a single CPU perspective.
-	 */
-	u64				last_migration_time;
-	/* Time slice used in current migration window. */
-	u64				migration_window_time_slice;
-	/* Number of migrations in current migration window. */
-	u32				migration_count;
 
 	struct tlbflush_unmap_batch	tlb_ubc;
 
