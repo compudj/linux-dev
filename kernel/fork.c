@@ -1059,9 +1059,6 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	tsk->mm_cid = -1;
 	tsk->mm_cid_active = 0;
 #endif
-	tsk->last_migration_time = 0;
-	tsk->migration_window_time_slice = 0;
-	tsk->migration_count = 0;
 	return tsk;
 
 free_stack:
