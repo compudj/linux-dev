@@ -13,6 +13,7 @@
 
 #include "rseq.h"
 
+static
 void test_cpu_pointer(void)
 {
 	cpu_set_t affinity, test_affinity;
@@ -39,6 +40,29 @@ void test_cpu_pointer(void)
 	sched_setaffinity(0, sizeof(affinity), &affinity);
 }
 
+/*
+ * Validate that a single-threaded process always observes mm_cid == 0.
+ */
+static
+void test_cid_single_thread(void)
+{
+	cpu_set_t affinity, test_affinity;
+	int i;
+
+	sched_getaffinity(0, sizeof(affinity), &affinity);
+	CPU_ZERO(&test_affinity);
+	for (i = 0; i < CPU_SETSIZE; i++) {
+		if (CPU_ISSET(i, &affinity)) {
+			CPU_SET(i, &test_affinity);
+			sched_setaffinity(0, sizeof(test_affinity),
+					&test_affinity);
+			assert(rseq_current_mm_cid() == 0);
+			CPU_CLR(i, &test_affinity);
+		}
+	}
+	sched_setaffinity(0, sizeof(affinity), &affinity);
+}
+
 int main(int argc, char **argv)
 {
 	if (rseq_register_current_thread()) {
@@ -48,6 +72,8 @@ int main(int argc, char **argv)
 	}
 	printf("testing current cpu\n");
 	test_cpu_pointer();
+	printf("testing cid single-thread\n");
+	test_cid_single_thread();
 	if (rseq_unregister_current_thread()) {
 		fprintf(stderr, "Error: rseq_unregister_current_thread(...) failed(%d): %s\n",
 			errno, strerror(errno));
