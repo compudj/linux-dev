@@ -133,12 +133,36 @@ static int show_schedstat(struct seq_file *seq, void *v)
 
 		/* runqueue-specific stats */
 		seq_printf(seq,
-		    "cpu%d %u 0 %u %u %u %u %llu %llu %lu",
+		    "cpu%d %u 0 %u %u %u %u %llu %llu %lu "
+		    "mm_cid_task_work_nr_run: %u "
+		    "mm_cid_task_work_clear_old: %u "
+		    "mm_cid_task_work_clear_compact: %u "
+		    "mm_cid_task_work_bump_snapshot: %u "
+		    "mm_cid_get_cached: %u "
+		    "mm_cid_get_alloc: %u "
+		    "mm_cid_get_put_lazy: %u "
+		    "mm_cid_put_lazy: %u "
+		    "mm_cid_put: %u "
+		    "mm_cid_migrate_steal: %u "
+		    "mm_cid_migrate_clear: %u "
+		    "mm_cid_migrate_move: %u",
 		    cpu, rq->yld_count,
 		    rq->sched_count, rq->sched_goidle,
 		    rq->ttwu_count, rq->ttwu_local,
 		    rq->rq_cpu_time,
-		    rq->rq_sched_info.run_delay, rq->rq_sched_info.pcount);
+		    rq->rq_sched_info.run_delay, rq->rq_sched_info.pcount,
+		    rq->mm_cid_task_work_nr_run,
+		    rq->mm_cid_task_work_clear_old,
+		    rq->mm_cid_task_work_clear_compact,
+		    rq->mm_cid_task_work_bump_snapshot,
+		    rq->mm_cid_get_cached,
+		    rq->mm_cid_get_alloc,
+		    rq->mm_cid_get_put_lazy,
+		    rq->mm_cid_put_lazy,
+		    rq->mm_cid_put,
+		    rq->mm_cid_migrate_steal,
+		    rq->mm_cid_migrate_clear,
+		    rq->mm_cid_migrate_move);
 
 		seq_printf(seq, "\n");
 

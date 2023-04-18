@@ -11657,12 +11657,15 @@ void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t)
 							    src_cid);
 	if (src_cid == -1)
 		return;
+	schedstat_inc(dst_rq->mm_cid_migrate_steal);
 	if (!mm_cid_is_unset(dst_cid)) {
+		schedstat_inc(dst_rq->mm_cid_migrate_clear);
 		__mm_cid_put(mm, src_cid);
 		return;
 	}
 	/* Move src_cid to dst cpu. */
 	mm_cid_snapshot_time(dst_rq, mm);
+	schedstat_inc(dst_rq->mm_cid_migrate_move);
 	WRITE_ONCE(dst_pcpu_cid->cid, src_cid);
 }
 
@@ -11747,6 +11750,7 @@ static void sched_mm_cid_remote_clear_old(struct mm_struct *mm, int cpu)
 	rcu_read_lock();
 	curr = rcu_dereference(rq->curr);
 	if (READ_ONCE(curr->mm_cid_active) && curr->mm == mm) {
+		schedstat_inc(rq->mm_cid_task_work_bump_snapshot);
 		WRITE_ONCE(pcpu_cid->time, rq_clock);
 		rcu_read_unlock();
 		return;
@@ -11755,6 +11759,7 @@ static void sched_mm_cid_remote_clear_old(struct mm_struct *mm, int cpu)
 
 	if (rq_clock < pcpu_cid->time + SCHED_MM_CID_PERIOD_NS)
 		return;
+	schedstat_inc(rq->mm_cid_task_work_clear_old);
 	sched_mm_cid_remote_clear(mm, pcpu_cid, cpu);
 }
 
@@ -11768,6 +11773,7 @@ static void sched_mm_cid_remote_clear_weight(struct mm_struct *mm, int cpu,
 	cid = READ_ONCE(pcpu_cid->cid);
 	if (!mm_cid_is_valid(cid) || cid < weight)
 		return;
+	schedstat_inc(this_rq()->mm_cid_task_work_clear_compact);
 	sched_mm_cid_remote_clear(mm, pcpu_cid, cpu);
 }
 
@@ -11802,6 +11808,7 @@ static void task_mm_cid_work(struct callback_head *work)
 		return;
 	if (!try_cmpxchg(&mm->mm_cid_next_scan, &old_scan, next_scan))
 		return;
+	schedstat_inc(this_rq()->mm_cid_task_work_nr_run);
 	cidmask = mm_cidmask(mm);
 	/* Clear cids that were not recently used. */
 	for_each_possible_cpu(cpu)

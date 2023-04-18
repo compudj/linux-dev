@@ -1154,6 +1154,19 @@ struct rq {
 	u64			core_forceidle_start;
 #endif
 
+	unsigned int		mm_cid_task_work_nr_run;
+	unsigned int		mm_cid_task_work_clear_old;
+	unsigned int		mm_cid_task_work_clear_compact;
+	unsigned int		mm_cid_task_work_bump_snapshot;
+	unsigned int		mm_cid_get_cached;
+	unsigned int		mm_cid_get_alloc;
+	unsigned int		mm_cid_get_put_lazy;
+	unsigned int		mm_cid_put_lazy;
+	unsigned int		mm_cid_put;
+	unsigned int		mm_cid_migrate_steal;
+	unsigned int		mm_cid_migrate_clear;
+	unsigned int		mm_cid_migrate_move;
+
 	/* Scratch cpumask to be temporarily used under rq_lock */
 	cpumask_var_t		scratch_mask;
 
@@ -3287,6 +3300,7 @@ static inline void mm_cid_put_lazy(struct task_struct *t)
 	if (!mm_cid_is_lazy_put(cid) ||
 	    !try_cmpxchg(&this_cpu_ptr(pcpu_cid)->cid, &cid, MM_CID_UNSET))
 		return;
+	schedstat_inc(this_rq()->mm_cid_put_lazy);
 	__mm_cid_put(mm, mm_cid_clear_lazy_put(cid));
 }
 
@@ -3319,6 +3333,7 @@ static inline void mm_cid_put(struct mm_struct *mm)
 	cid = mm_cid_pcpu_unset(mm);
 	if (cid == MM_CID_UNSET)
 		return;
+	schedstat_inc(this_rq()->mm_cid_put);
 	__mm_cid_put(mm, mm_cid_clear_lazy_put(cid));
 }
 
@@ -3418,14 +3433,18 @@ static inline int mm_cid_get(struct rq *rq, struct mm_struct *mm)
 	cpumask = mm_cidmask(mm);
 	cid = __this_cpu_read(pcpu_cid->cid);
 	if (mm_cid_is_valid(cid)) {
+		schedstat_inc(rq->mm_cid_get_cached);
 		mm_cid_snapshot_time(rq, mm);
 		return cid;
 	}
 	if (mm_cid_is_lazy_put(cid)) {
-		if (try_cmpxchg(&this_cpu_ptr(pcpu_cid)->cid, &cid, MM_CID_UNSET))
+		if (try_cmpxchg(&this_cpu_ptr(pcpu_cid)->cid, &cid, MM_CID_UNSET)) {
+			schedstat_inc(rq->mm_cid_get_put_lazy);
 			__mm_cid_put(mm, mm_cid_clear_lazy_put(cid));
+		}
 	}
 	cid = __mm_cid_get(rq, mm);
+	schedstat_inc(rq->mm_cid_get_alloc);
 	__this_cpu_write(pcpu_cid->cid, cid);
 	return cid;
 }
