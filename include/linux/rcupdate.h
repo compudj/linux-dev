@@ -215,7 +215,7 @@ void rcu_tasks_trace_qs_blkd(struct task_struct *t);
 										\
 		if (likely(!READ_ONCE((t)->trc_reader_special.b.need_qs)) &&	\
 		    likely(!___rttq_nesting)) {					\
-			rcu_trc_cmpxchg_need_qs((t), 0,	TRC_NEED_QS_CHECKED);	\
+			rcu_trc_cmpxchg_need_qs(t, 0, TRC_NEED_QS_CHECKED);	\
 		} else if (___rttq_nesting && ___rttq_nesting != INT_MIN &&	\
 			   !READ_ONCE((t)->trc_reader_special.b.blocked)) {	\
 			rcu_tasks_trace_qs_blkd(t);				\
@@ -227,7 +227,7 @@ void rcu_tasks_trace_qs_blkd(struct task_struct *t);
 
 #define rcu_tasks_qs(t, preempt)					\
 do {									\
-	rcu_tasks_classic_qs((t), (preempt));				\
+	rcu_tasks_classic_qs(t, preempt);				\
 	rcu_tasks_trace_qs(t);						\
 } while (0)
 
@@ -430,16 +430,16 @@ static inline void rcu_preempt_sleep_check(void) { }
 
 #ifdef __CHECKER__
 #define rcu_check_sparse(p, space) \
-	((void)(((typeof(*p) space *)p) == p))
+	((void)(((typeof(*(p)) space *)(p)) == (p)))
 #else /* #ifdef __CHECKER__ */
 #define rcu_check_sparse(p, space)
 #endif /* #else #ifdef __CHECKER__ */
 
 #define __unrcu_pointer(p, local)					\
 ({									\
-	typeof(*p) *local = (typeof(*p) *__force)(p);			\
+	typeof(*(p)) *(local) = (typeof(*(p)) *__force)(p);		\
 	rcu_check_sparse(p, __rcu);					\
-	((typeof(*p) __force __kernel *)(local)); 			\
+	((typeof(*(p)) __force __kernel *)(local));			\
 })
 /**
  * unrcu_pointer - mark a pointer as not being RCU protected
@@ -452,29 +452,29 @@ static inline void rcu_preempt_sleep_check(void) { }
 
 #define __rcu_access_pointer(p, local, space) \
 ({ \
-	typeof(*p) *local = (typeof(*p) *__force)READ_ONCE(p); \
+	typeof(*(p)) *(local) = (typeof(*(p)) *__force)READ_ONCE(p); \
 	rcu_check_sparse(p, space); \
-	((typeof(*p) __force __kernel *)(local)); \
+	((typeof(*(p)) __force __kernel *)(local)); \
 })
 #define __rcu_dereference_check(p, local, c, space) \
 ({ \
 	/* Dependency order vs. p above. */ \
-	typeof(*p) *local = (typeof(*p) *__force)READ_ONCE(p); \
+	typeof(*(p)) *(local) = (typeof(*(p)) *__force)READ_ONCE(p); \
 	RCU_LOCKDEP_WARN(!(c), "suspicious rcu_dereference_check() usage"); \
 	rcu_check_sparse(p, space); \
-	((typeof(*p) __force __kernel *)(local)); \
+	((typeof(*(p)) __force __kernel *)(local)); \
 })
 #define __rcu_dereference_protected(p, local, c, space) \
 ({ \
 	RCU_LOCKDEP_WARN(!(c), "suspicious rcu_dereference_protected() usage"); \
 	rcu_check_sparse(p, space); \
-	((typeof(*p) __force __kernel *)(p)); \
+	((typeof(*(p)) __force __kernel *)(p)); \
 })
 #define __rcu_dereference_raw(p, local) \
 ({ \
 	/* Dependency order vs. p above. */ \
-	typeof(p) local = READ_ONCE(p); \
-	((typeof(*p) __force __kernel *)(local)); \
+	typeof(p) (local) = READ_ONCE(p); \
+	((typeof(*(p)) __force __kernel *)(local)); \
 })
 #define rcu_dereference_raw(p) __rcu_dereference_raw(p, __UNIQUE_ID(rcu))
 
@@ -520,10 +520,10 @@ do {									      \
 	uintptr_t _r_a_p__v = (uintptr_t)(v);				      \
 	rcu_check_sparse(p, __rcu);					      \
 									      \
-	if (__builtin_constant_p(v) && (_r_a_p__v) == (uintptr_t)NULL)	      \
-		WRITE_ONCE((p), (typeof(p))(_r_a_p__v));		      \
+	if (__builtin_constant_p(v) && _r_a_p__v == (uintptr_t)NULL)	      \
+		WRITE_ONCE(p, (typeof(p))_r_a_p__v);			      \
 	else								      \
-		smp_store_release(&p, RCU_INITIALIZER((typeof(p))_r_a_p__v)); \
+		smp_store_release(&(p), RCU_INITIALIZER((typeof(p))_r_a_p__v));\
 } while (0)
 
 /**
@@ -539,8 +539,8 @@ do {									      \
  */
 #define rcu_replace_pointer(rcu_ptr, ptr, c)				\
 ({									\
-	typeof(ptr) __tmp = rcu_dereference_protected((rcu_ptr), (c));	\
-	rcu_assign_pointer((rcu_ptr), (ptr));				\
+	typeof(ptr) __tmp = rcu_dereference_protected(rcu_ptr, c);	\
+	rcu_assign_pointer(rcu_ptr, ptr);				\
 	__tmp;								\
 })
 
@@ -571,7 +571,7 @@ do {									      \
  * down multi-linked structures after a grace period has elapsed.  However,
  * rcu_dereference_protected() is normally preferred for this use case.
  */
-#define rcu_access_pointer(p) __rcu_access_pointer((p), __UNIQUE_ID(rcu), __rcu)
+#define rcu_access_pointer(p) __rcu_access_pointer(p, __UNIQUE_ID(rcu), __rcu)
 
 /**
  * rcu_dereference_check() - rcu_dereference with debug checking
@@ -607,7 +607,7 @@ do {									      \
  * annotated as __rcu.
  */
 #define rcu_dereference_check(p, c) \
-	__rcu_dereference_check((p), __UNIQUE_ID(rcu), \
+	__rcu_dereference_check(p, __UNIQUE_ID(rcu), \
 				(c) || rcu_read_lock_held(), __rcu)
 
 /**
@@ -623,7 +623,7 @@ do {									      \
  * rcu_read_lock() but also rcu_read_lock_bh() into account.
  */
 #define rcu_dereference_bh_check(p, c) \
-	__rcu_dereference_check((p), __UNIQUE_ID(rcu), \
+	__rcu_dereference_check(p, __UNIQUE_ID(rcu), \
 				(c) || rcu_read_lock_bh_held(), __rcu)
 
 /**
@@ -639,7 +639,7 @@ do {									      \
  * only rcu_read_lock() but also rcu_read_lock_sched() into account.
  */
 #define rcu_dereference_sched_check(p, c) \
-	__rcu_dereference_check((p), __UNIQUE_ID(rcu), \
+	__rcu_dereference_check(p, __UNIQUE_ID(rcu), \
 				(c) || rcu_read_lock_sched_held(), \
 				__rcu)
 
@@ -651,7 +651,7 @@ do {									      \
  * rcu_read_lock_held().
  */
 #define rcu_dereference_raw_check(p) \
-	__rcu_dereference_check((p), __UNIQUE_ID(rcu), 1, __rcu)
+	__rcu_dereference_check(p, __UNIQUE_ID(rcu), 1, __rcu)
 
 /**
  * rcu_dereference_protected() - fetch RCU pointer when updates prevented
@@ -670,7 +670,7 @@ do {									      \
  * but very ugly failures.
  */
 #define rcu_dereference_protected(p, c) \
-	__rcu_dereference_protected((p), __UNIQUE_ID(rcu), (c), __rcu)
+	__rcu_dereference_protected(p, __UNIQUE_ID(rcu), c, __rcu)
 
 
 /**
@@ -1021,7 +1021,7 @@ static inline notrace void rcu_read_unlock_sched_notrace(void)
 #define KVFREE_GET_MACRO(_1, _2, NAME, ...) NAME
 #define kvfree_rcu_arg_2(ptr, rhf)					\
 do {									\
-	typeof (ptr) ___p = (ptr);					\
+	typeof(ptr) ___p = (ptr);					\
 									\
 	if (___p) {									\
 		BUILD_BUG_ON(!__is_kvfree_rcu_offset(offsetof(typeof(*(ptr)), rhf)));	\
