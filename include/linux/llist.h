@@ -62,7 +62,7 @@ struct llist_node {
 };
 
 #define LLIST_HEAD_INIT(name)	{ NULL }
-#define LLIST_HEAD(name)	struct llist_head name = LLIST_HEAD_INIT(name)
+#define LLIST_HEAD(name)	struct llist_head (name) = LLIST_HEAD_INIT(name)
 
 /**
  * init_llist_head - initialize lock-less list head
@@ -151,7 +151,7 @@ static inline void init_llist_head(struct llist_head *list)
  * reverse the order by yourself before traversing.
  */
 #define llist_for_each_entry(pos, node, member)				\
-	for ((pos) = llist_entry((node), typeof(*(pos)), member);	\
+	for ((pos) = llist_entry(node, typeof(*(pos)), member);	\
 	     member_address_is_nonnull(pos, member);			\
 	     (pos) = llist_entry((pos)->member.next, typeof(*(pos)), member))
 
@@ -173,10 +173,10 @@ static inline void init_llist_head(struct llist_head *list)
  * reverse the order by yourself before traversing.
  */
 #define llist_for_each_entry_safe(pos, n, node, member)			       \
-	for (pos = llist_entry((node), typeof(*pos), member);		       \
+	for ((pos) = llist_entry(node, typeof(*(pos)), member);		       \
 	     member_address_is_nonnull(pos, member) &&			       \
-	        (n = llist_entry(pos->member.next, typeof(*n), member), true); \
-	     pos = n)
+		((n) = llist_entry((pos)->member.next, typeof(*(n)), member), true); \
+	     (pos) = (n))
 
 /**
  * llist_empty - tests whether a lock-less list is empty
