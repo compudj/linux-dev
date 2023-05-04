@@ -20,7 +20,7 @@ static inline unsigned int bio_max_segs(unsigned int nr_segs)
 }
 
 #define bio_prio(bio)			(bio)->bi_ioprio
-#define bio_set_prio(bio, prio)		((bio)->bi_ioprio = prio)
+#define bio_set_prio(bio, prio)		((bio)->bi_ioprio = (prio))
 
 #define bio_iter_iovec(bio, iter)				\
 	bvec_iter_bvec((bio)->bi_io_vec, (iter))
@@ -37,7 +37,7 @@ static inline unsigned int bio_max_segs(unsigned int nr_segs)
 #define bio_iovec(bio)		bio_iter_iovec((bio), (bio)->bi_iter)
 
 #define bvec_iter_sectors(iter)	((iter).bi_size >> 9)
-#define bvec_iter_end_sector(iter) ((iter).bi_sector + bvec_iter_sectors((iter)))
+#define bvec_iter_end_sector(iter) ((iter).bi_sector + bvec_iter_sectors(iter))
 
 #define bio_sectors(bio)	bvec_iter_sectors((bio)->bi_iter)
 #define bio_end_sector(bio)	bvec_iter_end_sector((bio)->bi_iter)
@@ -93,7 +93,7 @@ static inline bool bio_next_segment(const struct bio *bio,
  * before it got to the driver and the driver won't own all of it
  */
 #define bio_for_each_segment_all(bvl, bio, iter) \
-	for (bvl = bvec_init_iter_all(&iter); bio_next_segment((bio), &iter); )
+	for (bvl = bvec_init_iter_all(&(iter)); bio_next_segment(bio, &(iter)); )
 
 static inline void bio_advance_iter(const struct bio *bio,
 				    struct bvec_iter *iter, unsigned int bytes)
@@ -143,19 +143,19 @@ static inline void bio_advance(struct bio *bio, unsigned int nbytes)
 }
 
 #define __bio_for_each_segment(bvl, bio, iter, start)			\
-	for (iter = (start);						\
+	for ((iter) = (start);						\
 	     (iter).bi_size &&						\
-		((bvl = bio_iter_iovec((bio), (iter))), 1);		\
-	     bio_advance_iter_single((bio), &(iter), (bvl).bv_len))
+		(((bvl) = bio_iter_iovec(bio, iter)), 1);		\
+	     bio_advance_iter_single(bio, &(iter), (bvl).bv_len))
 
 #define bio_for_each_segment(bvl, bio, iter)				\
 	__bio_for_each_segment(bvl, bio, iter, (bio)->bi_iter)
 
-#define __bio_for_each_bvec(bvl, bio, iter, start)		\
-	for (iter = (start);						\
+#define __bio_for_each_bvec(bvl, bio, iter, start)			\
+	for ((iter) = (start);						\
 	     (iter).bi_size &&						\
-		((bvl = mp_bvec_iter_bvec((bio)->bi_io_vec, (iter))), 1); \
-	     bio_advance_iter_single((bio), &(iter), (bvl).bv_len))
+		(((bvl) = mp_bvec_iter_bvec((bio)->bi_io_vec, iter)), 1);\
+	     bio_advance_iter_single(bio, &(iter), (bvl).bv_len))
 
 /* iterate over multi-page bvec */
 #define bio_for_each_bvec(bvl, bio, iter)			\
@@ -166,8 +166,8 @@ static inline void bio_advance(struct bio *bio, unsigned int nbytes)
  * same reasons as bio_for_each_segment_all().
  */
 #define bio_for_each_bvec_all(bvl, bio, i)		\
-	for (i = 0, bvl = bio_first_bvec_all(bio);	\
-	     i < (bio)->bi_vcnt; i++, bvl++)
+	for ((i) = 0, (bvl) = bio_first_bvec_all(bio);	\
+	     (i) < (bio)->bi_vcnt; (i)++, (bvl)++)
 
 #define bio_iter_last(bvec, iter) ((iter).bi_size == (bvec).bv_len)
 
@@ -311,7 +311,7 @@ static inline void bio_next_folio(struct folio_iter *fi, struct bio *bio)
  * @bio: struct bio to iterate over.
  */
 #define bio_for_each_folio_all(fi, bio)				\
-	for (bio_first_folio(&fi, bio, 0); fi.folio; bio_next_folio(&fi, bio))
+	for (bio_first_folio(&fi, bio, 0); (fi).folio; bio_next_folio(&(fi), bio))
 
 enum bip_flags {
 	BIP_BLOCK_INTEGRITY	= 1 << 0, /* block layer owns integrity data */
@@ -548,7 +548,7 @@ static inline void bio_list_init(struct bio_list *bl)
 #define BIO_EMPTY_LIST	{ NULL, NULL }
 
 #define bio_list_for_each(bio, bl) \
-	for (bio = (bl)->head; bio; bio = bio->bi_next)
+	for ((bio) = (bl)->head; bio; (bio) = (bio)->bi_next)
 
 static inline unsigned bio_list_size(const struct bio_list *bl)
 {
@@ -702,7 +702,7 @@ static inline bool bioset_initialized(struct bio_set *bs)
 
 #define bio_for_each_integrity_vec(_bvl, _bio, _iter)			\
 	for_each_bio(_bio)						\
-		bip_for_each_vec(_bvl, _bio->bi_integrity, _iter)
+		bip_for_each_vec(_bvl, (_bio)->bi_integrity, _iter)
 
 extern struct bio_integrity_payload *bio_integrity_alloc(struct bio *, gfp_t, unsigned int);
 extern int bio_integrity_add_page(struct bio *, struct page *, unsigned int, unsigned int);
