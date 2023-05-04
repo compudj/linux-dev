@@ -223,13 +223,13 @@ static inline unsigned short req_get_ioprio(struct request *req)
 
 #define rq_list_add(listptr, rq)	do {		\
 	(rq)->rq_next = *(listptr);			\
-	*(listptr) = rq;				\
+	*(listptr) = (rq);				\
 } while (0)
 
 #define rq_list_add_tail(lastpptr, rq)	do {		\
 	(rq)->rq_next = NULL;				\
-	**(lastpptr) = rq;				\
-	*(lastpptr) = &rq->rq_next;			\
+	**(lastpptr) = (rq);				\
+	*(lastpptr) = &(rq)->rq_next;			\
 } while (0)
 
 #define rq_list_pop(listptr)				\
@@ -251,11 +251,11 @@ static inline unsigned short req_get_ioprio(struct request *req)
 })
 
 #define rq_list_for_each(listptr, pos)			\
-	for (pos = rq_list_peek((listptr)); pos; pos = rq_list_next(pos))
+	for ((pos) = rq_list_peek(listptr); pos; (pos) = rq_list_next(pos))
 
 #define rq_list_for_each_safe(listptr, pos, nxt)			\
-	for (pos = rq_list_peek((listptr)), nxt = rq_list_next(pos);	\
-		pos; pos = nxt, nxt = pos ? rq_list_next(pos) : NULL)
+	for ((pos) = rq_list_peek(listptr), (nxt) = rq_list_next(pos);	\
+		pos; (pos) = (nxt), (nxt) = (pos) ? rq_list_next(pos) : NULL)
 
 #define rq_list_next(rq)	(rq)->rq_next
 #define rq_list_empty(list)	((list) == (struct request *) NULL)
@@ -692,10 +692,10 @@ enum {
 	BLK_MQ_CPU_WORK_BATCH	= 8,
 };
 #define BLK_MQ_FLAG_TO_ALLOC_POLICY(flags) \
-	((flags >> BLK_MQ_F_ALLOC_POLICY_START_BIT) & \
+	(((flags) >> BLK_MQ_F_ALLOC_POLICY_START_BIT) & \
 		((1 << BLK_MQ_F_ALLOC_POLICY_BITS) - 1))
 #define BLK_ALLOC_POLICY_TO_MQ_FLAG(policy) \
-	((policy & ((1 << BLK_MQ_F_ALLOC_POLICY_BITS) - 1)) \
+	(((policy) & ((1 << BLK_MQ_F_ALLOC_POLICY_BITS) - 1)) \
 		<< BLK_MQ_F_ALLOC_POLICY_START_BIT)
 
 #define BLK_MQ_NO_HCTX_IDX	(-1U)
@@ -948,11 +948,11 @@ static inline void *blk_mq_rq_to_pdu(struct request *rq)
 }
 
 #define queue_for_each_hw_ctx(q, hctx, i)				\
-	xa_for_each(&(q)->hctx_table, (i), (hctx))
+	xa_for_each(&(q)->hctx_table, i, hctx)
 
 #define hctx_for_each_ctx(hctx, ctx, i)					\
 	for ((i) = 0; (i) < (hctx)->nr_ctx &&				\
-	     ({ ctx = (hctx)->ctxs[(i)]; 1; }); (i)++)
+	     ({ (ctx) = (hctx)->ctxs[i]; 1; }); (i)++)
 
 static inline void blk_mq_cleanup_rq(struct request *rq)
 {
@@ -1013,20 +1013,20 @@ struct req_iterator {
 };
 
 #define __rq_for_each_bio(_bio, rq)	\
-	if ((rq->bio))			\
-		for (_bio = (rq)->bio; _bio; _bio = _bio->bi_next)
+	if ((rq)->bio)			\
+		for ((_bio) = (rq)->bio; _bio; (_bio) = (_bio)->bi_next)
 
 #define rq_for_each_segment(bvl, _rq, _iter)			\
-	__rq_for_each_bio(_iter.bio, _rq)			\
-		bio_for_each_segment(bvl, _iter.bio, _iter.iter)
+	__rq_for_each_bio((_iter).bio, _rq)			\
+		bio_for_each_segment(bvl, (_iter).bio, (_iter).iter)
 
 #define rq_for_each_bvec(bvl, _rq, _iter)			\
-	__rq_for_each_bio(_iter.bio, _rq)			\
-		bio_for_each_bvec(bvl, _iter.bio, _iter.iter)
+	__rq_for_each_bio((_iter).bio, _rq)			\
+		bio_for_each_bvec(bvl, (_iter).bio, (_iter).iter)
 
 #define rq_iter_last(bvec, _iter)				\
-		(_iter.bio->bi_next == NULL &&			\
-		 bio_iter_last(bvec, _iter.iter))
+		((_iter).bio->bi_next == NULL &&		\
+		 bio_iter_last(bvec, (_iter).iter))
 
 /*
  * blk_rq_pos()			: the current sector
