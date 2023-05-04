@@ -125,10 +125,10 @@ static inline void hlist_nulls_del(struct hlist_nulls_node *n)
  *
  */
 #define hlist_nulls_for_each_entry(tpos, pos, head, member)		       \
-	for (pos = (head)->first;					       \
+	for ((pos) = (head)->first;					       \
 	     (!is_a_nulls(pos)) &&					       \
-		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1;}); \
-	     pos = pos->next)
+		({ (tpos) = hlist_nulls_entry(pos, typeof(*(tpos)), member); 1;}); \
+	     (pos) = (pos)->next)
 
 /**
  * hlist_nulls_for_each_entry_from - iterate over a hlist continuing from current point
@@ -139,7 +139,7 @@ static inline void hlist_nulls_del(struct hlist_nulls_node *n)
  */
 #define hlist_nulls_for_each_entry_from(tpos, pos, member)	\
 	for (; (!is_a_nulls(pos)) && 				\
-		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1;}); \
-	     pos = pos->next)
+		({ (tpos) = hlist_nulls_entry(pos, typeof(*(tpos)), member); 1;}); \
+	     (pos) = (pos)->next)
 
 #endif
