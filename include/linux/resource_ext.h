@@ -60,11 +60,11 @@ resource_list_destroy_entry(struct resource_entry *entry)
 	resource_list_free_entry(entry);
 }
 
-#define resource_list_for_each_entry(entry, list)	\
-	list_for_each_entry((entry), (list), node)
+#define resource_list_for_each_entry(entry, list)		\
+	list_for_each_entry(entry, list, node)
 
 #define resource_list_for_each_entry_safe(entry, tmp, list)	\
-	list_for_each_entry_safe((entry), (tmp), (list), node)
+	list_for_each_entry_safe(entry, tmp, list, node)
 
 static inline struct resource_entry *
 resource_list_first_type(struct list_head *list, unsigned long type)
