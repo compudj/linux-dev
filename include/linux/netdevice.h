@@ -283,7 +283,7 @@ struct hh_cache {
 	/* cached hardware header; allow for machine alignment needs.        */
 #define HH_DATA_MOD	16
 #define HH_DATA_OFF(__len) \
-	(HH_DATA_MOD - (((__len - 1) & (HH_DATA_MOD - 1)) + 1))
+	(HH_DATA_MOD - ((((__len) - 1) & (HH_DATA_MOD - 1)) + 1))
 #define HH_DATA_ALIGN(__len) \
 	(((__len)+(HH_DATA_MOD-1))&~(HH_DATA_MOD - 1))
 	unsigned long	hh_data[HH_DATA_ALIGN(LL_MAX_HEADER) / sizeof(long)];
@@ -4459,7 +4459,7 @@ static inline void netif_tx_unlock_bh(struct net_device *dev)
 }
 
 #define HARD_TX_LOCK(dev, txq, cpu) {			\
-	if ((dev->features & NETIF_F_LLTX) == 0) {	\
+	if (((dev)->features & NETIF_F_LLTX) == 0) {	\
 		__netif_tx_lock(txq, cpu);		\
 	} else {					\
 		__netif_tx_acquire(txq);		\
@@ -4467,12 +4467,12 @@ static inline void netif_tx_unlock_bh(struct net_device *dev)
 }
 
 #define HARD_TX_TRYLOCK(dev, txq)			\
-	(((dev->features & NETIF_F_LLTX) == 0) ?	\
+	((((dev)->features & NETIF_F_LLTX) == 0) ?	\
 		__netif_tx_trylock(txq) :		\
 		__netif_tx_acquire(txq))
 
 #define HARD_TX_UNLOCK(dev, txq) {			\
-	if ((dev->features & NETIF_F_LLTX) == 0) {	\
+	if (((dev)->features & NETIF_F_LLTX) == 0) {	\
 		__netif_tx_unlock(txq);			\
 	} else {					\
 		__netif_tx_release(txq);		\
@@ -4534,7 +4534,7 @@ static inline void netif_addr_unlock_bh(struct net_device *dev)
  * rcu_read_lock held.
  */
 #define for_each_dev_addr(dev, ha) \
-		list_for_each_entry_rcu(ha, &dev->dev_addrs.list, list)
+		list_for_each_entry_rcu(ha, &(dev)->dev_addrs.list, list)
 
 /* These functions live elsewhere (drivers/net/net_init.c, but related) */
 
@@ -4755,25 +4755,25 @@ void *netdev_lower_get_next_private_rcu(struct net_device *dev,
 					struct list_head **iter);
 
 #define netdev_for_each_lower_private(dev, priv, iter) \
-	for (iter = (dev)->adj_list.lower.next, \
-	     priv = netdev_lower_get_next_private(dev, &(iter)); \
+	for ((iter) = (dev)->adj_list.lower.next, \
+	     (priv) = netdev_lower_get_next_private(dev, &(iter)); \
 	     priv; \
-	     priv = netdev_lower_get_next_private(dev, &(iter)))
+	     (priv) = netdev_lower_get_next_private(dev, &(iter)))
 
 #define netdev_for_each_lower_private_rcu(dev, priv, iter) \
-	for (iter = &(dev)->adj_list.lower, \
-	     priv = netdev_lower_get_next_private_rcu(dev, &(iter)); \
+	for ((iter) = &(dev)->adj_list.lower, \
+	     (priv) = netdev_lower_get_next_private_rcu(dev, &(iter)); \
 	     priv; \
-	     priv = netdev_lower_get_next_private_rcu(dev, &(iter)))
+	     (priv) = netdev_lower_get_next_private_rcu(dev, &(iter)))
 
 void *netdev_lower_get_next(struct net_device *dev,
 				struct list_head **iter);
 
 #define netdev_for_each_lower_dev(dev, ldev, iter) \
-	for (iter = (dev)->adj_list.lower.next, \
-	     ldev = netdev_lower_get_next(dev, &(iter)); \
+	for ((iter) = (dev)->adj_list.lower.next, \
+	     (ldev) = netdev_lower_get_next(dev, &(iter)); \
 	     ldev; \
-	     ldev = netdev_lower_get_next(dev, &(iter)))
+	     (ldev) = netdev_lower_get_next(dev, &(iter)))
 
 struct net_device *netdev_next_lower_dev_rcu(struct net_device *dev,
 					     struct list_head **iter);
@@ -5237,6 +5237,6 @@ extern struct net_device *blackhole_netdev;
 /* Note: Avoid these macros in fast path, prefer per-cpu or per-queue counters. */
 #define DEV_STATS_INC(DEV, FIELD) atomic_long_inc(&(DEV)->stats.__##FIELD)
 #define DEV_STATS_ADD(DEV, FIELD, VAL) 	\
-		atomic_long_add((VAL), &(DEV)->stats.__##FIELD)
+		atomic_long_add(VAL, &(DEV)->stats.__##FIELD)
 
 #endif	/* _LINUX_NETDEVICE_H */
