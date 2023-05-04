@@ -167,10 +167,10 @@ static inline bool hlist_bl_is_locked(struct hlist_bl_head *b)
  *
  */
 #define hlist_bl_for_each_entry(tpos, pos, head, member)		\
-	for (pos = hlist_bl_first(head);				\
-	     pos &&							\
-		({ tpos = hlist_bl_entry(pos, typeof(*tpos), member); 1;}); \
-	     pos = pos->next)
+	for ((pos) = hlist_bl_first(head);				\
+	     (pos) &&							\
+		({ (tpos) = hlist_bl_entry(pos, typeof(*(tpos)), member); 1;}); \
+	     (pos) = (pos)->next)
 
 /**
  * hlist_bl_for_each_entry_safe - iterate over list of given type safe against removal of list entry
@@ -181,9 +181,9 @@ static inline bool hlist_bl_is_locked(struct hlist_bl_head *b)
  * @member:	the name of the hlist_node within the struct.
  */
 #define hlist_bl_for_each_entry_safe(tpos, pos, n, head, member)	 \
-	for (pos = hlist_bl_first(head);				 \
-	     pos && ({ n = pos->next; 1; }) && 				 \
-		({ tpos = hlist_bl_entry(pos, typeof(*tpos), member); 1;}); \
-	     pos = n)
+	for ((pos) = hlist_bl_first(head);				 \
+	     (pos) && ({ (n) = (pos)->next; 1; }) &&			 \
+		({ (tpos) = hlist_bl_entry(pos, typeof(*(tpos)), member); 1;}); \
+	     (pos) = (n))
 
 #endif
