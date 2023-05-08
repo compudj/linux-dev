@@ -819,9 +819,159 @@ Macros with multiple statements should be enclosed in a do - while block:
 
 	#define macrofun(a, b, c)			\
 		do {					\
-			if (a == 5)			\
+			if ((a) == 5)			\
 				do_this(b, c);		\
 		} while (0)
+
+Always use parentheses around macro arguments, except for the situations listed
+below.
+
+Examples where parentheses are required around macro arguments:
+
+.. code-block:: c
+
+	#define foo(a, b)				\
+		do {					\
+			(a) = (b);			\
+		} while (0)
+
+.. code-block:: c
+
+	#define foo(a)					\
+		do {					\
+			(a)++;				\
+		} while (0)
+
+.. code-block:: c
+
+	#define cmp_gt(a, b)			((a) > (b))
+
+.. code-block:: c
+
+	#define foo(a)				do_this(!(a))
+
+.. code-block:: c
+
+	#define foo(a)				do_this(*(a))
+
+.. code-block:: c
+
+	#define foo(a)				do_this(&(a))
+
+.. code-block:: c
+
+	#define get_member(struct_var)		do_this((struct_var).member)
+
+.. code-block:: c
+
+	#define deref_member(struct_ptr)	do_this((struct_ptr)->member)
+
+Situations where parentheses should not be added around arguments, when:
+
+* they are used as a full expression:
+
+  * as an initializer:
+
+    .. code-block:: c
+
+	#define foo(a)					\
+		do {					\
+			int __m_var = a;		\
+		} while (0)
+
+  * as an expression statement:
+
+    .. code-block:: c
+
+	#define foo(a)					\
+		do {					\
+			a;				\
+		} while (0)
+
+  * as the controlling expression of a selection statement (``if`` or ``switch``):
+
+    .. code-block:: c
+
+	#define foo(a)					\
+		do {					\
+			if (a)				\
+				do_this();		\
+		} while (0)
+
+    .. code-block:: c
+
+	#define foo(a)					\
+		do {					\
+			switch (a) {			\
+			case 1:	do_this();		\
+				break;			\
+			}				\
+		} while (0)
+
+  * as the controlling expression of a ``while`` or ``do`` statement:
+
+    .. code-block:: c
+
+	#define foo(a)					\
+		do {					\
+			while (a)			\
+				do_this();		\
+		} while (0)
+
+    .. code-block:: c
+
+	#define foo(a)					\
+		do {					\
+			do_this();			\
+		} while (a)
+
+  * as any of the expressions of a ``for`` statement:
+
+    .. code-block:: c
+
+	#define foo(a, b, c)				\
+		do {					\
+			for (a; b; c)			\
+				do_this();		\
+		} while (0)
+
+  * as the expression in a return statement (note that use of return
+    statements in macros is strongly discouraged because it affects the control
+    flow),
+
+    .. code-block:: c
+
+	#define foo(a)					\
+		do {					\
+			return a;			\
+		} while (0)
+
+* they are used as expression within an array subscript operator "[]":
+
+  .. code-block:: c
+
+	#define foo(a)					\
+		do {					\
+			if (array[a] == 1)		\
+				do_this();		\
+		} while (0)
+
+* they are used as arguments to functions or other macros:
+
+  .. code-block:: c
+
+	#define foo(a)		do_this(a)
+
+  .. code-block:: c
+
+	#define foo(a, b, c)	do_this(a, b, c)
+
+* there is some syntax reason why adding the parentheses would not work, e.g.
+  the ``member`` argument:
+
+  .. code-block:: c
+
+	#define foo(struct_p, member)	do_this((struct_p)->member)
 
 Things to avoid when using macros:
 
