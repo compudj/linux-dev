@@ -87,10 +87,12 @@
 
 static int rseq_update_cpu_node_id(struct task_struct *t)
 {
+	struct rseq_sched_state __user *rseq_sched_state = t->rseq_sched_state;
 	struct rseq __user *rseq = t->rseq;
 	u32 cpu_id = raw_smp_processor_id();
 	u32 node_id = cpu_to_node(cpu_id);
 	u32 mm_cid = task_mm_cid(t);
+	u32 sched_state = RSEQ_SCHED_STATE_FLAG_ON_CPU;
 
 	WARN_ON_ONCE((int) mm_cid < 0);
 	if (!user_write_access_begin(rseq, t->rseq_len))
@@ -99,6 +101,8 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
 	unsafe_put_user(cpu_id, &rseq->cpu_id, efault_end);
 	unsafe_put_user(node_id, &rseq->node_id, efault_end);
 	unsafe_put_user(mm_cid, &rseq->mm_cid, efault_end);
+	if (rseq_sched_state)
+		unsafe_put_user(sched_state, &rseq_sched_state->state, efault_end);
 	/*
 	 * Additional feature fields added after ORIG_RSEQ_SIZE
 	 * need to be conditionally updated only if
@@ -339,6 +343,18 @@ error:
 	force_sigsegv(sig);
 }
 
+/*
+ * Attempt to update rseq scheduler state.
+ */
+void __rseq_set_sched_state(struct task_struct *t, unsigned int state)
+{
+	if (unlikely(t->flags & PF_EXITING))
+		return;
+	pagefault_disable();
+	(void) put_user(state, &t->rseq_sched_state->state);
+	pagefault_enable();
+}
+
 #ifdef CONFIG_DEBUG_RSEQ
 
 /*
@@ -359,6 +375,29 @@ void rseq_syscall(struct pt_regs *regs)
 
 #endif
 
+static int rseq_get_sched_state_ptr(struct rseq __user *rseq, u32 rseq_len,
+				    struct rseq_sched_state __user **_sched_state_ptr)
+{
+	struct rseq_sched_state __user *sched_state_ptr;
+	u64 sched_state_ptr_value;
+	u32 version = 0;
+	int ret;
+
+	if (rseq_len < offsetofend(struct rseq, sched_state_ptr))
+		return 0;
+	ret = get_user(sched_state_ptr_value, &rseq->sched_state_ptr);
+	if (ret)
+		return ret;
+	sched_state_ptr = (struct rseq_sched_state __user *)(unsigned long)sched_state_ptr_value;
+	if (!sched_state_ptr)
+		return 0;
+	ret = put_user(version, &sched_state_ptr->version);
+	if (ret)
+		return ret;
+	*_sched_state_ptr = sched_state_ptr;
+	return 0;
+}
+
 /*
  * sys_rseq - setup restartable sequences for caller thread.
  */
@@ -366,6 +405,7 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
 		int, flags, u32, sig)
 {
 	int ret;
+	struct rseq_sched_state __user *sched_state_ptr = NULL;
 
 	if (flags & RSEQ_FLAG_UNREGISTER) {
 		if (flags & ~RSEQ_FLAG_UNREGISTER)
@@ -383,6 +423,7 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
 		current->rseq = NULL;
 		current->rseq_sig = 0;
 		current->rseq_len = 0;
+		current->rseq_sched_state = NULL;
 		return 0;
 	}
 
@@ -420,9 +461,12 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
 		return -EINVAL;
 	if (!access_ok(rseq, rseq_len))
 		return -EFAULT;
+	if (rseq_get_sched_state_ptr(rseq, rseq_len, &sched_state_ptr))
+		return -EFAULT;
 	current->rseq = rseq;
 	current->rseq_len = rseq_len;
 	current->rseq_sig = sig;
+	current->rseq_sched_state = sched_state_ptr;
 	/*
 	 * If rseq was previously inactive, and has just been
 	 * registered, ensure the cpu_id_start and cpu_id fields
