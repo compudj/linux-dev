@@ -37,6 +37,13 @@ enum rseq_abi_cs_flags {
 		(1U << RSEQ_ABI_CS_FLAG_NO_RESTART_ON_MIGRATE_BIT),
 };
 
+enum rseq_abi_sched_state_flags {
+	/*
+	 * Task is currently running on a CPU if bit is set.
+	 */
+	RSEQ_ABI_SCHED_STATE_FLAG_ON_CPU		= (1U << 0),
+};
+
 /*
  * struct rseq_abi_cs is aligned on 4 * 8 bytes to ensure it is always
  * contained within a single cache-line. It is usually declared as
@@ -52,6 +59,32 @@ struct rseq_abi_cs {
 	__u64 post_commit_offset;
 	__u64 abort_ip;
 } __attribute__((aligned(4 * sizeof(__u64))));
+
+/*
+ * rseq_abi_sched_state should be aligned on the cache line size.
+ */
+struct rseq_abi_sched_state {
+	/*
+	 * Version of this structure. Populated by the kernel, read by
+	 * user-space.
+	 */
+	__u32 version;
+	/*
+	 * The state is updated by the kernel. Read by user-space with
+	 * single-copy atomicity semantics. This field can be read by any
+	 * userspace thread. Aligned on 32-bit, and ideally on cache line size.
+	 * Contains a bitmask of enum rseq_abi_sched_state_flags. This field is
+	 * provided as a hint by the scheduler, and requires that the page
+	 * holding this state is faulted-in for the state update to be
+	 * performed by the scheduler.
+	 */
+	__u32 state;
+	/*
+	 * Thread ID associated with the thread registering this structure.
+	 * Initialized by user-space before registration.
+	 */
+	__u32 tid;
+};
 
 /*
  * struct rseq_abi is aligned on 4 * 8 bytes to ensure it is always
@@ -163,6 +196,15 @@ struct rseq_abi {
 	 * (allocated uniquely within a memory map).
 	 */
 	__u32 mm_cid;
+
+	__u32 padding1;
+
+	/*
+	 * Restartable sequences sched_state_ptr field. Initialized by
+	 * userspace to the address at which the struct rseq_abi_sched_state is
+	 * located. Read by the kernel on rseq registration.
+	 */
+	__u64 sched_state_ptr;
 
 	/*
 	 * Flexible array member at end of structure, after last feature field.

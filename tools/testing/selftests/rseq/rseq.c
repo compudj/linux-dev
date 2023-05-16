@@ -62,6 +62,9 @@ static int rseq_reg_success;	/* At least one rseq registration has succeded. */
 /* Allocate a large area for the TLS. */
 #define RSEQ_THREAD_AREA_ALLOC_SIZE	1024
 
+/* Approximation of cacheline size. */
+#define CACHELINE_SIZE			128
+
 /* Original struct rseq feature size is 20 bytes. */
 #define ORIG_RSEQ_FEATURE_SIZE		20
 
@@ -69,9 +72,17 @@ static int rseq_reg_success;	/* At least one rseq registration has succeded. */
 #define ORIG_RSEQ_ALLOC_SIZE		32
 
 static
+__thread struct rseq_abi_sched_state __rseq_abi_sched_state __attribute__((tls_model("initial-exec"), aligned(CACHELINE_SIZE)));
+
+static
 __thread struct rseq_abi __rseq_abi __attribute__((tls_model("initial-exec"), aligned(RSEQ_THREAD_AREA_ALLOC_SIZE))) = {
 	.cpu_id = RSEQ_ABI_CPU_ID_UNINITIALIZED,
 };
+
+static pid_t rseq_gettid(void)
+{
+	return syscall(__NR_gettid);
+}
 
 static int sys_rseq(struct rseq_abi *rseq_abi, uint32_t rseq_len,
 		    int flags, uint32_t sig)
@@ -109,6 +120,8 @@ int rseq_register_current_thread(void)
 		/* Treat libc's ownership as a successful registration. */
 		return 0;
 	}
+	__rseq_abi_sched_state.tid = rseq_gettid();
+	__rseq_abi.sched_state_ptr = (uint64_t)(unsigned long)&__rseq_abi_sched_state;
 	rc = sys_rseq(&__rseq_abi, rseq_size, 0, RSEQ_SIG);
 	if (rc) {
 		if (RSEQ_READ_ONCE(rseq_reg_success)) {

@@ -236,6 +236,11 @@ static inline void rseq_prepare_unload(void)
 	rseq_clear_rseq_cs();
 }
 
+static inline struct rseq_abi_sched_state *rseq_get_sched_state(struct rseq_abi *rseq)
+{
+	return (struct rseq_abi_sched_state *)(unsigned long)rseq->sched_state_ptr;
+}
+
 static inline __attribute__((always_inline))
 int rseq_cmpeqv_storev(enum rseq_mo rseq_mo, enum rseq_percpu_mode percpu_mode,
 		       intptr_t *v, intptr_t expect,
