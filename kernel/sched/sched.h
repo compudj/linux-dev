@@ -97,6 +97,9 @@
 # define SCHED_WARN_ON(x)      ({ (void)(x), 0; })
 #endif
 
+#define IDLE_CPU_DELAY_NS		1000000		/* 1ms */
+#define IDLE_CPU_DELAY_MAX_RUNNING	4
+
 struct rq;
 struct cpuidle_state;
 
