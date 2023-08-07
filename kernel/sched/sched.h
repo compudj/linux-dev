@@ -167,6 +167,12 @@ extern int sched_rr_timeslice;
 #define NICE_0_LOAD		(1L << NICE_0_LOAD_SHIFT)
 
 /*
+ * Consider a CPU with nice 0 load at 0.5% or less to be almost idle for
+ * runqueue selection purposes.
+ */
+#define ALMOST_IDLE_CPU_LOAD	(scale_load_down(NICE_0_LOAD) / 200)
+
+/*
  * Single value that decides SCHED_DEADLINE internal math precision.
  * 10 -> just above 1us
  * 9  -> just above 0.5us

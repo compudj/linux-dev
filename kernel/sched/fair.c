@@ -6599,6 +6599,12 @@ static int wake_wide(struct task_struct *p)
 	return 1;
 }
 
+static int
+almost_idle_cpu(int cpu)
+{
+	return cpu_load(cpu_rq(cpu)) <= ALMOST_IDLE_CPU_LOAD;
+}
+
 /*
  * The purpose of wake_affine() is to quickly determine on which CPU we can run
  * soonest. For the purpose of speed we only consider the waking and previous
@@ -6627,12 +6633,12 @@ wake_affine_idle(int this_cpu, int prev_cpu, int sync)
 	 * on one CPU.
 	 */
 	if (available_idle_cpu(this_cpu) && cpus_share_cache(this_cpu, prev_cpu))
-		return available_idle_cpu(prev_cpu) ? prev_cpu : this_cpu;
+		return (available_idle_cpu(prev_cpu) || almost_idle_cpu(prev_cpu)) ? prev_cpu : this_cpu;
 
 	if (sync && cpu_rq(this_cpu)->nr_running == 1)
 		return this_cpu;
 
-	if (available_idle_cpu(prev_cpu))
+	if (available_idle_cpu(prev_cpu) || almost_idle_cpu(prev_cpu))
 		return prev_cpu;
 
 	return nr_cpumask_bits;
@@ -7139,7 +7145,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 */
 	lockdep_assert_irqs_disabled();
 
-	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
+	if ((available_idle_cpu(target) || sched_idle_cpu(target) || (prev == target && almost_idle_cpu(target))) &&
 	    asym_fits_cpu(task_util, util_min, util_max, target))
 		return target;
 
@@ -7147,7 +7153,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 * If the previous CPU is cache affine and idle, don't be stupid:
 	 */
 	if (prev != target && cpus_share_cache(prev, target) &&
-	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
+	    ((available_idle_cpu(prev) || almost_idle_cpu(prev)) || sched_idle_cpu(prev)) &&
 	    asym_fits_cpu(task_util, util_min, util_max, prev))
 		return prev;
 
