@@ -340,6 +340,12 @@ config HAVE_ASM_MODVERSIONS
 	  <asm/asm-prototypes.h> to support the module versioning for symbols
 	  exported from assembly code.
 
+config HAVE_CLUSTERGROUP
+	bool
+	help
+	  This symbol should be selected by an architecture if it
+	  implements CPU clustergroup.
+
 config HAVE_REGS_AND_STACK_ACCESS_API
 	bool
 	help

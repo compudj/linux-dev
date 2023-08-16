@@ -3904,13 +3904,33 @@ out:
 	rcu_read_unlock();
 }
 
+/*
+ * Query whether CPUs share LLC.
+ */
 bool cpus_share_cache(int this_cpu, int that_cpu)
+{
+	return per_cpu(sd_llc_id, this_cpu) == per_cpu(sd_llc_id, that_cpu);
+}
+
+#ifdef CONFIG_HAVE_CLUSTERGROUP
+/*
+ * Query whether CPUs share L2 cache.
+ */
+bool cpus_share_cluster(int this_cpu, int that_cpu)
 {
 	if (this_cpu == that_cpu)
 		return true;
-
-	return per_cpu(sd_llc_id, this_cpu) == per_cpu(sd_llc_id, that_cpu);
+	return cpumask_test_cpu(that_cpu, cpu_clustergroup_mask(this_cpu));
 }
+#else
+/*
+ * Fall-back on querying whether CPUs share LLC.
+ */
+bool cpus_share_cluster(int this_cpu, int that_cpu)
+{
+	return cpus_share_cache(this_cpu, that_cpu);
+}
+#endif
 
 static inline bool ttwu_queue_cond(struct task_struct *p, int cpu)
 {
@@ -3929,7 +3949,7 @@ static inline bool ttwu_queue_cond(struct task_struct *p, int cpu)
 	 * If the CPU does not share cache, then queue the task on the
 	 * remote rqs wakelist to avoid accessing remote data.
 	 */
-	if (!cpus_share_cache(smp_processor_id(), cpu))
+	if (!cpus_share_cluster(smp_processor_id(), cpu))
 		return true;
 
 	if (cpu == smp_processor_id())

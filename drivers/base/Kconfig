@@ -218,6 +218,7 @@ config DMA_FENCE_TRACE
 
 config GENERIC_ARCH_TOPOLOGY
 	bool
+	select HAVE_CLUSTERGROUP
 	help
 	  Enable support for architectures common topology code: e.g., parsing
 	  CPU capacity information from DT, usage of such information for
