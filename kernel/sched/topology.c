@@ -661,8 +661,11 @@ static void destroy_sched_domains(struct sched_domain *sd)
  *
  * Also keep a unique ID per domain (we use the first CPU number in
  * the cpumask of the domain), this allows us to quickly tell if
- * two CPUs are in the same cache domain, see cpus_share_llc().
+ * two CPUs are in the same cache domain, see cpus_share_l2c() and
+ * cpus_share_llc().
  */
+DEFINE_PER_CPU(int, sd_l2c_size);
+DEFINE_PER_CPU(int, sd_l2c_id);
 DEFINE_PER_CPU(struct sched_domain __rcu *, sd_llc);
 DEFINE_PER_CPU(int, sd_llc_size);
 DEFINE_PER_CPU(int, sd_llc_id);
@@ -672,12 +675,27 @@ DEFINE_PER_CPU(struct sched_domain __rcu *, sd_asym_packing);
 DEFINE_PER_CPU(struct sched_domain __rcu *, sd_asym_cpucapacity);
 DEFINE_STATIC_KEY_FALSE(sched_asym_cpucapacity);
 
+#ifdef TOPOLOGY_CLUSTER_SYSFS
+static int cpu_get_l2c_info(int cpu, int *l2c_size, int *l2c_id)
+{
+	const struct cpumask *cluster_mask = topology_cluster_cpumask(cpu);
+
+	*l2c_size = cpumask_weight(cluster_mask);
+	*l2c_id = cpumask_first(cluster_mask);
+	return 0;
+}
+#else
+static int cpu_get_l2c_info(int cpu, int *l2c_size, int *l2c_id)
+{
+	return -1;
+}
+#endif
+
 static void update_top_cache_domain(int cpu)
 {
 	struct sched_domain_shared *sds = NULL;
 	struct sched_domain *sd;
-	int id = cpu;
-	int size = 1;
+	int id = cpu, size = 1, l2c_id, l2c_size;
 
 	sd = highest_flag_domain(cpu, SD_SHARE_PKG_RESOURCES);
 	if (sd) {
@@ -685,6 +703,14 @@ static void update_top_cache_domain(int cpu)
 		size = cpumask_weight(sched_domain_span(sd));
 		sds = sd->shared;
 	}
+
+	if (cpu_get_l2c_info(cpu, &l2c_size, &l2c_id)) {
+		/* Fallback on using LLC. */
+		l2c_size = size;
+		l2c_id = id;
+	}
+	per_cpu(sd_l2c_size, cpu) = l2c_size;
+	per_cpu(sd_l2c_id, cpu) = l2c_id;
 
 	rcu_assign_pointer(per_cpu(sd_llc, cpu), sd);
 	per_cpu(sd_llc_size, cpu) = size;
