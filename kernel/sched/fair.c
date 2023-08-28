@@ -6697,6 +6697,19 @@ static unsigned long capacity_of(int cpu)
 	return cpu_rq(cpu)->cpu_capacity;
 }
 
+static bool should_migrate_task(struct task_struct *p, int prev_cpu)
+{
+	u64 now = sched_clock_cpu(prev_cpu);
+
+	/* sched_clock reset causing next migration time to be too far ahead. */
+	if (now + SCHED_MIGRATION_RATELIMIT_WINDOW < p->se.next_migration_time)
+		return true;
+	/* Rate limit task migration. */
+	if (now >= p->se.next_migration_time)
+		return true;
+	return false;
+}
+
 static void record_wakee(struct task_struct *p)
 {
 	/*
@@ -7897,6 +7910,9 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
 	}
 
+	if (want_affine && !should_migrate_task(p, prev_cpu))
+		return prev_cpu;
+
 	rcu_read_lock();
 	for_each_domain(cpu, tmp) {
 		/*
@@ -7943,6 +7959,9 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 {
 	struct sched_entity *se = &p->se;
+
+	/* Rate limit task migration. */
+	se->next_migration_time = sched_clock_cpu(new_cpu) + SCHED_MIGRATION_RATELIMIT_WINDOW;
 
 	if (!task_on_rq_migrating(p)) {
 		remove_entity_load_avg(se);
