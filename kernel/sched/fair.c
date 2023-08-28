@@ -703,6 +703,14 @@ int sched_update_scaling(void)
 }
 #endif
 
+static bool should_migrate_task(struct task_struct *p, int prev_cpu)
+{
+	/* Rate limit task migration. */
+	if (sched_clock_cpu(prev_cpu) < p->se.next_migration_time)
+	       return false;
+	return true;
+}
+
 /*
  * delta /= w
  */
@@ -7694,6 +7702,9 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
 	}
 
+	if (want_affine && !should_migrate_task(p, prev_cpu))
+		return prev_cpu;
+
 	rcu_read_lock();
 	for_each_domain(cpu, tmp) {
 		/*
@@ -7740,6 +7751,9 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 {
 	struct sched_entity *se = &p->se;
+
+	/* Rate limit task migration. */
+	se->next_migration_time = sched_clock_cpu(new_cpu) + SCHED_MIGRATION_RATELIMIT_WINDOW;
 
 	/*
 	 * As blocked tasks retain absolute vruntime the migration needs to

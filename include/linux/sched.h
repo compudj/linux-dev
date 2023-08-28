@@ -560,6 +560,8 @@ struct sched_entity {
 
 	u64				nr_migrations;
 
+	u64				next_migration_time;
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	int				depth;
 	struct sched_entity		*parent;
