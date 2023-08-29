@@ -6699,12 +6699,15 @@ static unsigned long capacity_of(int cpu)
 
 static bool should_migrate_task(struct task_struct *p, int prev_cpu)
 {
-	u64 now = sched_clock_cpu(prev_cpu);
+	u64 now;
 
+	/* Rate limit task migration. */
+	if (p->se.nr_migrations_per_window < p->se.quota_migrations_per_window)
+		return true;
+	now = sched_clock_cpu(prev_cpu);
 	/* sched_clock reset causing next migration time to be too far ahead. */
 	if (now + SCHED_MIGRATION_RATELIMIT_WINDOW < p->se.next_migration_time)
 		return true;
-	/* Rate limit task migration. */
 	if (now >= p->se.next_migration_time)
 		return true;
 	return false;
@@ -7951,6 +7954,31 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 	return new_cpu;
 }
 
+static void migrate_task_ratelimit_fair(struct task_struct *p, int new_cpu)
+{
+	struct sched_entity *se = &p->se;
+	u64 now;
+
+	/* Rate limit task migration. */
+	now = sched_clock_cpu(task_cpu(p));
+	if (now < se->next_migration_time) {
+		se->nr_migrations_per_window++;
+		if (!sched_clock_stable())
+			se->next_migration_time += sched_clock_cpu(new_cpu) - now;
+	} else {
+		if (!sched_clock_stable())
+			now = sched_clock_cpu(new_cpu);
+		se->next_migration_time = now + SCHED_MIGRATION_RATELIMIT_WINDOW;
+		if (se->nr_migrations_per_window >= se->quota_migrations_per_window)
+			se->quota_migrations_per_window = max(1, se->quota_migrations_per_window >> 1);
+		else
+			se->quota_migrations_per_window =
+				min(SCHED_MIGRATION_QUOTA,
+				    se->quota_migrations_per_window + SCHED_MIGRATION_QUOTA_REPLENISH);
+		se->nr_migrations_per_window = 1;
+	}
+}
+
 /*
  * Called immediately before a task is migrated to a new CPU; task_cpu(p) and
  * cfs_rq_of(p) references at time of call are still valid and identify the
@@ -7960,8 +7988,7 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 {
 	struct sched_entity *se = &p->se;
 
-	/* Rate limit task migration. */
-	se->next_migration_time = sched_clock_cpu(new_cpu) + SCHED_MIGRATION_RATELIMIT_WINDOW;
+	migrate_task_ratelimit_fair(p, new_cpu);
 
 	if (!task_on_rq_migrating(p)) {
 		remove_entity_load_avg(se);
