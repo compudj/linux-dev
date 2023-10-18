@@ -103,6 +103,12 @@ SCHED_FEAT(UTIL_EST_FASTUP, true)
  */
 SCHED_FEAT(UTIL_FITS_CAPACITY, true)
 
+/*
+ * Bias runqueue selection towards the previous runqueue over the target
+ * runqueue.
+ */
+SCHED_FEAT(SELECT_BIAS_PREV, true)
+
 SCHED_FEAT(LATENCY_WARN, false)
 
 SCHED_FEAT(ALT_PERIOD, true)

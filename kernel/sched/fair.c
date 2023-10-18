@@ -7166,15 +7166,30 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 */
 	lockdep_assert_irqs_disabled();
 
+	/*
+	 * With the SELECT_BIAS_PREV feature, if the previous CPU is
+	 * cache affine and the task fits within the prev cpu capacity,
+	 * prefer the previous CPU to the target CPU to inhibit costly
+	 * task migration.
+	 */
+	if (sched_feat(SELECT_BIAS_PREV) &&
+	    (prev == target || cpus_share_cache(prev, target)) &&
+	    (available_idle_cpu(prev) || sched_idle_cpu(prev) ||
+	    task_fits_remaining_cpu_capacity(task_util, prev)) &&
+	    asym_fits_cpu(task_util, util_min, util_max, prev))
+		return prev;
+
 	if ((available_idle_cpu(target) || sched_idle_cpu(target) ||
 	    task_fits_remaining_cpu_capacity(task_util, target)) &&
 	    asym_fits_cpu(task_util, util_min, util_max, target))
 		return target;
 
 	/*
-	 * If the previous CPU is cache affine and idle, don't be stupid:
+	 * Without the SELECT_BIAS_PREV feature, use the previous CPU if
+	 * it is cache affine and idle if the target cpu is not idle.
 	 */
-	if (prev != target && cpus_share_cache(prev, target) &&
+	if (!sched_feat(SELECT_BIAS_PREV) &&
+	    prev != target && cpus_share_cache(prev, target) &&
 	    (available_idle_cpu(prev) || sched_idle_cpu(prev) ||
 	    task_fits_remaining_cpu_capacity(task_util, prev)) &&
 	    asym_fits_cpu(task_util, util_min, util_max, prev))
@@ -7246,6 +7261,15 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	i = select_idle_cpu(p, sd, has_idle_core, target);
 	if ((unsigned)i < nr_cpumask_bits)
 		return i;
+
+	/*
+	 * With the SELECT_BIAS_PREV feature, if the previous CPU is
+	 * cache affine, prefer the previous CPU when all CPUs are busy
+	 * to inhibit migration.
+	 */
+	if (sched_feat(SELECT_BIAS_PREV) &&
+	    prev != target && cpus_share_cache(prev, target))
+		return prev;
 
 	return target;
 }
