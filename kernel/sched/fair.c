@@ -4497,6 +4497,30 @@ done:
 	trace_sched_util_est_se_tp(&p->se);
 }
 
+static unsigned long scale_rt_capacity(int cpu);
+
+/*
+ * Returns true if adding the task utilization to the estimated
+ * utilization of the runnable tasks on @cpu does not exceed the
+ * capacity of @cpu.
+ *
+ * This considers only the utilization of _runnable_ tasks on the @cpu
+ * runqueue, excluding blocked and sleeping tasks. This is achieved by
+ * using the runqueue util_est.enqueued.
+ *
+ * It depends on the UTIL_FITS_CAPACITY and UTIL_EST sched features.
+ */
+static inline bool task_fits_remaining_cpu_capacity(unsigned long task_util,
+						    int cpu)
+{
+	unsigned long total_util;
+
+	if (!sched_feat(UTIL_FITS_CAPACITY))
+		return false;
+	total_util = READ_ONCE(cpu_rq(cpu)->cfs.avg.util_est.enqueued) + task_util;
+	return fits_capacity(total_util, scale_rt_capacity(cpu));
+}
+
 static inline int util_fits_cpu(unsigned long util,
 				unsigned long uclamp_min,
 				unsigned long uclamp_max,
@@ -7124,12 +7148,15 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	int i, recent_used_cpu;
 
 	/*
-	 * On asymmetric system, update task utilization because we will check
-	 * that the task fits with cpu's capacity.
+	 * With the UTIL_FITS_CAPACITY feature and on asymmetric system,
+	 * update task utilization because we will check that the task
+	 * fits with cpu's capacity.
 	 */
-	if (sched_asym_cpucap_active()) {
+	if (sched_feat(UTIL_FITS_CAPACITY) || sched_asym_cpucap_active()) {
 		sync_entity_load_avg(&p->se);
 		task_util = task_util_est(p);
+	}
+	if (sched_asym_cpucap_active()) {
 		util_min = uclamp_eff_value(p, UCLAMP_MIN);
 		util_max = uclamp_eff_value(p, UCLAMP_MAX);
 	}
@@ -7139,7 +7166,8 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 */
 	lockdep_assert_irqs_disabled();
 
-	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
+	if ((available_idle_cpu(target) || sched_idle_cpu(target) ||
+	    task_fits_remaining_cpu_capacity(task_util, target)) &&
 	    asym_fits_cpu(task_util, util_min, util_max, target))
 		return target;
 
@@ -7147,7 +7175,8 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 * If the previous CPU is cache affine and idle, don't be stupid:
 	 */
 	if (prev != target && cpus_share_cache(prev, target) &&
-	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
+	    (available_idle_cpu(prev) || sched_idle_cpu(prev) ||
+	    task_fits_remaining_cpu_capacity(task_util, prev)) &&
 	    asym_fits_cpu(task_util, util_min, util_max, prev))
 		return prev;
 
@@ -7173,7 +7202,8 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	if (recent_used_cpu != prev &&
 	    recent_used_cpu != target &&
 	    cpus_share_cache(recent_used_cpu, target) &&
-	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
+	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu) ||
+	    task_fits_remaining_cpu_capacity(task_util, recent_used_cpu)) &&
 	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
 	    asym_fits_cpu(task_util, util_min, util_max, recent_used_cpu)) {
 		return recent_used_cpu;

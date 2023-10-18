@@ -97,6 +97,12 @@ SCHED_FEAT(WA_BIAS, true)
 SCHED_FEAT(UTIL_EST, true)
 SCHED_FEAT(UTIL_EST_FASTUP, true)
 
+/*
+ * Select the previous, target, or recent runqueue if they have enough
+ * remaining capacity to enqueue the task. Requires UTIL_EST.
+ */
+SCHED_FEAT(UTIL_FITS_CAPACITY, true)
+
 SCHED_FEAT(LATENCY_WARN, false)
 
 SCHED_FEAT(ALT_PERIOD, true)
