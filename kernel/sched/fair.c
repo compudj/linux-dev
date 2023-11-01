@@ -7798,6 +7798,78 @@ static void sched_connectivity_update(struct task_struct *waker, int waker_cpu,
 }
 #endif
 
+static int
+select_task_rq_fair_binpack(struct task_struct *p, int prev_cpu, int wake_flags)
+{
+	int cpu = smp_processor_id();
+	int new_cpu = prev_cpu;
+
+	//TODO
+
+	/* Find node with highest connectivity to p */
+
+	/* Within node, find cluster with highest connectivity to p */
+
+	/* Within cluster, find core with highest connectivity to p */
+
+	/*
+	 * Note: capacity and utilization of a core should take into
+	 * account all SMT siblings within the core.
+	 * Make capacity of each additional SMT sibling in a core half
+	 * of the capacity of a single HW thread to account for the fact
+	 * that ressources are shared.
+	 */
+
+	/*
+	 * If the core found has enough capacity, use it. Use the SMT
+	 * sibling with most capacity left, unless one of its SMT
+	 * siblings is prev_cpu, in which case stay on prev_cpu.
+	 */
+
+	/*
+	 * Else, the core found does not have enough capacity left. We
+	 * need to widen our search and use the core within our cluster
+	 * which has the most capacity left (if any).
+	 *
+	 * If the core found has enough capacity, use it. Use the SMT
+	 * sibling with most capacity left, unless one of its SMT
+	 * siblings is prev_cpu, in which case stay on prev_cpu.
+	 */
+
+	/*
+	 * Else, the cluster found does not have enough capacity left. We
+	 * need to widen our search and use the core within our numa
+	 * node which has the most capacity left (if any).
+	 *
+	 * If the core found has enough capacity, use it. Use the SMT
+	 * sibling with most capacity left, unless one of its SMT
+	 * siblings is prev_cpu, in which case stay on prev_cpu.
+	 */
+
+	/*
+	 * Else, the numa node found does not have enough capacity left.
+	 * We need to widen our search and use the core within the whole
+	 * system which has the most capacity left (if any).
+	 *
+	 * If the core found has enough capacity, use it. Use the SMT
+	 * sibling with most capacity left, unless one of its SMT
+	 * siblings is prev_cpu, in which case stay on prev_cpu.
+	 */
+
+	/*
+	 * No core in the system has enough capacity. Favor either:
+	 * - Staying on prev,
+	 * - Moving to the core with the most remaining capacity,
+	 * - Moving to the core with most connectivity even though it
+	 *   does not have enough capacity.
+	 *
+	 * (I'm unsure which approach is best in this situation)
+	 */
+
+	sched_connectivity_update(current, cpu, p, new_cpu);
+	return new_cpu;
+}
+
 /*
  * select_task_rq_fair: Select target runqueue for the waking task in domains
  * that have the relevant SD flag set. In practice, this is SD_BALANCE_WAKE,
