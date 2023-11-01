@@ -545,6 +545,22 @@ struct sched_statistics {
 #endif /* CONFIG_SCHEDSTATS */
 } ____cacheline_aligned;
 
+//TODO: use cpu topology.
+#define NR_CORES	192
+#define NR_CLUSTERS	24
+#define NR_NODES	2
+#define NR_SMT_PER_CORE	2
+
+/*
+ * Saturation counters keeping track of waker/wakee connectivity.
+ */
+struct sched_connectivity {
+	u32				node[NR_NODES];
+	u16				cluster[NR_CLUSTERS];
+	u8				core[NR_CORES];
+	unsigned long			decay_ts;
+};
+
 struct sched_entity {
 	/* For load-balancing: */
 	struct load_weight		load;
@@ -578,6 +594,7 @@ struct sched_entity {
 	 * collide with read-mostly values above.
 	 */
 	struct sched_avg		avg;
+	struct sched_connectivity	connectivity;
 #endif
 };
 

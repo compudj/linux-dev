@@ -4534,6 +4534,7 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 #ifdef CONFIG_SMP
 	p->wake_entry.u_flags = CSD_TYPE_TTWU;
 	p->migration_pending = NULL;
+	p->se.connectivity.decay_ts = jiffies;
 #endif
 	init_sched_mm_cid(p);
 }

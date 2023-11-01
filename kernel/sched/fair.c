@@ -7740,6 +7740,64 @@ unlock:
 	return target;
 }
 
+#ifdef CONFIG_SMP
+/*
+ * Connectivity counter updates are non-atomic and race against
+ * concurrent updaters. This should not matter much since those only
+ * need to be statistically OK for task runqueue selection purposes.
+ */
+static void sched_connectivity_decay(struct sched_connectivity *conn)
+{
+	int i;
+
+	if (!time_after(jiffies, conn->decay_ts + HZ))
+		return;
+	conn->decay_ts = jiffies;
+	for (i = 0; i < NR_NODES; i++)
+		conn->node[i] >>= 1;
+	for (i = 0; i < NR_CLUSTERS; i++)
+		conn->cluster[i] >>= 1;
+	for (i = 0; i < NR_CORES; i++)
+		conn->core[i] >>= 1;
+}
+
+static void sched_connectivity_update_task(struct task_struct *t, int cpu)
+{
+	struct sched_connectivity *conn = &t->se.connectivity;
+	u8 *core, core_v;
+	u16 *cluster, cluster_v;
+	u32 *node, node_v;
+
+	sched_connectivity_decay(conn);
+	core = &conn->core[topology_core_id(cpu)];
+	cluster = &conn->cluster[topology_cluster_id(cpu)];
+	node = &conn->node[cpu_to_node(cpu)];
+
+	/* Update counters with saturation. */
+	core_v = *core;
+	if (core_v < U8_MAX)
+		*core = core_v + 1;
+	cluster_v = *cluster;
+	if (cluster_v < U16_MAX)
+		*cluster = cluster_v + 1;
+	node_v = *node;
+	if (node_v < U32_MAX)
+		*node = node_v + 1;
+}
+
+static void sched_connectivity_update(struct task_struct *waker, int waker_cpu,
+				      struct task_struct *wakee, int wakee_cpu)
+{
+	sched_connectivity_update_task(waker, wakee_cpu);
+	sched_connectivity_update_task(wakee, waker_cpu);
+}
+#else
+static void sched_connectivity_update(struct task_struct *waker, int waker_cpu,
+				      struct task_struct *wakee, int wakee_cpu)
+{
+}
+#endif
+
 /*
  * select_task_rq_fair: Select target runqueue for the waking task in domains
  * that have the relevant SD flag set. In practice, this is SD_BALANCE_WAKE,
@@ -7770,8 +7828,10 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 
 		if (sched_energy_enabled()) {
 			new_cpu = find_energy_efficient_cpu(p, prev_cpu);
-			if (new_cpu >= 0)
+			if (new_cpu >= 0) {
+				sched_connectivity_update(current, cpu, p, new_cpu);
 				return new_cpu;
+			}
 			new_cpu = prev_cpu;
 		}
 
@@ -7812,6 +7872,8 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
 	}
 	rcu_read_unlock();
+
+	sched_connectivity_update(current, cpu, p, new_cpu);
 
 	return new_cpu;
 }
