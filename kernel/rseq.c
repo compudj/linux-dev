@@ -149,6 +149,18 @@ static int rseq_reset_rseq_cpu_node_id(struct task_struct *t)
 	return 0;
 }
 
+static int rseq_get_rseq_cs_ptr(struct rseq __user *rseq, u64 *ptr)
+{
+#ifdef CONFIG_64BIT
+	if (get_user(*ptr, &rseq->rseq_cs))
+		return -EFAULT;
+#else
+	if (copy_from_user(ptr, &rseq->rseq_cs, sizeof(*ptr)))
+		return -EFAULT;
+#endif
+	return 0;
+}
+
 static int rseq_get_rseq_cs(struct task_struct *t, struct rseq_cs *rseq_cs)
 {
 	struct rseq_cs __user *urseq_cs;
@@ -157,13 +169,9 @@ static int rseq_get_rseq_cs(struct task_struct *t, struct rseq_cs *rseq_cs)
 	u32 sig;
 	int ret;
 
-#ifdef CONFIG_64BIT
-	if (get_user(ptr, &t->rseq->rseq_cs))
-		return -EFAULT;
-#else
-	if (copy_from_user(&ptr, &t->rseq->rseq_cs, sizeof(ptr)))
-		return -EFAULT;
-#endif
+	ret = rseq_get_rseq_cs_ptr(t->rseq, &ptr);
+	if (ret)
+		return ret;
 	if (!ptr) {
 		memset(rseq_cs, 0, sizeof(*rseq_cs));
 		return 0;
@@ -366,6 +374,7 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
 		int, flags, u32, sig)
 {
 	int ret;
+	u64 ptr;
 
 	if (flags & RSEQ_FLAG_UNREGISTER) {
 		if (flags & ~RSEQ_FLAG_UNREGISTER)
@@ -420,6 +429,14 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
 		return -EINVAL;
 	if (!access_ok(rseq, rseq_len))
 		return -EFAULT;
+	/*
+	 * Validate that the rseq_cs pointer is initialized to NULL by
+	 * user-space before registration.
+	 */
+	if (rseq_get_rseq_cs_ptr(rseq, &ptr))
+		return -EFAULT;
+	if (ptr)
+		return -EINVAL;
 	current->rseq = rseq;
 	current->rseq_len = rseq_len;
 	current->rseq_sig = sig;
