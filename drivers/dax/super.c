@@ -448,7 +448,7 @@ struct dax_device *alloc_dax(void *private, const struct dax_operations *ops)
 
 	/* Unavailable on architectures with virtually aliased data caches. */
 	if (cpu_dcache_is_aliasing())
-		return NULL;
+		return ERR_PTR(-EOPNOTSUPP);
 
 	if (WARN_ON_ONCE(ops && !ops->zero_page_range))
 		return ERR_PTR(-EINVAL);

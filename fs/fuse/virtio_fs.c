@@ -799,6 +799,7 @@ static int virtio_fs_setup_dax(struct virtio_device *vdev, struct virtio_fs *fs)
 {
 	struct virtio_shm_region cache_reg;
 	struct dev_pagemap *pgmap;
+	struct dax_device *dax_dev;
 	bool have_cache;
 
 	if (!IS_ENABLED(CONFIG_FUSE_DAX))
@@ -818,7 +819,7 @@ static int virtio_fs_setup_dax(struct virtio_device *vdev, struct virtio_fs *fs)
 			 cache_reg.addr, cache_reg.len);
 		return -EBUSY;
 	}
-
+	//where is devm_release_mem_region ?
 	dev_notice(&vdev->dev, "Cache len: 0x%llx @ 0x%llx\n", cache_reg.len,
 		   cache_reg.addr);
 
@@ -840,6 +841,7 @@ static int virtio_fs_setup_dax(struct virtio_device *vdev, struct virtio_fs *fs)
 	pgmap->nr_range = 1;
 
 	fs->window_kaddr = devm_memremap_pages(&vdev->dev, pgmap);
+	//TODO: do we have a leak of pgmap on error here ?
 	if (IS_ERR(fs->window_kaddr))
 		return PTR_ERR(fs->window_kaddr);
 
@@ -849,9 +851,16 @@ static int virtio_fs_setup_dax(struct virtio_device *vdev, struct virtio_fs *fs)
 	dev_dbg(&vdev->dev, "%s: window kaddr 0x%px phys_addr 0x%llx len 0x%llx\n",
 		__func__, fs->window_kaddr, cache_reg.addr, cache_reg.len);
 
-	fs->dax_dev = alloc_dax(fs, &virtio_fs_dax_ops);
-	if (IS_ERR(fs->dax_dev))
-		return PTR_ERR(fs->dax_dev);
+	//TODO: do we have a leak of pgmap and window_kaddr on error here ?
+	dax_dev = alloc_dax(fs, &virtio_fs_dax_ops);
+	if (IS_ERR(dax_dev)) {
+		int rc = PTR_ERR(dax_dev);
+
+		if (rc == -EOPNOTSUPP)
+			return 0;
+		return rc;
+	}
+	fs->dax_dev = dax_dev;
 
 	return devm_add_action_or_reset(&vdev->dev, virtio_fs_cleanup_dax,
 					fs->dax_dev);
