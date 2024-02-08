@@ -406,3 +406,19 @@ void __flush_anon_page(struct vm_area_struct *vma, struct page *page, unsigned l
 	 */
 	__cpuc_flush_dcache_area(page_address(page), PAGE_SIZE);
 }
+
+#ifdef CONFIG_ARCH_HAS_PMEM_API
+void arch_wb_cache_pmem(void *addr, size_t size)
+{
+	/* Ensure order against any prior non-cacheable writes */
+	dmb(osh);
+	__sync_cache_range_w(addr, (size_t)addr + size);
+}
+EXPORT_SYMBOL_GPL(arch_wb_cache_pmem);
+
+void arch_invalidate_pmem(void *addr, size_t size)
+{
+	__sync_cache_range_w(addr, (size_t)addr + size);
+}
+EXPORT_SYMBOL_GPL(arch_invalidate_pmem);
+#endif
