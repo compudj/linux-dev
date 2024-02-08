@@ -26,11 +26,20 @@
 #include <linux/dax.h>
 #include <linux/nd.h>
 #include <linux/mm.h>
+#include <linux/panic_notifier.h>
+#include <linux/reboot.h>
 #include <asm/cacheflush.h>
 #include "pmem.h"
 #include "btt.h"
 #include "pfn.h"
 #include "nd.h"
+
+static int pmem_die_handler(struct notifier_block *self,
+		unsigned long ev, void *unused);
+static int pmem_panic_handler(struct notifier_block *self,
+		unsigned long ev, void *unused);
+static int pmem_reboot_handler(struct notifier_block *self,
+		unsigned long ev, void *unused);
 
 static struct device *to_dev(struct pmem_device *pmem)
 {
@@ -423,6 +432,10 @@ static void pmem_release_disk(void *__pmem)
 {
 	struct pmem_device *pmem = __pmem;
 
+	unregister_reboot_notifier(&pmem->reboot_notifier);
+	atomic_notifier_chain_unregister(&panic_notifier_list,
+			&pmem->panic_notifier);
+	unregister_die_notifier(&pmem->die_notifier);
 	dax_remove_host(pmem->disk);
 	kill_dax(pmem->dax_dev);
 	put_dax(pmem->dax_dev);
@@ -573,9 +586,25 @@ static int pmem_attach_disk(struct device *dev,
 			goto out_cleanup_dax;
 		dax_write_cache(dax_dev, nvdimm_has_cache(nd_region));
 	}
-	rc = device_add_disk(dev, disk, pmem_attribute_groups);
+	pmem->die_notifier.notifier_call = pmem_die_handler;
+	pmem->die_notifier.priority = -INT_MAX;
+	rc = register_die_notifier(&pmem->die_notifier);
 	if (rc)
 		goto out_remove_host;
+	pmem->panic_notifier.notifier_call = pmem_panic_handler;
+	pmem->panic_notifier.priority = -INT_MAX;
+	rc = atomic_notifier_chain_register(&panic_notifier_list,
+			&pmem->panic_notifier);
+	if (rc)
+		goto out_unregister_die;
+	pmem->reboot_notifier.notifier_call = pmem_reboot_handler;
+	pmem->reboot_notifier.priority = -INT_MAX;
+	rc = register_reboot_notifier(&pmem->reboot_notifier);
+	if (rc)
+		goto out_unregister_panic;
+	rc = device_add_disk(dev, disk, pmem_attribute_groups);
+	if (rc)
+		goto out_unregister_reboot;
 	if (devm_add_action_or_reset(dev, pmem_release_disk, pmem))
 		return -ENOMEM;
 
@@ -587,6 +616,13 @@ static int pmem_attach_disk(struct device *dev,
 		dev_warn(dev, "'badblocks' notification disabled\n");
 	return 0;
 
+out_unregister_reboot:
+	unregister_reboot_notifier(&pmem->reboot_notifier);
+out_unregister_panic:
+	atomic_notifier_chain_unregister(&panic_notifier_list,
+			&pmem->panic_notifier);
+out_unregister_die:
+	unregister_die_notifier(&pmem->die_notifier);
 out_remove_host:
 	dax_remove_host(pmem->disk);
 out_cleanup_dax:
@@ -747,6 +783,45 @@ static void nd_pmem_notify(struct device *dev, enum nvdimm_event event)
 		dev_WARN_ONCE(dev, 1, "notify: unknown event: %d\n", event);
 		break;
 	}
+}
+
+/*
+ * For volatile memory use-cases where explicit flushing of the data
+ * cache is not useful after stores, the pmem reboot notifier is called
+ * on reboot, and the panic notifier is called on die/panic to make sure
+ * the content of the pmem memory area is flushed from data cache to
+ * memory, so it can be preserved across warm reboot. Use a low notifier
+ * priority to flush stores that are performed from other die notifiers
+ * to memory.
+ */
+static int pmem_reboot_handler(struct notifier_block *self,
+		unsigned long ev, void *unused)
+{
+	struct pmem_device *pmem = container_of(self, struct pmem_device, reboot_notifier);
+
+	arch_wb_cache_pmem(pmem->virt_addr, pmem->size);
+	return NOTIFY_DONE;
+}
+
+static int pmem_die_handler(struct notifier_block *self,
+		unsigned long ev, void *unused)
+{
+	struct pmem_device *pmem = container_of(self, struct pmem_device, die_notifier);
+
+	/* Only trigger on DIE_OOPS for the die notifier. */
+	if (ev != DIE_OOPS)
+		return NOTIFY_DONE;
+	arch_wb_cache_pmem(pmem->virt_addr, pmem->size);
+	return NOTIFY_DONE;
+}
+
+static int pmem_panic_handler(struct notifier_block *self,
+		unsigned long ev, void *unused)
+{
+	struct pmem_device *pmem = container_of(self, struct pmem_device, panic_notifier);
+
+	arch_wb_cache_pmem(pmem->virt_addr, pmem->size);
+	return NOTIFY_DONE;
 }
 
 MODULE_ALIAS("pmem");

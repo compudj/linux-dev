@@ -4,6 +4,7 @@
 #include <linux/page-flags.h>
 #include <linux/badblocks.h>
 #include <linux/memremap.h>
+#include <linux/notifier.h>
 #include <linux/types.h>
 #include <linux/pfn_t.h>
 #include <linux/fs.h>
@@ -27,6 +28,9 @@ struct pmem_device {
 	struct dax_device	*dax_dev;
 	struct gendisk		*disk;
 	struct dev_pagemap	pgmap;
+	struct notifier_block	die_notifier;
+	struct notifier_block	panic_notifier;
+	struct notifier_block	reboot_notifier;
 };
 
 long __pmem_direct_access(struct pmem_device *pmem, pgoff_t pgoff,
