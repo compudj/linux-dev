@@ -55,6 +55,24 @@ void on_each_cpu_cond_mask(smp_cond_func_t cond_func, smp_call_func_t func,
 
 int smp_call_function_single_async(int cpu, call_single_data_t *csd);
 
+int smp_call_function_single_serialize(int cpuid, smp_call_func_t func,
+				       void *info, int wait);
+
+void smp_call_function_many_serialize(const struct cpumask *mask,
+				      smp_call_func_t func,
+				      void *info, bool wait);
+
+void on_each_cpu_cond_mask_serialize(smp_cond_func_t cond_func, smp_call_func_t func,
+			   void *info, bool wait, const struct cpumask *mask);
+
+static inline
+void on_each_cpu_mask_serialize(const struct cpumask *mask,
+				smp_call_func_t func,
+				void *info, bool wait)
+{
+	on_each_cpu_cond_mask_serialize(NULL, func, info, wait, mask);
+}
+
 /*
  * Cpus stopping functions in panic. All have default weak definitions.
  * Architecture-dependent code may override them.
