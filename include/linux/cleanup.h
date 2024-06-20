@@ -146,12 +146,20 @@ static inline class_##_name##_t class_##_name##ext##_constructor(_init_args) \
  *      similar to scoped_guard(), except it does fail when the lock
  *      acquire fails.
  *
+ * DEFINE_INACTIVE_GUARD(name, var):
+ *      define an inactive guard variable in a given scope, initialized to NULL.
+ *
+ * activate_guard(name, var)(args...):
+ *      activate a guard variable with its constructor, if it is not already
+ *      activated.
  */
 
 #define DECLARE_GUARD(_name, _type, _lock, _unlock) \
 	DECLARE_CLASS(_name, _type, if (_T) { _unlock; }, ({ _lock; _T; }), _type _T); \
 	static inline void * class_##_name##_lock_ptr(class_##_name##_t *_T) \
-	{ return *_T; }
+	{ return *_T; } \
+	static inline class_##_name##_t class_##_name##_null(void) \
+	{ return NULL; }
 
 #define DECLARE_GUARD_COND(_name, _ext, _condlock) \
 	EXTEND_CLASS(_name, _ext, \
@@ -174,6 +182,14 @@ static inline class_##_name##_t class_##_name##ext##_constructor(_init_args) \
 	     *done = NULL; !done; done = (void *)1) \
 		if (!__guard_ptr(_name)(&scope)) _fail; \
 		else
+
+#define DEFINE_INACTIVE_GUARD(_name, _var) \
+	class_##_name##_t _var __cleanup(class_##_name##_destructor) = \
+		class_##_name##_null()
+
+#define activate_guard(_name, _var) \
+	if (!class_##_name##_lock_ptr(&(_var))) \
+		_var = class_##_name##_constructor
 
 /*
  * Additional helper macros for generating lock guards with types, either for
@@ -209,6 +225,11 @@ static inline void class_##_name##_destructor(class_##_name##_t *_T)	\
 static inline void *class_##_name##_lock_ptr(class_##_name##_t *_T)	\
 {									\
 	return _T->lock;						\
+}									\
+static inline class_##_name##_t class_##_name##_null(void)		\
+{									\
+	class_##_name##_t _t = { .lock = NULL };			\
+	return _t;							\
 }
 
 
