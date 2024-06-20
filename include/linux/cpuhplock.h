@@ -44,6 +44,6 @@ static inline int remove_cpu(unsigned int cpu) { return -EPERM; }
 static inline void smp_shutdown_nonboot_cpus(unsigned int primary_cpu) { }
 #endif	/* !CONFIG_HOTPLUG_CPU */
 
-DEFINE_LOCK_GUARD_0(cpus_read_lock, cpus_read_lock(), cpus_read_unlock())
+DECLARE_LOCK_GUARD_0(cpus_read_lock, cpus_read_lock(), cpus_read_unlock())
 
 #endif /* _LINUX_CPUHPLOCK_H_ */

@@ -163,7 +163,7 @@ static inline void put_task_struct(struct task_struct *t)
 	call_rcu(&t->rcu, __put_task_struct_rcu_cb);
 }
 
-DEFINE_FREE(put_task, struct task_struct *, if (_T) put_task_struct(_T))
+DECLARE_FREE(put_task, struct task_struct *, if (_T) put_task_struct(_T))
 
 static inline void put_task_struct_many(struct task_struct *t, int nr)
 {
@@ -228,6 +228,6 @@ static inline void task_unlock(struct task_struct *p)
 	spin_unlock(&p->alloc_lock);
 }
 
-DEFINE_GUARD(task_lock, struct task_struct *, task_lock(_T), task_unlock(_T))
+DECLARE_GUARD(task_lock, struct task_struct *, task_lock(_T), task_unlock(_T))
 
 #endif /* _LINUX_SCHED_TASK_H */

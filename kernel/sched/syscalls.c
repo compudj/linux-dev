@@ -382,8 +382,8 @@ static struct task_struct *find_get_task(pid_t pid)
 	return p;
 }
 
-DEFINE_CLASS(find_get_task, struct task_struct *, if (_T) put_task_struct(_T),
-	     find_get_task(pid), pid_t pid)
+DECLARE_CLASS(find_get_task, struct task_struct *, if (_T) put_task_struct(_T),
+	      find_get_task(pid), pid_t pid)
 
 /*
  * sched_setparam() passes in -1 for its policy, to let the functions

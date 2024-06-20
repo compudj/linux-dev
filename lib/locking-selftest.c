@@ -2507,19 +2507,19 @@ static void fs_reclaim_tests(void)
 }
 
 /* Defines guard classes to create contexts */
-DEFINE_LOCK_GUARD_0(HARDIRQ, HARDIRQ_ENTER(), HARDIRQ_EXIT())
-DEFINE_LOCK_GUARD_0(NOTTHREADED_HARDIRQ,
+DECLARE_LOCK_GUARD_0(HARDIRQ, HARDIRQ_ENTER(), HARDIRQ_EXIT())
+DECLARE_LOCK_GUARD_0(NOTTHREADED_HARDIRQ,
 	do {
 		local_irq_disable();
 		__irq_enter();
 		WARN_ON(!in_irq());
 	} while(0), HARDIRQ_EXIT())
-DEFINE_LOCK_GUARD_0(SOFTIRQ, SOFTIRQ_ENTER(), SOFTIRQ_EXIT())
+DECLARE_LOCK_GUARD_0(SOFTIRQ, SOFTIRQ_ENTER(), SOFTIRQ_EXIT())
 
 /* Define RCU guards, should go away when RCU has its own guard definitions */
-DEFINE_LOCK_GUARD_0(RCU, rcu_read_lock(), rcu_read_unlock())
-DEFINE_LOCK_GUARD_0(RCU_BH, rcu_read_lock_bh(), rcu_read_unlock_bh())
-DEFINE_LOCK_GUARD_0(RCU_SCHED, rcu_read_lock_sched(), rcu_read_unlock_sched())
+DECLARE_LOCK_GUARD_0(RCU, rcu_read_lock(), rcu_read_unlock())
+DECLARE_LOCK_GUARD_0(RCU_BH, rcu_read_lock_bh(), rcu_read_unlock_bh())
+DECLARE_LOCK_GUARD_0(RCU_SCHED, rcu_read_lock_sched(), rcu_read_unlock_sched())
 
 
 #define GENERATE_2_CONTEXT_TESTCASE(outer, outer_lock, inner, inner_lock)	\
