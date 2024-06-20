@@ -17,6 +17,7 @@
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/cpumask.h>
+#include <linux/cleanup.h>
 #include <linux/rcupdate.h>
 #include <linux/tracepoint-defs.h>
 #include <linux/static_call.h>
@@ -195,6 +196,7 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
 #define __DO_TRACE(name, args, cond, rcuidle)				\
 	do {								\
 		int __maybe_unused __idx = 0;				\
+		DEFINE_INACTIVE_GUARD(preempt_notrace, myguard);	\
 									\
 		if (!(cond))						\
 			return;						\
@@ -204,7 +206,8 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
 			return;						\
 									\
 		/* keep srcu and sched-rcu usage consistent */		\
-		preempt_disable_notrace();				\
+		if (cond)						\
+			activate_guard(preempt_notrace, myguard)();	\
 									\
 		/*							\
 		 * For rcuidle callers, use srcu since sched-rcu	\
@@ -221,8 +224,6 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
 			ct_irq_exit_irqson();				\
 			srcu_read_unlock_notrace(&tracepoint_srcu, __idx);\
 		}							\
-									\
-		preempt_enable_notrace();				\
 	} while (0)
 
 #ifndef MODULE
