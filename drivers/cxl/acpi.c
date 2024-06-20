@@ -337,9 +337,9 @@ static int add_or_reset_cxl_resource(struct resource *parent, struct resource *r
 	return rc;
 }
 
-DEFINE_FREE(put_cxlrd, struct cxl_root_decoder *,
-	    if (!IS_ERR_OR_NULL(_T)) put_device(&_T->cxlsd.cxld.dev))
-DEFINE_FREE(del_cxl_resource, struct resource *, if (_T) del_cxl_resource(_T))
+DECLARE_FREE(put_cxlrd, struct cxl_root_decoder *,
+	     if (!IS_ERR_OR_NULL(_T)) put_device(&_T->cxlsd.cxld.dev))
+DECLARE_FREE(del_cxl_resource, struct resource *, if (_T) del_cxl_resource(_T))
 static int __cxl_parse_cfmws(struct acpi_cedt_cfmws *cfmws,
 			     struct cxl_cfmws_context *ctx)
 {

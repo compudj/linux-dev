@@ -123,6 +123,6 @@ static inline void get_nsproxy(struct nsproxy *ns)
 	refcount_inc(&ns->count);
 }
 
-DEFINE_FREE(put_nsproxy, struct nsproxy *, if (_T) put_nsproxy(_T))
+DECLARE_FREE(put_nsproxy, struct nsproxy *, if (_T) put_nsproxy(_T))
 
 #endif

@@ -26,7 +26,7 @@ static inline void path_put_init(struct path *path)
 
 /*
  * Cleanup macro for use with __free(path_put). Avoids dereference and
- * copying @path unlike DEFINE_FREE(). path_put() will handle the empty
+ * copying @path unlike DECLARE_FREE(). path_put() will handle the empty
  * path correctly just ensure @path is initialized:
  *
  * struct path path __free(path_put) = {};

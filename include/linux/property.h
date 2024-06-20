@@ -200,7 +200,7 @@ static inline void fwnode_handle_put(struct fwnode_handle *fwnode)
 	fwnode_call_void_op(fwnode, put);
 }
 
-DEFINE_FREE(fwnode_handle, struct fwnode_handle *, fwnode_handle_put(_T))
+DECLARE_FREE(fwnode_handle, struct fwnode_handle *, fwnode_handle_put(_T))
 
 int fwnode_irq_get(const struct fwnode_handle *fwnode, unsigned int index);
 int fwnode_irq_get_byname(const struct fwnode_handle *fwnode, const char *name);

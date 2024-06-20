@@ -1147,7 +1147,7 @@ rcu_head_after_call_rcu(struct rcu_head *rhp, rcu_callback_t f)
 extern int rcu_expedited;
 extern int rcu_normal;
 
-DEFINE_LOCK_GUARD_0(rcu,
+DECLARE_LOCK_GUARD_0(rcu,
 	do {
 		rcu_read_lock();
 		/*
