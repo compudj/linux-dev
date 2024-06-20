@@ -385,7 +385,7 @@ static void discard_dsmas(struct xarray *xa)
 	}
 	xa_destroy(xa);
 }
-DEFINE_FREE(dsmas, struct xarray *, if (_T) discard_dsmas(_T))
+DECLARE_FREE(dsmas, struct xarray *, if (_T) discard_dsmas(_T))
 
 void cxl_endpoint_parse_cdat(struct cxl_port *port)
 {

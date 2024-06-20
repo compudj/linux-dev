@@ -199,7 +199,7 @@ struct gpio_chip_guard {
 	int idx;
 };
 
-DEFINE_CLASS(gpio_chip_guard,
+DECLARE_CLASS(gpio_chip_guard,
 	     struct gpio_chip_guard,
 	     srcu_read_unlock(&_T.gdev->srcu, _T.idx),
 	     ({

@@ -83,7 +83,7 @@ static inline void fdput_pos(struct fd f)
 	fdput(f);
 }
 
-DEFINE_CLASS(fd, struct fd, fdput(_T), fdget(fd), int fd)
+DECLARE_CLASS(fd, struct fd, fdput(_T), fdget(fd), int fd)
 
 extern int f_dupfd(unsigned int from, struct file *file, unsigned flags);
 extern int replace_fd(unsigned fd, struct file *file, unsigned flags);
@@ -93,7 +93,7 @@ extern int __get_unused_fd_flags(unsigned flags, unsigned long nofile);
 extern int get_unused_fd_flags(unsigned flags);
 extern void put_unused_fd(unsigned int fd);
 
-DEFINE_CLASS(get_unused_fd, int, if (_T >= 0) put_unused_fd(_T),
+DECLARE_CLASS(get_unused_fd, int, if (_T >= 0) put_unused_fd(_T),
 	     get_unused_fd_flags(flags), unsigned flags)
 
 extern void fd_install(unsigned int fd, struct file *file);

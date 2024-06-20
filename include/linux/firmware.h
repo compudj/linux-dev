@@ -199,6 +199,6 @@ static inline void firmware_upload_unregister(struct fw_upload *fw_upload)
 
 int firmware_request_cache(struct device *device, const char *name);
 
-DEFINE_FREE(firmware, struct firmware *, release_firmware(_T))
+DECLARE_FREE(firmware, struct firmware *, release_firmware(_T))
 
 #endif

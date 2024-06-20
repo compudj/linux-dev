@@ -6439,7 +6439,7 @@ static void queue_core_balance(struct rq *rq)
 	queue_balance_callback(rq, &per_cpu(core_balance_head, rq->cpu), sched_core_balance);
 }
 
-DEFINE_LOCK_GUARD_1(core_lock, int,
+DECLARE_LOCK_GUARD_1(core_lock, int,
 		    sched_core_lock(*_T->lock, &_T->flags),
 		    sched_core_unlock(*_T->lock, &_T->flags),
 		    unsigned long flags)
@@ -7591,7 +7591,7 @@ static struct task_struct *find_get_task(pid_t pid)
 	return p;
 }
 
-DEFINE_CLASS(find_get_task, struct task_struct *, if (_T) put_task_struct(_T),
+DECLARE_CLASS(find_get_task, struct task_struct *, if (_T) put_task_struct(_T),
 	     find_get_task(pid), pid_t pid)
 
 /*

@@ -477,8 +477,8 @@ static __always_inline void preempt_enable_nested(void)
 		preempt_enable();
 }
 
-DEFINE_LOCK_GUARD_0(preempt, preempt_disable(), preempt_enable())
-DEFINE_LOCK_GUARD_0(preempt_notrace, preempt_disable_notrace(), preempt_enable_notrace())
-DEFINE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
+DECLARE_LOCK_GUARD_0(preempt, preempt_disable(), preempt_enable())
+DECLARE_LOCK_GUARD_0(preempt_notrace, preempt_disable_notrace(), preempt_enable_notrace())
+DECLARE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
 
 #endif /* __LINUX_PREEMPT_H */

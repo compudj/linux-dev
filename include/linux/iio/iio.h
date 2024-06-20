@@ -644,10 +644,10 @@ void iio_device_release_direct_mode(struct iio_dev *indio_dev);
  * This autocleanup logic is normally used via
  * iio_device_claim_direct_scoped().
  */
-DEFINE_GUARD(iio_claim_direct, struct iio_dev *, iio_device_claim_direct_mode(_T),
+DECLARE_GUARD(iio_claim_direct, struct iio_dev *, iio_device_claim_direct_mode(_T),
 	     iio_device_release_direct_mode(_T))
 
-DEFINE_GUARD_COND(iio_claim_direct, _try, ({
+DECLARE_GUARD_COND(iio_claim_direct, _try, ({
 			struct iio_dev *dev;
 			int d = iio_device_claim_direct_mode(_T);
 
