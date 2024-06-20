@@ -134,7 +134,7 @@ extern void __percpu *__alloc_percpu(size_t size, size_t align) __alloc_size(1);
 extern void free_percpu(void __percpu *__pdata);
 extern size_t pcpu_alloc_size(void __percpu *__pdata);
 
-DEFINE_FREE(free_percpu, void __percpu *, free_percpu(_T))
+DECLARE_FREE(free_percpu, void __percpu *, free_percpu(_T))
 
 extern phys_addr_t per_cpu_ptr_to_phys(void *addr);
 

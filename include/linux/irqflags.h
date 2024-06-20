@@ -256,8 +256,8 @@ extern void warn_bogus_irq_restore(void);
 
 #define irqs_disabled_flags(flags) raw_irqs_disabled_flags(flags)
 
-DEFINE_LOCK_GUARD_0(irq, local_irq_disable(), local_irq_enable())
-DEFINE_LOCK_GUARD_0(irqsave,
+DECLARE_LOCK_GUARD_0(irq, local_irq_disable(), local_irq_enable())
+DECLARE_LOCK_GUARD_0(irqsave,
 		    local_irq_save(_T->flags),
 		    local_irq_restore(_T->flags),
 		    unsigned long flags)

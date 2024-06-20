@@ -5,8 +5,8 @@
 #include <linux/compiler.h>
 
 /*
- * DEFINE_FREE(name, type, free):
- *	simple helper macro that defines the required wrapper for a __free()
+ * DECLARE_FREE(name, type, free):
+ *	simple helper macro that declares the required wrapper for a __free()
  *	based cleanup function. @free is an expression using '_T' to access the
  *	variable. @free should typically include a NULL test before calling a
  *	function, see the example below.
@@ -26,7 +26,7 @@
  *
  * Ex.
  *
- * DEFINE_FREE(kfree, void *, if (_T) kfree(_T))
+ * DECLARE_FREE(kfree, void *, if (_T) kfree(_T))
  *
  * void *alloc_obj(...)
  * {
@@ -40,7 +40,7 @@
  *	return_ptr(p);
  * }
  *
- * NOTE: the DEFINE_FREE()'s @free expression includes a NULL test even though
+ * NOTE: the DECLARE_FREE()'s @free expression includes a NULL test even though
  * kfree() is fine to be called with a NULL value. This is on purpose. This way
  * the compiler sees the end of our alloc_obj() function as:
  *
@@ -58,7 +58,7 @@
  * Without the NULL test it turns into a mess and the compiler can't help us.
  */
 
-#define DEFINE_FREE(_name, _type, _free) \
+#define DECLARE_FREE(_name, _type, _free) \
 	static inline void __free_##_name(void *p) { _type _T = *(_type *)p; _free; }
 
 #define __free(_name)	__cleanup(__free_##_name)
@@ -79,8 +79,8 @@ const volatile void * __must_check_fn(const volatile void *val)
 
 
 /*
- * DEFINE_CLASS(name, type, exit, init, init_args...):
- *	helper to define the destructor and constructor for a type.
+ * DECLARE_CLASS(name, type, exit, init, init_args...):
+ *	helper to declare the destructor and constructor for a type.
  *	@exit is an expression using '_T' -- similar to FREE above.
  *	@init is an expression in @init_args resulting in @type
  *
@@ -92,7 +92,7 @@ const volatile void * __must_check_fn(const volatile void *val)
  *
  * Ex.
  *
- * DEFINE_CLASS(fdget, struct fd, fdput(_T), fdget(fd), int fd)
+ * DECLARE_CLASS(fdget, struct fd, fdput(_T), fdget(fd), int fd)
  *
  *	CLASS(fdget, f)(fd);
  *	if (!f.file)
@@ -101,7 +101,7 @@ const volatile void * __must_check_fn(const volatile void *val)
  *	// use 'f' without concern
  */
 
-#define DEFINE_CLASS(_name, _type, _exit, _init, _init_args...)		\
+#define DECLARE_CLASS(_name, _type, _exit, _init, _init_args...)		\
 typedef _type class_##_name##_t;					\
 static inline void class_##_name##_destructor(_type *p)			\
 { _type _T = *p; _exit; }						\
@@ -121,11 +121,11 @@ static inline class_##_name##_t class_##_name##ext##_constructor(_init_args) \
 
 
 /*
- * DEFINE_GUARD(name, type, lock, unlock):
- *	trivial wrapper around DEFINE_CLASS() above specifically
+ * DECLARE_GUARD(name, type, lock, unlock):
+ *	trivial wrapper around DECLARE_CLASS() above specifically
  *	for locks.
  *
- * DEFINE_GUARD_COND(name, ext, condlock)
+ * DECLARE_GUARD_COND(name, ext, condlock)
  *	wrapper around EXTEND_CLASS above to add conditional lock
  *	variants to a base class, eg. mutex_trylock() or
  *	mutex_lock_interruptible().
@@ -148,12 +148,12 @@ static inline class_##_name##_t class_##_name##ext##_constructor(_init_args) \
  *
  */
 
-#define DEFINE_GUARD(_name, _type, _lock, _unlock) \
-	DEFINE_CLASS(_name, _type, if (_T) { _unlock; }, ({ _lock; _T; }), _type _T); \
+#define DECLARE_GUARD(_name, _type, _lock, _unlock) \
+	DECLARE_CLASS(_name, _type, if (_T) { _unlock; }, ({ _lock; _T; }), _type _T); \
 	static inline void * class_##_name##_lock_ptr(class_##_name##_t *_T) \
 	{ return *_T; }
 
-#define DEFINE_GUARD_COND(_name, _ext, _condlock) \
+#define DECLARE_GUARD_COND(_name, _ext, _condlock) \
 	EXTEND_CLASS(_name, _ext, \
 		     ({ void *_t = _T; if (_T && !(_condlock)) _t = NULL; _t; }), \
 		     class_##_name##_t _T) \
@@ -180,9 +180,9 @@ static inline class_##_name##_t class_##_name##ext##_constructor(_init_args) \
  * locks that don't have a native type (eg. RCU, preempt) or those that need a
  * 'fat' pointer (eg. spin_lock_irqsave).
  *
- * DEFINE_LOCK_GUARD_0(name, lock, unlock, ...)
- * DEFINE_LOCK_GUARD_1(name, type, lock, unlock, ...)
- * DEFINE_LOCK_GUARD_1_COND(name, ext, condlock)
+ * DECLARE_LOCK_GUARD_0(name, lock, unlock, ...)
+ * DECLARE_LOCK_GUARD_1(name, type, lock, unlock, ...)
+ * DECLARE_LOCK_GUARD_1_COND(name, ext, condlock)
  *
  * will result in the following type:
  *
@@ -195,7 +195,7 @@ static inline class_##_name##_t class_##_name##ext##_constructor(_init_args) \
  * be a pointer to the above struct.
  */
 
-#define __DEFINE_UNLOCK_GUARD(_name, _type, _unlock, ...)		\
+#define __DECLARE_UNLOCK_GUARD(_name, _type, _unlock, ...)		\
 typedef struct {							\
 	_type *lock;							\
 	__VA_ARGS__;							\
@@ -212,7 +212,7 @@ static inline void *class_##_name##_lock_ptr(class_##_name##_t *_T)	\
 }
 
 
-#define __DEFINE_LOCK_GUARD_1(_name, _type, _lock)			\
+#define __DECLARE_LOCK_GUARD_1(_name, _type, _lock)			\
 static inline class_##_name##_t class_##_name##_constructor(_type *l)	\
 {									\
 	class_##_name##_t _t = { .lock = l }, *_T = &_t;		\
@@ -220,7 +220,7 @@ static inline class_##_name##_t class_##_name##_constructor(_type *l)	\
 	return _t;							\
 }
 
-#define __DEFINE_LOCK_GUARD_0(_name, _lock)				\
+#define __DECLARE_LOCK_GUARD_0(_name, _lock)				\
 static inline class_##_name##_t class_##_name##_constructor(void)	\
 {									\
 	class_##_name##_t _t = { .lock = (void*)1 },			\
@@ -229,15 +229,15 @@ static inline class_##_name##_t class_##_name##_constructor(void)	\
 	return _t;							\
 }
 
-#define DEFINE_LOCK_GUARD_1(_name, _type, _lock, _unlock, ...)		\
-__DEFINE_UNLOCK_GUARD(_name, _type, _unlock, __VA_ARGS__)		\
-__DEFINE_LOCK_GUARD_1(_name, _type, _lock)
+#define DECLARE_LOCK_GUARD_1(_name, _type, _lock, _unlock, ...)		\
+__DECLARE_UNLOCK_GUARD(_name, _type, _unlock, __VA_ARGS__)		\
+__DECLARE_LOCK_GUARD_1(_name, _type, _lock)
 
-#define DEFINE_LOCK_GUARD_0(_name, _lock, _unlock, ...)			\
-__DEFINE_UNLOCK_GUARD(_name, void, _unlock, __VA_ARGS__)		\
-__DEFINE_LOCK_GUARD_0(_name, _lock)
+#define DECLARE_LOCK_GUARD_0(_name, _lock, _unlock, ...)			\
+__DECLARE_UNLOCK_GUARD(_name, void, _unlock, __VA_ARGS__)		\
+__DECLARE_LOCK_GUARD_0(_name, _lock)
 
-#define DEFINE_LOCK_GUARD_1_COND(_name, _ext, _condlock)		\
+#define DECLARE_LOCK_GUARD_1_COND(_name, _ext, _condlock)		\
 	EXTEND_CLASS(_name, _ext,					\
 		     ({ class_##_name##_t _t = { .lock = l }, *_T = &_t;\
 		        if (_T->lock && !(_condlock)) _T->lock = NULL;	\

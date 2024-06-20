@@ -1005,7 +1005,7 @@ static inline void device_unlock(struct device *dev)
 	mutex_unlock(&dev->mutex);
 }
 
-DEFINE_GUARD(device, struct device *, device_lock(_T), device_unlock(_T))
+DECLARE_GUARD(device, struct device *, device_lock(_T), device_unlock(_T))
 
 static inline void device_lock_assert(struct device *dev)
 {
@@ -1055,7 +1055,7 @@ void device_initialize(struct device *dev);
 int __must_check device_add(struct device *dev);
 void device_del(struct device *dev);
 
-DEFINE_FREE(device_del, struct device *, if (_T) device_del(_T))
+DECLARE_FREE(device_del, struct device *, if (_T) device_del(_T))
 
 int device_for_each_child(struct device *dev, void *data,
 			  int (*fn)(struct device *dev, void *data));
@@ -1224,7 +1224,7 @@ extern int (*platform_notify_remove)(struct device *dev);
 struct device *get_device(struct device *dev);
 void put_device(struct device *dev);
 
-DEFINE_FREE(put_device, struct device *, if (_T) put_device(_T))
+DECLARE_FREE(put_device, struct device *, if (_T) put_device(_T))
 
 bool kill_device(struct device *dev);
 
