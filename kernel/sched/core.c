@@ -11792,9 +11792,13 @@ void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t)
 	 * scenarios.
 	 *
 	 * It is not useful to clear the src cid when the number of threads is
-	 * greater or equal to the number of allowed cpus, because user-space
+	 * greater or equal to the number of CPUs allowed, because user-space
 	 * can expect that the number of allowed cids can reach the number of
-	 * allowed cpus.
+	 * CPUs allowed.
+	 *
+	 * This also prevents moving cid across NUMA nodes when the
+	 * number of threads is greater or equal to the number of
+	 * CPUs allowed.
 	 */
 	dst_pcpu_cid = per_cpu_ptr(mm->pcpu_cid, cpu_of(dst_rq));
 	dst_cid = READ_ONCE(dst_pcpu_cid->cid);
@@ -12053,7 +12057,7 @@ void sched_mm_cid_after_execve(struct task_struct *t)
 		 * Matches barrier in sched_mm_cid_remote_clear_old().
 		 */
 		smp_mb();
-		t->last_mm_cid = t->mm_cid = mm_cid_get(rq, mm);
+		t->last_mm_cid = t->mm_cid = mm_cid_get(rq, t, mm);
 	}
 	rseq_set_notify_resume(t);
 }

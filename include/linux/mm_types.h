@@ -19,6 +19,7 @@
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
+#include <linux/nodemask.h>
 
 #include <asm/mmu.h>
 
@@ -1154,6 +1155,59 @@ static inline cpumask_t *mm_cidmask(struct mm_struct *mm)
 	return (struct cpumask *)cid_bitmap;
 }
 
+#ifdef CONFIG_NUMA
+/*
+ * Layout of NUMA cidmasks:
+ * - node_alloc cidmask:        cpumask tracking which cids were
+ *                              allocated (across nodes) in this
+ *                              memory map.
+ * - node cidmask[nr_node_ids]: per-node cpumask tracking which cid
+ *                              were allocated in this memory map.
+ */
+static inline cpumask_t *mm_node_alloc_cidmask(struct mm_struct *mm)
+{
+	unsigned long cid_bitmap = (unsigned long)mm_cidmask(mm);
+
+	/* Skip mm_cidmask */
+	cid_bitmap += cpumask_size();
+	return (struct cpumask *)cid_bitmap;
+}
+
+static inline cpumask_t *mm_node_cidmask(struct mm_struct *mm, unsigned int node)
+{
+	unsigned long cid_bitmap = (unsigned long)mm_node_alloc_cidmask(mm);
+
+	/* Skip node alloc cidmask */
+	cid_bitmap += cpumask_size();
+	cid_bitmap += node * cpumask_size();
+	return (struct cpumask *)cid_bitmap;
+}
+
+static inline void mm_init_node_cidmask(struct mm_struct *mm)
+{
+	unsigned int node;
+
+	if (num_possible_nodes() == 1)
+		return;
+	cpumask_clear(mm_node_alloc_cidmask(mm));
+	for (node = 0; node < nr_node_ids; node++)
+		cpumask_clear(mm_node_cidmask(mm, node));
+}
+
+static inline unsigned int mm_node_cidmask_size(void)
+{
+	if (num_possible_nodes() == 1)
+		return 0;
+	return (nr_node_ids + 1) * cpumask_size();
+}
+#else /* CONFIG_NUMA */
+static inline void mm_init_node_cidmask(struct mm_struct *mm) { }
+static inline unsigned int mm_node_cidmask_size(void)
+{
+	return 0;
+}
+#endif /* CONFIG_NUMA */
+
 static inline void mm_init_cid(struct mm_struct *mm)
 {
 	int i;
@@ -1165,6 +1219,7 @@ static inline void mm_init_cid(struct mm_struct *mm)
 		pcpu_cid->time = 0;
 	}
 	cpumask_clear(mm_cidmask(mm));
+	mm_init_node_cidmask(mm);
 }
 
 static inline int mm_alloc_cid_noprof(struct mm_struct *mm)
@@ -1185,7 +1240,7 @@ static inline void mm_destroy_cid(struct mm_struct *mm)
 
 static inline unsigned int mm_cid_size(void)
 {
-	return cpumask_size();
+	return cpumask_size() + mm_node_cidmask_size();
 }
 #else /* CONFIG_SCHED_MM_CID */
 static inline void mm_init_cid(struct mm_struct *mm) { }
