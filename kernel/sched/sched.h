@@ -68,6 +68,7 @@
 #include <linux/wait_api.h>
 #include <linux/wait_bit.h>
 #include <linux/workqueue_api.h>
+#include <linux/nodemask.h>
 
 #include <trace/events/power.h>
 #include <trace/events/sched.h>
@@ -3311,12 +3312,10 @@ static inline void mm_cid_put(struct mm_struct *mm)
 	__mm_cid_put(mm, mm_cid_clear_lazy_put(cid));
 }
 
-static inline int __mm_cid_try_get(struct mm_struct *mm)
+static inline int __mm_cid_test_and_set_first(struct cpumask *cpumask)
 {
-	struct cpumask *cpumask;
 	int cid;
 
-	cpumask = mm_cidmask(mm);
 	/*
 	 * Retry finding first zero bit if the mask is temporarily
 	 * filled. This only happens during concurrent remote-clear
@@ -3333,9 +3332,123 @@ static inline int __mm_cid_try_get(struct mm_struct *mm)
 	return cid;
 }
 
+#ifdef CONFIG_NUMA
 /*
- * Save a snapshot of the current runqueue time of this cpu
- * with the per-cpu cid value, allowing to estimate how recently it was used.
+ * NUMA locality is preserved as long as the mm_cid range is restricted
+ * to the minimum between the number of CPUs allowed and the number of
+ * threads with references to the mm_struct.
+ */
+static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
+{
+	struct cpumask *cpumask = mm_cidmask(mm),
+		      *node_cpumask = mm_node_cidmask(mm, numa_node_id()),
+		      *node_alloc_cpumask = mm_node_alloc_cidmask(mm);
+	unsigned int node;
+	int cid;
+
+	if (num_possible_nodes() == 1)
+		return __mm_cid_test_and_set_first(cpumask);
+
+	/*
+	 * Try to reserve lowest available cid number within those
+	 * already reserved for this NUMA node.
+	 */
+	cid = cpumask_first_andnot(node_cpumask, cpumask);
+	if (cid >= t->nr_cpus_allowed || cid >= atomic_read(&mm->mm_users))
+		goto alloc_numa;
+	if (cpumask_test_and_set_cpu(cid, cpumask))
+		return -1;
+	goto end;
+
+alloc_numa:
+	/*
+	 * Try to reserve lowest available cid number within those not
+	 * already allocated for NUMA nodes.
+	 */
+	cid = cpumask_first_nor(node_alloc_cpumask, cpumask);
+	if (cid >= t->nr_cpus_allowed)
+		goto steal_overprovisioned_cid;
+	if (cid >= atomic_read(&mm->mm_users))
+		goto steal_first_available_cid;
+	if (cpumask_test_and_set_cpu(cid, cpumask))
+		return -1;
+	__cpumask_set_cpu(cid, node_cpumask);
+	__cpumask_set_cpu(cid, node_alloc_cpumask);
+	goto end;
+
+steal_overprovisioned_cid:
+	/*
+	 * Either the NUMA node id configuration changed for at least
+	 * one CPU in the system, or the scheduler migrated threads
+	 * across NUMA nodes, or the CPUs allowed mask changed. We need
+	 * to steal a currently unused cid. Userspace must handle the
+	 * fact that the node id associated with this cid may change.
+	 *
+	 * Try to steal an available cid number from an overprovisioned
+	 * NUMA node. A NUMA node is overprovisioned when more cids are
+	 * associated to it than the number of cores associated with
+	 * this NUMA node in the CPUs allowed mask. Stealing from
+	 * overprovisioned NUMA nodes ensures cid movement across NUMA
+	 * nodes stabilises after a configuration or CPUs allowed mask
+	 * change.
+	 */
+	for (node = 0; node < nr_node_ids; node++) {
+		struct cpumask *iter_cpumask;
+		int nr_allowed_cores;
+
+		if (node == numa_node_id())
+			continue;
+		iter_cpumask = mm_node_cidmask(mm, node);
+		nr_allowed_cores = cpumask_weight_and(cpumask_of_node(node), t->cpus_ptr);
+		if (cpumask_weight(iter_cpumask) <= nr_allowed_cores)
+			continue;
+		/* Try to steal from an overprovisioned NUMA node. */
+		cid = cpumask_first_andnot(iter_cpumask, cpumask);
+		if (cid >= t->nr_cpus_allowed || cid >= atomic_read(&mm->mm_users))
+			goto steal_first_available_cid;
+		if (cpumask_test_and_set_cpu(cid, cpumask))
+			return -1;
+		__cpumask_clear_cpu(cid, iter_cpumask);
+		__cpumask_set_cpu(cid, node_cpumask);
+		goto end;
+	}
+
+steal_first_available_cid:
+	/*
+	 * Steal the first available cid, without caring about NUMA
+	 * locality. This is needed when the scheduler migrates threads
+	 * across NUMA nodes, when those threads belong to processes
+	 * which have fewer threads than the number of CPUs allowed.
+	 */
+	cid = __mm_cid_test_and_set_first(cpumask);
+	if (cid < 0)
+		return -1;
+	/* Steal cid from its NUMA node mask. */
+	for (node = 0; node < nr_node_ids; node++) {
+		struct cpumask *iter_cpumask;
+
+		if (node == numa_node_id())
+			continue;
+		iter_cpumask = mm_node_cidmask(mm, node);
+		if (cpumask_test_cpu(cid, iter_cpumask)) {
+			__cpumask_clear_cpu(cid, iter_cpumask);
+			break;
+		}
+	}
+	__cpumask_set_cpu(cid, node_cpumask);
+end:
+	return cid;
+}
+#else
+static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
+{
+	return __mm_cid_test_and_set_first(mm_cidmask(mm));
+}
+#endif
+
+/*
+ * Save a snapshot of the current runqueue time of this CPU
+ * with the per-CPU cid value, allowing to estimate how recently it was used.
  */
 static inline void mm_cid_snapshot_time(struct rq *rq, struct mm_struct *mm)
 {
@@ -3345,7 +3458,8 @@ static inline void mm_cid_snapshot_time(struct rq *rq, struct mm_struct *mm)
 	WRITE_ONCE(pcpu_cid->time, rq->clock);
 }
 
-static inline int __mm_cid_get(struct rq *rq, struct mm_struct *mm)
+static inline int __mm_cid_get(struct rq *rq, struct task_struct *t,
+			       struct mm_struct *mm)
 {
 	int cid;
 
@@ -3355,13 +3469,13 @@ static inline int __mm_cid_get(struct rq *rq, struct mm_struct *mm)
 	 * guarantee forward progress.
 	 */
 	if (!READ_ONCE(use_cid_lock)) {
-		cid = __mm_cid_try_get(mm);
+		cid = __mm_cid_try_get(t, mm);
 		if (cid >= 0)
 			goto end;
 		raw_spin_lock(&cid_lock);
 	} else {
 		raw_spin_lock(&cid_lock);
-		cid = __mm_cid_try_get(mm);
+		cid = __mm_cid_try_get(t, mm);
 		if (cid >= 0)
 			goto unlock;
 	}
@@ -3381,7 +3495,7 @@ static inline int __mm_cid_get(struct rq *rq, struct mm_struct *mm)
 	 * all newcoming allocations observe the use_cid_lock flag set.
 	 */
 	do {
-		cid = __mm_cid_try_get(mm);
+		cid = __mm_cid_try_get(t, mm);
 		cpu_relax();
 	} while (cid < 0);
 	/*
@@ -3397,7 +3511,8 @@ end:
 	return cid;
 }
 
-static inline int mm_cid_get(struct rq *rq, struct mm_struct *mm)
+static inline int mm_cid_get(struct rq *rq, struct task_struct *t,
+			     struct mm_struct *mm)
 {
 	struct mm_cid __percpu *pcpu_cid = mm->pcpu_cid;
 	struct cpumask *cpumask;
@@ -3414,7 +3529,7 @@ static inline int mm_cid_get(struct rq *rq, struct mm_struct *mm)
 		if (try_cmpxchg(&this_cpu_ptr(pcpu_cid)->cid, &cid, MM_CID_UNSET))
 			__mm_cid_put(mm, mm_cid_clear_lazy_put(cid));
 	}
-	cid = __mm_cid_get(rq, mm);
+	cid = __mm_cid_get(rq, t, mm);
 	__this_cpu_write(pcpu_cid->cid, cid);
 	return cid;
 }
@@ -3467,7 +3582,7 @@ static inline void switch_mm_cid(struct rq *rq,
 		prev->mm_cid = -1;
 	}
 	if (next->mm_cid_active)
-		next->last_mm_cid = next->mm_cid = mm_cid_get(rq, next->mm);
+		next->last_mm_cid = next->mm_cid = mm_cid_get(rq, next, next->mm);
 }
 
 #else
