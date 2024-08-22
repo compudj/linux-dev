@@ -1340,6 +1340,9 @@ struct task_struct {
 	 * with respect to preemption.
 	 */
 	unsigned long rseq_event_mask;
+# ifdef CONFIG_DEBUG_RSEQ
+	struct rseq			rseq_fields;
+# endif
 #endif
 
 #ifdef CONFIG_SCHED_MM_CID
