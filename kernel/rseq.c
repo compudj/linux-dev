@@ -88,14 +88,31 @@
 static int rseq_update_cpu_node_id(struct task_struct *t)
 {
 	struct rseq __user *rseq = t->rseq;
-	u32 cpu_id = raw_smp_processor_id();
-	u32 node_id = cpu_to_node(cpu_id);
-	u32 mm_cid = task_mm_cid(t);
+	u32 cpu_id_start, cpu_id, node_id, mm_cid;
 
-	WARN_ON_ONCE((int) mm_cid < 0);
 	if (!user_write_access_begin(rseq, t->rseq_len))
 		goto efault;
-	unsafe_put_user(cpu_id, &rseq->cpu_id_start, efault_end);
+#ifdef CONFIG_DEBUG_RSEQ
+	/*
+	 * Validate fields which are required to be read-only by
+	 * user-space.
+	 */
+	unsafe_get_user(cpu_id_start, &rseq->cpu_id_start, efault_end);
+	unsafe_get_user(cpu_id, &rseq->cpu_id, efault_end);
+	unsafe_get_user(node_id, &rseq->node_id, efault_end);
+	unsafe_get_user(mm_cid, &rseq->mm_cid, efault_end);
+	if (cpu_id_start != t->rseq_fields.cpu_id_start ||
+	    cpu_id != t->rseq_fields.cpu_id ||
+	    node_id != t->rseq_fields.node_id ||
+	    mm_cid != t->rseq_fields.mm_cid)
+		goto efault_end;
+#endif
+	cpu_id_start = cpu_id = raw_smp_processor_id();
+	node_id = cpu_to_node(cpu_id);
+	mm_cid = task_mm_cid(t);
+	WARN_ON_ONCE((int) mm_cid < 0);
+
+	unsafe_put_user(cpu_id_start, &rseq->cpu_id_start, efault_end);
 	unsafe_put_user(cpu_id, &rseq->cpu_id, efault_end);
 	unsafe_put_user(node_id, &rseq->node_id, efault_end);
 	unsafe_put_user(mm_cid, &rseq->mm_cid, efault_end);
@@ -105,20 +122,46 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
 	 * t->rseq_len != ORIG_RSEQ_SIZE.
 	 */
 	user_write_access_end();
+#ifdef CONFIG_DEBUG_RSEQ
+	/* Save a copy of the values which are read-only in kernel space. */
+	t->rseq_fields.cpu_id_start = cpu_id_start;
+	t->rseq_fields.cpu_id = cpu_id;
+	t->rseq_fields.node_id = node_id;
+	t->rseq_fields.mm_cid = mm_cid;
+#endif
 	trace_rseq_update(t);
 	return 0;
 
 efault_end:
 	user_write_access_end();
 efault:
-	return -EFAULT;
+	return -1;
 }
 
 static int rseq_reset_rseq_cpu_node_id(struct task_struct *t)
 {
-	u32 cpu_id_start = 0, cpu_id = RSEQ_CPU_ID_UNINITIALIZED, node_id = 0,
-	    mm_cid = 0;
+	u32 cpu_id_start, cpu_id, node_id, mm_cid;
 
+#ifdef CONFIG_DEBUG_RSEQ
+	/*
+	 * Validate fields which are required to be read-only by
+	 * user-space.
+	 */
+	if (get_user(cpu_id_start, &t->rseq->cpu_id_start) ||
+	    get_user(cpu_id, &t->rseq->cpu_id) ||
+	    get_user(node_id, &t->rseq->node_id) ||
+	    get_user(mm_cid, &t->rseq->mm_cid))
+		return -EFAULT;
+	if (cpu_id_start != t->rseq_fields.cpu_id_start ||
+	    cpu_id != t->rseq_fields.cpu_id ||
+	    node_id != t->rseq_fields.node_id ||
+	    mm_cid != t->rseq_fields.mm_cid)
+		return -EINVAL;
+#endif
+	cpu_id_start = 0;
+	cpu_id = RSEQ_CPU_ID_UNINITIALIZED;
+	node_id = 0;
+	mm_cid = 0;
 	/*
 	 * Reset cpu_id_start to its initial state (0).
 	 */
@@ -141,6 +184,15 @@ static int rseq_reset_rseq_cpu_node_id(struct task_struct *t)
 	 */
 	if (put_user(mm_cid, &t->rseq->mm_cid))
 		return -EFAULT;
+#ifdef CONFIG_DEBUG_RSEQ
+	/*
+	 * Reset the in-kernel rseq fields copy.
+	 */
+	t->rseq_fields.cpu_id_start = cpu_id_start;
+	t->rseq_fields.cpu_id = cpu_id;
+	t->rseq_fields.node_id = node_id;
+	t->rseq_fields.mm_cid = mm_cid;
+#endif
 	/*
 	 * Additional feature fields added after ORIG_RSEQ_SIZE
 	 * need to be conditionally reset only if
@@ -423,6 +475,17 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
 	current->rseq = rseq;
 	current->rseq_len = rseq_len;
 	current->rseq_sig = sig;
+#ifdef CONFIG_DEBUG_RSEQ
+	/*
+	 * Initialize the in-kernel rseq fields copy for validation of
+	 * read-only fields.
+	 */
+	if (get_user(current->rseq_fields.cpu_id_start, &current->rseq->cpu_id_start) ||
+	    get_user(current->rseq_fields.cpu_id, &current->rseq->cpu_id) ||
+	    get_user(current->rseq_fields.node_id, &current->rseq->node_id) ||
+	    get_user(current->rseq_fields.mm_cid, &current->rseq->mm_cid))
+		return -EFAULT;
+#endif
 	/*
 	 * If rseq was previously inactive, and has just been
 	 * registered, ensure the cpu_id_start and cpu_id fields
