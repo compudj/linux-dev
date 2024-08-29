@@ -3356,8 +3356,11 @@ static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 	cid = cpumask_first_andnot(node_cpumask, cpumask);
 	if (cid >= t->nr_cpus_allowed || cid >= atomic_read(&mm->mm_users))
 		goto alloc_numa;
-	if (cpumask_test_and_set_cpu(cid, cpumask))
+	if (cpumask_test_and_set_cpu(cid, cpumask)) {
+		schedstat_inc(t->stats.nr_cid_failures);
 		return -1;
+	}
+	schedstat_inc(t->stats.nr_cid_already_reserved_success);
 	goto end;
 
 alloc_numa:
@@ -3370,10 +3373,13 @@ alloc_numa:
 		goto steal_overprovisioned_cid;
 	if (cid >= atomic_read(&mm->mm_users))
 		goto steal_first_available_cid;
-	if (cpumask_test_and_set_cpu(cid, cpumask))
+	if (cpumask_test_and_set_cpu(cid, cpumask)) {
+		schedstat_inc(t->stats.nr_cid_failures);
 		return -1;
+	}
 	__cpumask_set_cpu(cid, node_cpumask);
 	__cpumask_set_cpu(cid, node_alloc_cpumask);
+	schedstat_inc(t->stats.nr_cid_alloc_numa_success);
 	goto end;
 
 steal_overprovisioned_cid:
@@ -3406,10 +3412,13 @@ steal_overprovisioned_cid:
 		cid = cpumask_first_andnot(iter_cpumask, cpumask);
 		if (cid >= t->nr_cpus_allowed || cid >= atomic_read(&mm->mm_users))
 			goto steal_first_available_cid;
-		if (cpumask_test_and_set_cpu(cid, cpumask))
+		if (cpumask_test_and_set_cpu(cid, cpumask)) {
+			schedstat_inc(t->stats.nr_cid_failures);
 			return -1;
+		}
 		__cpumask_clear_cpu(cid, iter_cpumask);
 		__cpumask_set_cpu(cid, node_cpumask);
+		schedstat_inc(t->stats.nr_cid_steal_overprivisioned_success);
 		goto end;
 	}
 
@@ -3421,8 +3430,10 @@ steal_first_available_cid:
 	 * which have fewer threads than the number of CPUs allowed.
 	 */
 	cid = __mm_cid_test_and_set_first(cpumask);
-	if (cid < 0)
+	if (cid < 0) {
+		schedstat_inc(t->stats.nr_cid_failures);
 		return -1;
+	}
 	/* Steal cid from its NUMA node mask. */
 	for (node = 0; node < nr_node_ids; node++) {
 		struct cpumask *iter_cpumask;
@@ -3435,6 +3446,7 @@ steal_first_available_cid:
 			break;
 		}
 	}
+	schedstat_inc(t->stats.nr_cid_steal_first_success);
 	__cpumask_set_cpu(cid, node_cpumask);
 end:
 	return cid;

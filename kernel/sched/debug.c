@@ -1040,6 +1040,11 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 		P_SCHEDSTAT(nr_wakeups_affine_attempts);
 		P_SCHEDSTAT(nr_wakeups_passive);
 		P_SCHEDSTAT(nr_wakeups_idle);
+		P_SCHEDSTAT(nr_cid_already_reserved_success);
+		P_SCHEDSTAT(nr_cid_alloc_numa_success);
+		P_SCHEDSTAT(nr_cid_steal_overprivisioned_success);
+		P_SCHEDSTAT(nr_cid_steal_first_success);
+		P_SCHEDSTAT(nr_cid_failures);
 
 		avg_atom = p->se.sum_exec_runtime;
 		if (nr_switches)

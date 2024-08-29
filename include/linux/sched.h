@@ -527,6 +527,12 @@ struct sched_statistics {
 	u64				nr_wakeups_passive;
 	u64				nr_wakeups_idle;
 
+	u64				nr_cid_already_reserved_success;
+	u64				nr_cid_alloc_numa_success;
+	u64				nr_cid_steal_overprivisioned_success;
+	u64				nr_cid_steal_first_success;
+	u64				nr_cid_failures;
+
 #ifdef CONFIG_SCHED_CORE
 	u64				core_forceidle_sum;
 #endif
