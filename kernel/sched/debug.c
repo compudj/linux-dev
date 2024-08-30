@@ -1055,9 +1055,7 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 
 		SEQ_printf(m, "cid: node %d\n", numa_node_id());
 		SEQ_printf(m, "cid: mm_users %d\n", atomic_read(&p->mm->mm_users));
-		SEQ_printf(m, "cid: weight mm_cpumask() %d\n", cpumask_weight(mm_cpumask(p->mm)));
 		SEQ_printf(m, "cid: node cores %d\n", cpumask_weight(cpumask_of_node(numa_node_id())));
-		SEQ_printf(m, "cid: node&mm_cpumask %d\n", cpumask_weight_and(cpumask_of_node(numa_node_id()), mm_cpumask(p->mm)));
 		SEQ_printf(m, "cid: nr_cpu_ids %d\n", nr_cpu_ids);
 		SEQ_printf(m, "cid: weight node&online masks %d\n", cpumask_weight_and(cpumask_of_node(numa_node_id()), cpu_online_mask));
 		SEQ_printf(m, "cid: node_cid_weight %d\n", cpumask_weight(mm_node_cidmask(p->mm, numa_node_id())));

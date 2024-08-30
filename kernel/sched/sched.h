@@ -3343,8 +3343,6 @@ static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 	struct cpumask *cpumask = mm_cidmask(mm),
 		      *node_cpumask = mm_node_cidmask(mm, numa_node_id()),
 		      *node_alloc_cpumask = mm_node_alloc_cidmask(mm);
-	//int mm_cpumask_weight = cpumask_weight(mm_cpumask(mm));
-	int mm_cpumask_weight = nr_cpu_ids;
 	unsigned int node;
 	int cid;
 
@@ -3356,7 +3354,7 @@ static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 	 * already reserved for this NUMA node.
 	 */
 	cid = cpumask_first_andnot(node_cpumask, cpumask);
-	if (cid >= mm_cpumask_weight) {
+	if (cid >= nr_cpu_ids) {
 		schedstat_inc(t->stats.nr_cid_over_cpus_allowed1);
 		goto alloc_numa;
 	}
@@ -3377,7 +3375,7 @@ alloc_numa:
 	 * already allocated for NUMA nodes.
 	 */
 	cid = cpumask_first_nor(node_alloc_cpumask, cpumask);
-	if (cid >= mm_cpumask_weight) {
+	if (cid >= nr_cpu_ids) {
 		schedstat_inc(t->stats.nr_cid_over_cpus_allowed2);
 		goto steal_overprovisioned_cid;
 	}
@@ -3412,14 +3410,11 @@ steal_overprovisioned_cid:
 	 */
 	for (node = 0; node < nr_node_ids; node++) {
 		struct cpumask *iter_cpumask;
-		int nr_allowed_cores;
 
 		if (node == numa_node_id())
 			continue;
 		iter_cpumask = mm_node_cidmask(mm, node);
-		//nr_allowed_cores = cpumask_weight_and(cpumask_of_node(node), mm_cpumask(mm));
-		nr_allowed_cores = cpumask_weight_and(cpumask_of_node(node), cpu_online_mask);
-		if (cpumask_weight(iter_cpumask) <= nr_allowed_cores)
+		if (cpumask_weight(iter_cpumask) <= cpumask_weight(cpumask_of_node(node)))
 			continue;
 		/* Try to steal from an overprovisioned NUMA node. */
 		cid = cpumask_first_andnot(iter_cpumask, cpumask);
