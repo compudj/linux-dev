@@ -3343,6 +3343,8 @@ static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 	struct cpumask *cpumask = mm_cidmask(mm),
 		      *node_cpumask = mm_node_cidmask(mm, numa_node_id()),
 		      *node_alloc_cpumask = mm_node_alloc_cidmask(mm);
+	//int mm_cpumask_weight = cpumask_weight(mm_cpumask(mm));
+	int mm_cpumask_weight = nr_cpu_ids;
 	unsigned int node;
 	int cid;
 
@@ -3354,7 +3356,7 @@ static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 	 * already reserved for this NUMA node.
 	 */
 	cid = cpumask_first_andnot(node_cpumask, cpumask);
-	if (cid >= t->nr_cpus_allowed) {
+	if (cid >= mm_cpumask_weight) {
 		schedstat_inc(t->stats.nr_cid_over_cpus_allowed1);
 		goto alloc_numa;
 	}
@@ -3375,7 +3377,7 @@ alloc_numa:
 	 * already allocated for NUMA nodes.
 	 */
 	cid = cpumask_first_nor(node_alloc_cpumask, cpumask);
-	if (cid >= t->nr_cpus_allowed) {
+	if (cid >= mm_cpumask_weight) {
 		schedstat_inc(t->stats.nr_cid_over_cpus_allowed2);
 		goto steal_overprovisioned_cid;
 	}
@@ -3415,18 +3417,19 @@ steal_overprovisioned_cid:
 		if (node == numa_node_id())
 			continue;
 		iter_cpumask = mm_node_cidmask(mm, node);
-		nr_allowed_cores = cpumask_weight_and(cpumask_of_node(node), t->cpus_ptr);
+		//nr_allowed_cores = cpumask_weight_and(cpumask_of_node(node), mm_cpumask(mm));
+		nr_allowed_cores = cpumask_weight_and(cpumask_of_node(node), cpu_online_mask);
 		if (cpumask_weight(iter_cpumask) <= nr_allowed_cores)
 			continue;
 		/* Try to steal from an overprovisioned NUMA node. */
 		cid = cpumask_first_andnot(iter_cpumask, cpumask);
-		if (cid >= t->nr_cpus_allowed) {
+		if (cid >= mm_cpumask_weight) {
 			schedstat_inc(t->stats.nr_cid_over_cpus_allowed3);
-			goto steal_first_available_cid;
+			continue;
 		}
 		if (cid >= atomic_read(&mm->mm_users)) {
 			schedstat_inc(t->stats.nr_cid_over_mm_users3);
-			goto steal_first_available_cid;
+			continue;
 		}
 		if (cpumask_test_and_set_cpu(cid, cpumask)) {
 			schedstat_inc(t->stats.nr_cid_failures);
@@ -3465,6 +3468,8 @@ steal_first_available_cid:
 	}
 	schedstat_inc(t->stats.nr_cid_steal_first_success);
 	__cpumask_set_cpu(cid, node_cpumask);
+	if (!cpumask_test_cpu(cid, node_alloc_cpumask))
+		__cpumask_set_cpu(cid, node_alloc_cpumask);
 end:
 	return cid;
 }
