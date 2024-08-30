@@ -3418,7 +3418,7 @@ steal_overprovisioned_cid:
 			continue;
 		/* Try to steal from an overprovisioned NUMA node. */
 		cid = cpumask_first_andnot(iter_cpumask, cpumask);
-		if (cid >= mm_cpumask_weight) {
+		if (cid >= nr_cpu_ids) {
 			schedstat_inc(t->stats.nr_cid_over_cpus_allowed3);
 			continue;
 		}
