@@ -1040,9 +1040,16 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 		P_SCHEDSTAT(nr_wakeups_affine_attempts);
 		P_SCHEDSTAT(nr_wakeups_passive);
 		P_SCHEDSTAT(nr_wakeups_idle);
+		P_SCHEDSTAT(nr_cid_over_cpus_allowed1);
+		P_SCHEDSTAT(nr_cid_over_mm_users1);
 		P_SCHEDSTAT(nr_cid_already_reserved_success);
+		P_SCHEDSTAT(nr_cid_over_cpus_allowed2);
+		P_SCHEDSTAT(nr_cid_over_mm_users2);
 		P_SCHEDSTAT(nr_cid_alloc_numa_success);
-		P_SCHEDSTAT(nr_cid_steal_overprivisioned_success);
+		P_SCHEDSTAT(nr_cid_over_cpus_allowed2);
+		P_SCHEDSTAT(nr_cid_over_mm_users2);
+		P_SCHEDSTAT(nr_cid_steal_overprovisioned_success);
+		P_SCHEDSTAT(nr_cid_steal_overprovisioned_failures);
 		P_SCHEDSTAT(nr_cid_steal_first_success);
 		P_SCHEDSTAT(nr_cid_failures);
 

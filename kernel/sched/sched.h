@@ -3354,8 +3354,14 @@ static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 	 * already reserved for this NUMA node.
 	 */
 	cid = cpumask_first_andnot(node_cpumask, cpumask);
-	if (cid >= t->nr_cpus_allowed || cid >= atomic_read(&mm->mm_users))
+	if (cid >= t->nr_cpus_allowed) {
+		schedstat_inc(t->stats.nr_cid_over_cpus_allowed1);
 		goto alloc_numa;
+	}
+	if (cid >= atomic_read(&mm->mm_users)) {
+		schedstat_inc(t->stats.nr_cid_over_mm_users1);
+		goto alloc_numa;
+	}
 	if (cpumask_test_and_set_cpu(cid, cpumask)) {
 		schedstat_inc(t->stats.nr_cid_failures);
 		return -1;
@@ -3369,10 +3375,14 @@ alloc_numa:
 	 * already allocated for NUMA nodes.
 	 */
 	cid = cpumask_first_nor(node_alloc_cpumask, cpumask);
-	if (cid >= t->nr_cpus_allowed)
+	if (cid >= t->nr_cpus_allowed) {
+		schedstat_inc(t->stats.nr_cid_over_cpus_allowed2);
 		goto steal_overprovisioned_cid;
-	if (cid >= atomic_read(&mm->mm_users))
+	}
+	if (cid >= atomic_read(&mm->mm_users)) {
+		schedstat_inc(t->stats.nr_cid_over_mm_users2);
 		goto steal_first_available_cid;
+	}
 	if (cpumask_test_and_set_cpu(cid, cpumask)) {
 		schedstat_inc(t->stats.nr_cid_failures);
 		return -1;
@@ -3410,17 +3420,24 @@ steal_overprovisioned_cid:
 			continue;
 		/* Try to steal from an overprovisioned NUMA node. */
 		cid = cpumask_first_andnot(iter_cpumask, cpumask);
-		if (cid >= t->nr_cpus_allowed || cid >= atomic_read(&mm->mm_users))
+		if (cid >= t->nr_cpus_allowed) {
+			schedstat_inc(t->stats.nr_cid_over_cpus_allowed3);
 			goto steal_first_available_cid;
+		}
+		if (cid >= atomic_read(&mm->mm_users)) {
+			schedstat_inc(t->stats.nr_cid_over_mm_users3);
+			goto steal_first_available_cid;
+		}
 		if (cpumask_test_and_set_cpu(cid, cpumask)) {
 			schedstat_inc(t->stats.nr_cid_failures);
 			return -1;
 		}
 		__cpumask_clear_cpu(cid, iter_cpumask);
 		__cpumask_set_cpu(cid, node_cpumask);
-		schedstat_inc(t->stats.nr_cid_steal_overprivisioned_success);
+		schedstat_inc(t->stats.nr_cid_steal_overprovisioned_success);
 		goto end;
 	}
+	schedstat_inc(t->stats.nr_cid_steal_overprovisioned_failures);
 
 steal_first_available_cid:
 	/*

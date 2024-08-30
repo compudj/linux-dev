@@ -527,9 +527,16 @@ struct sched_statistics {
 	u64				nr_wakeups_passive;
 	u64				nr_wakeups_idle;
 
+	u64				nr_cid_over_cpus_allowed1;
+	u64				nr_cid_over_mm_users1;
 	u64				nr_cid_already_reserved_success;
+	u64				nr_cid_over_cpus_allowed2;
+	u64				nr_cid_over_mm_users2;
 	u64				nr_cid_alloc_numa_success;
-	u64				nr_cid_steal_overprivisioned_success;
+	u64				nr_cid_over_cpus_allowed3;
+	u64				nr_cid_over_mm_users3;
+	u64				nr_cid_steal_overprovisioned_success;
+	u64				nr_cid_steal_overprovisioned_failures;
 	u64				nr_cid_steal_first_success;
 	u64				nr_cid_failures;
 
