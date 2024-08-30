@@ -1046,8 +1046,8 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 		P_SCHEDSTAT(nr_cid_over_cpus_allowed2);
 		P_SCHEDSTAT(nr_cid_over_mm_users2);
 		P_SCHEDSTAT(nr_cid_alloc_numa_success);
-		P_SCHEDSTAT(nr_cid_over_cpus_allowed2);
-		P_SCHEDSTAT(nr_cid_over_mm_users2);
+		P_SCHEDSTAT(nr_cid_over_cpus_allowed3);
+		P_SCHEDSTAT(nr_cid_over_mm_users3);
 		P_SCHEDSTAT(nr_cid_steal_overprovisioned_success);
 		P_SCHEDSTAT(nr_cid_steal_overprovisioned_failures);
 		P_SCHEDSTAT(nr_cid_steal_first_success);
