@@ -2784,7 +2784,18 @@ __do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
 		put_prev_task(rq, p);
 
 	p->sched_class->set_cpus_allowed(p, ctx);
+	if (p->mm) {
+		struct cpumask *mm_allowed = mm_cpus_allowed(p->mm);
+		int cpu;
 
+		/*
+		 * The mm_cpus_allowed is the union of each thread allowed cpus
+		 * masks.
+		 */
+		for (cpu = 0; cpu < nr_cpu_ids;
+		     cpu = cpumask_next_andnot(cpu, ctx->new_mask, mm_allowed))
+			cpumask_set_cpu(cpu, mm_allowed);
+	}
 	if (queued)
 		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
 	if (running)

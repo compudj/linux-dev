@@ -1144,13 +1144,25 @@ static inline int mm_cid_clear_lazy_put(int cid)
 	return cid & ~MM_CID_LAZY_PUT;
 }
 
+/*
+ * mm_cpus_allowed:		union of all thread's allowed CPUs.
+ */
+static inline cpumask_t *mm_cpus_allowed(struct mm_struct *mm)
+{
+	unsigned long bitmap = (unsigned long)mm;
+
+	bitmap += offsetof(struct mm_struct, cpu_bitmap);
+	/* Skip cpu_bitmap */
+	bitmap += cpumask_size();
+	return (struct cpumask *)bitmap;
+}
+
 /* Accessor for struct mm_struct's cidmask. */
 static inline cpumask_t *mm_cidmask(struct mm_struct *mm)
 {
-	unsigned long cid_bitmap = (unsigned long)mm;
+	unsigned long cid_bitmap = (unsigned long)mm_cpus_allowed(mm);
 
-	cid_bitmap += offsetof(struct mm_struct, cpu_bitmap);
-	/* Skip cpu_bitmap */
+	/* Skip mm_cpus_allowed */
 	cid_bitmap += cpumask_size();
 	return (struct cpumask *)cid_bitmap;
 }
@@ -1218,6 +1230,7 @@ static inline void mm_init_cid(struct mm_struct *mm)
 		pcpu_cid->cid = MM_CID_UNSET;
 		pcpu_cid->time = 0;
 	}
+	cpumask_clear(mm_cpus_allowed(mm));
 	cpumask_clear(mm_cidmask(mm));
 	mm_init_node_cidmask(mm);
 }
@@ -1240,7 +1253,7 @@ static inline void mm_destroy_cid(struct mm_struct *mm)
 
 static inline unsigned int mm_cid_size(void)
 {
-	return cpumask_size() + mm_node_cidmask_size();
+	return (2 * cpumask_size()) + mm_node_cidmask_size();
 }
 #else /* CONFIG_SCHED_MM_CID */
 static inline void mm_init_cid(struct mm_struct *mm) { }
