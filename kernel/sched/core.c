@@ -11808,7 +11808,7 @@ void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t)
 {
 	struct mm_cid *src_pcpu_cid, *dst_pcpu_cid;
 	struct mm_struct *mm = t->mm;
-	int src_cid, dst_cid, src_cpu;
+	int src_cid, dst_cid, src_cpu, dst_node, src_node;
 	struct rq *src_rq;
 
 	lockdep_assert_rq_held(dst_rq);
@@ -11859,6 +11859,15 @@ void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t)
 	/* Move src_cid to dst cpu. */
 	mm_cid_snapshot_time(dst_rq, mm);
 	WRITE_ONCE(dst_pcpu_cid->cid, src_cid);
+	/* Move the NUMA bitmap allocation. */
+	src_node = cpu_to_node(cpu_of(src_rq));
+	dst_node = cpu_to_node(cpu_of(dst_rq));
+	if (src_node != dst_node) {
+		struct cpumask *src_node_cidmask = mm_node_cidmask(mm, src_node),
+				*dst_node_cidmask = mm_node_cidmask(mm, dst_node);
+		__cpumask_clear_cpu(src_cid, src_node_cidmask);
+		__cpumask_set_cpu(src_cid, dst_node_cidmask);
+	}
 }
 
 static void sched_mm_cid_remote_clear(struct mm_struct *mm, struct mm_cid *pcpu_cid,
