@@ -539,6 +539,8 @@ struct sched_statistics {
 	u64				nr_cid_steal_overprovisioned_failures;
 	u64				nr_cid_steal_first_success;
 	u64				nr_cid_failures;
+	u64				nr_cid_leak_lazy;
+	u64				nr_cid_leak;
 
 #ifdef CONFIG_SCHED_CORE
 	u64				core_forceidle_sum;

@@ -2795,6 +2795,7 @@ __do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
 		for (cpu = 0; cpu < nr_cpu_ids;
 		     cpu = cpumask_next_andnot(cpu, ctx->new_mask, mm_allowed))
 			cpumask_set_cpu(cpu, mm_allowed);
+		WRITE_ONCE(p->mm->nr_cpus_allowed, cpumask_weight(mm_allowed));
 	}
 	if (queued)
 		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
@@ -11840,7 +11841,7 @@ void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t)
 	dst_pcpu_cid = per_cpu_ptr(mm->pcpu_cid, cpu_of(dst_rq));
 	dst_cid = READ_ONCE(dst_pcpu_cid->cid);
 	if (!mm_cid_is_unset(dst_cid) &&
-	    atomic_read(&mm->mm_users) >= t->nr_cpus_allowed)
+	    atomic_read(&mm->mm_users) >= mm->nr_cpus_allowed)
 		return;
 	src_pcpu_cid = per_cpu_ptr(mm->pcpu_cid, src_cpu);
 	src_rq = cpu_rq(src_cpu);

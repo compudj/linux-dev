@@ -1040,6 +1040,8 @@ static int exec_mmap(struct mm_struct *mm)
 	tsk->active_mm = mm;
 	tsk->mm = mm;
 	mm_init_cid(mm);
+	cpumask_copy(mm_cpus_allowed(mm), tsk->cpus_ptr);
+	mm->nr_cpus_allowed = tsk->nr_cpus_allowed;
 	/*
 	 * This prevents preemption while active_mm is being loaded and
 	 * it and mm are being updated, which could cause problems for

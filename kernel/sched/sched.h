@@ -3323,6 +3323,7 @@ static inline int __mm_cid_test_and_set_first(struct cpumask *cpumask)
 	 */
 	for (;;) {
 		cid = cpumask_first_zero(cpumask);
+		//TODO: try to use mm allowed mask
 		if (cid < nr_cpu_ids)
 			break;
 		cpu_relax();
@@ -3343,18 +3344,38 @@ static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 	struct cpumask *cpumask = mm_cidmask(mm),
 		      *node_cpumask = mm_node_cidmask(mm, numa_node_id()),
 		      *node_alloc_cpumask = mm_node_alloc_cidmask(mm);
+	int cid, nr_cpus_allowed;
+	int retry_nr = 0;
 	unsigned int node;
-	int cid;
+	struct mm_cid __percpu *pcpu_cid = mm->pcpu_cid;
 
 	if (num_possible_nodes() == 1)
 		return __mm_cid_test_and_set_first(cpumask);
 
+	cid = __this_cpu_read(pcpu_cid->cid);
+	if (!mm_cid_is_unset(cid)) {
+		if (mm_cid_is_valid(cid))
+			schedstat_inc(t->stats.nr_cid_leak);
+		else
+			schedstat_inc(t->stats.nr_cid_leak_lazy);
+	}
+retry:
+	nr_cpus_allowed = READ_ONCE(mm->nr_cpus_allowed);
+#if 0
+	if (retry_nr > 1) {
+		trace_printk("cid: cpumask_first_andnot %d\n", cpumask_first_andnot(node_cpumask, cpumask));
+		trace_printk("cid: nr_cpus_allowed %d\n", nr_cpus_allowed);
+		trace_printk("cid: cpumask weight %d\n", cpumask_weight(cpumask));
+		trace_printk("cid: cpumask_first_nor %d\n", cpumask_first_nor(node_alloc_cpumask, cpumask));
+		goto steal_first_available_cid;
+	}
+#endif
 	/*
 	 * Try to reserve lowest available cid number within those
 	 * already reserved for this NUMA node.
 	 */
 	cid = cpumask_first_andnot(node_cpumask, cpumask);
-	if (cid >= nr_cpu_ids) {
+	if (cid >= nr_cpus_allowed) {
 		schedstat_inc(t->stats.nr_cid_over_cpus_allowed1);
 		goto alloc_numa;
 	}
@@ -3375,7 +3396,14 @@ alloc_numa:
 	 * already allocated for NUMA nodes.
 	 */
 	cid = cpumask_first_nor(node_alloc_cpumask, cpumask);
-	if (cid >= nr_cpu_ids) {
+	if (cid >= nr_cpus_allowed) {
+#if 0
+		if (cpumask_weight_and(node_cpumask, cpumask) >= cpumask_weight_and(cpumask_of_node(node), mm_cpus_allowed(mm))) {
+			cpu_relax();
+			retry_nr++;
+			goto retry;
+		}
+#endif
 		schedstat_inc(t->stats.nr_cid_over_cpus_allowed2);
 		goto steal_overprovisioned_cid;
 	}
@@ -3414,11 +3442,11 @@ steal_overprovisioned_cid:
 		if (node == numa_node_id())
 			continue;
 		iter_cpumask = mm_node_cidmask(mm, node);
-		if (cpumask_weight(iter_cpumask) <= cpumask_weight(cpumask_of_node(node)))
+		if (cpumask_weight(iter_cpumask) <= cpumask_weight_and(cpumask_of_node(node), mm_cpus_allowed(mm)))
 			continue;
 		/* Try to steal from an overprovisioned NUMA node. */
 		cid = cpumask_first_andnot(iter_cpumask, cpumask);
-		if (cid >= nr_cpu_ids) {
+		if (cid >= nr_cpus_allowed) {
 			schedstat_inc(t->stats.nr_cid_over_cpus_allowed3);
 			continue;
 		}

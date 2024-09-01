@@ -1052,15 +1052,19 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 		P_SCHEDSTAT(nr_cid_steal_overprovisioned_failures);
 		P_SCHEDSTAT(nr_cid_steal_first_success);
 		P_SCHEDSTAT(nr_cid_failures);
+		P_SCHEDSTAT(nr_cid_leak_lazy);
+		P_SCHEDSTAT(nr_cid_leak);
 
-		SEQ_printf(m, "cid: node %d\n", numa_node_id());
+		SEQ_printf(m, "cid: node %d\n", task_node(p));
 		SEQ_printf(m, "cid: mm_users %d\n", atomic_read(&p->mm->mm_users));
-		SEQ_printf(m, "cid: node cores %d\n", cpumask_weight(cpumask_of_node(numa_node_id())));
+		SEQ_printf(m, "cid: node cores %d\n", cpumask_weight(cpumask_of_node(task_node(p))));
 		SEQ_printf(m, "cid: nr_cpu_ids %d\n", nr_cpu_ids);
-		SEQ_printf(m, "cid: weight node&online masks %d\n", cpumask_weight_and(cpumask_of_node(numa_node_id()), cpu_online_mask));
-		SEQ_printf(m, "cid: node_cid_weight %d\n", cpumask_weight(mm_node_cidmask(p->mm, numa_node_id())));
+		SEQ_printf(m, "cid: weight node&online masks %d\n", cpumask_weight_and(cpumask_of_node(task_node(p)), cpu_online_mask));
+		SEQ_printf(m, "cid: node_cid_weight %d\n", cpumask_weight(mm_node_cidmask(p->mm, task_node(p))));
 		SEQ_printf(m, "cid: cidmask_weight %d\n", cpumask_weight(mm_cidmask(p->mm)));
 		SEQ_printf(m, "cid: node_alloc_cid_weight %d\n", cpumask_weight(mm_node_alloc_cidmask(p->mm)));
+		SEQ_printf(m, "cid: weight mm_cpus_allowed %d\n", cpumask_weight(mm_cpus_allowed(p->mm)));
+		SEQ_printf(m, "cid: mm nr_cpus_allowed %d\n", p->mm->nr_cpus_allowed);
 
 		avg_atom = p->se.sum_exec_runtime;
 		if (nr_switches)

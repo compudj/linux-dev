@@ -1301,6 +1301,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	if (mm_alloc_cid(mm))
 		goto fail_cid;
 
+	cpumask_copy(mm_cpus_allowed(mm), p->cpus_ptr);
+	mm->nr_cpus_allowed = p->nr_cpus_allowed;
+
 	if (percpu_counter_init_many(mm->rss_stat, 0, GFP_KERNEL_ACCOUNT,
 				     NR_MM_COUNTERS))
 		goto fail_pcpu;
