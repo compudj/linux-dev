@@ -3353,7 +3353,7 @@ static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 	used = atomic_read(&mm->nr_cids_used);
 retry:
 	if (used < cpumask_weight(mm_cpus_allowed(mm)) &&
-	    used < mm->mm_users) {
+	    used < atomic_read(&mm->mm_users)) {
 		old_used = used;
 		used = atomic_cmpxchg(&mm->nr_cids_used, old_used, old_used + 1);
 		if (used != old_used) {

@@ -11809,7 +11809,7 @@ void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t)
 {
 	struct mm_cid *src_pcpu_cid, *dst_pcpu_cid;
 	struct mm_struct *mm = t->mm;
-	int src_cid, dst_cid, src_cpu, dst_node, src_node;
+	int src_cid, dst_cid, src_cpu;
 	struct rq *src_rq;
 
 	lockdep_assert_rq_held(dst_rq);
