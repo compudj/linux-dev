@@ -3335,16 +3335,14 @@ static inline int __mm_cid_test_and_set_first(struct cpumask *cpumask)
 
 static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 {
-	struct mm_cid __percpu *pcpu_cid = mm->pcpu_cid;
-	int cid = READ_ONCE(pcpu_cid->recent_cid);
 	struct cpumask *cidmask = mm_cidmask(mm);
+	struct mm_cid __percpu *pcpu_cid = mm->pcpu_cid;
+	int cid = __this_cpu_read(pcpu_cid->recent_cid);
 	int used, old_used;
 
 	/* Try to re-use recent cid. This improves cache locality. */
-	if (!mm_cid_is_unset(cid)) {
-		if (!cpumask_test_and_set_cpu(cid, cidmask))
-			return cid;
-	}
+	if (!mm_cid_is_unset(cid) && !cpumask_test_and_set_cpu(cid, cidmask))
+		return cid;
 	/*
 	 * Expand cid allocation if used cids are below the number cpus
 	 * allowed and number of threads. Expanding cid allocation as
@@ -3352,13 +3350,12 @@ static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 	 */
 	used = atomic_read(&mm->nr_cids_used);
 retry:
-	if (used < cpumask_weight(mm_cpus_allowed(mm)) &&
+	if (used < READ_ONCE(mm->nr_cpus_allowed) &&
 	    used < atomic_read(&mm->mm_users)) {
 		old_used = used;
 		used = atomic_cmpxchg(&mm->nr_cids_used, old_used, old_used + 1);
-		if (used != old_used) {
+		if (used != old_used)
 			goto retry;
-		}
 		cid = old_used;
 		if (!cpumask_test_and_set_cpu(cid, cidmask))
 			return cid;
