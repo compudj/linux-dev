@@ -828,6 +828,7 @@ struct mm_struct {
 		 */
 		unsigned long mm_cid_next_scan;
 		int nr_cpus_allowed;
+		atomic_t nr_cids_used;
 #endif
 #ifdef CONFIG_MMU
 		atomic_long_t pgtables_bytes;	/* size of all page tables */
@@ -1182,6 +1183,7 @@ static inline void mm_init_cid(struct mm_struct *mm)
 	}
 	cpumask_clear(mm_cpus_allowed(mm));
 	cpumask_clear(mm_cidmask(mm));
+	atomic_set(&mm->nr_cids_used, 0);
 }
 
 static inline int mm_alloc_cid_noprof(struct mm_struct *mm)
