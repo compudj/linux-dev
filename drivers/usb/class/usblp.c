@@ -132,6 +132,7 @@ struct usblp {
 	struct usb_device	*dev;			/* USB device */
 	struct mutex		wmut;
 	struct mutex		mut;
+	struct hpref_node	hpref_node;
 	spinlock_t		lock;		/* locks rcomplete, wcomplete */
 	char			*readbuf;		/* read transfer_buffer */
 	char			*statusbuf;		/* status transfer_buffer */
@@ -241,7 +242,6 @@ static int usblp_cache_device_id_string(struct usblp *usblp);
 
 /* forward reference to make our lives easier */
 static struct usb_driver usblp_driver;
-static DEFINE_MUTEX(usblp_mutex);	/* locks the existence of usblp's */
 
 /*
  * Functions for usblp control messages.
@@ -409,19 +409,21 @@ static int usblp_open(struct inode *inode, struct file *file)
 	int minor = iminor(inode);
 	struct usblp *usblp;
 	struct usb_interface *intf;
+	struct hpref_node *node;
 	int retval;
 
 	if (minor < 0)
 		return -ENODEV;
 
-	mutex_lock(&usblp_mutex);
-
 	retval = -ENODEV;
 	intf = usb_find_interface(&usblp_driver, minor);
 	if (!intf)
 		goto out;
-	usblp = usb_get_intfdata(intf);
-	if (!usblp || !usblp->dev || !usblp->present)
+	node = usb_hpref_intfdata_hp_refcount_inc(intf);
+	if (!node)
+		goto out;
+	usblp = container_of(node, struct usblp, hpref_node);
+	if (!usblp->dev || !usblp->present)
 		goto out;
 
 	retval = -EBUSY;
@@ -451,14 +453,15 @@ static int usblp_open(struct inode *inode, struct file *file)
 		retval = -EIO;
 	}
 out:
-	mutex_unlock(&usblp_mutex);
+	hpref_refcount_dec(node);
 	return retval;
 }
 
-static void usblp_cleanup(struct usblp *usblp)
+static void release_node(struct hpref_node *node)
 {
-	printk(KERN_INFO "usblp%d: removed\n", usblp->minor);
+	struct usblp *usblp = container_of(node, struct usblp, hpref_node);
 
+	printk(KERN_INFO "usblp%d: removed\n", usblp->minor);
 	kfree(usblp->readbuf);
 	kfree(usblp->device_id_string);
 	kfree(usblp->statusbuf);
@@ -477,7 +480,6 @@ static int usblp_release(struct inode *inode, struct file *file)
 
 	usblp->flags &= ~LP_ABORT;
 
-	mutex_lock(&usblp_mutex);
 	usblp->used = 0;
 	if (usblp->present)
 		usblp_unlink_urbs(usblp);
@@ -485,9 +487,8 @@ static int usblp_release(struct inode *inode, struct file *file)
 	usb_autopm_put_interface(usblp->intf);
 
 	if (!usblp->present)		/* finish cleanup from disconnect */
-		usblp_cleanup(usblp);	/* any URBs must be dead */
+		hpref_refcount_dec(&usblp->hpref_node);
 
-	mutex_unlock(&usblp_mutex);
 	return 0;
 }
 
@@ -1105,7 +1106,7 @@ static struct usb_class_driver usblp_class = {
 static ssize_t ieee1284_id_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct usb_interface *intf = to_usb_interface(dev);
-	struct usblp *usblp = usb_get_intfdata(intf);
+	struct usblp *usblp = container_of(usb_get_hpref_intfdata(intf), struct usblp, hpref_node);
 
 	if (usblp->device_id_string[0] == 0 &&
 	    usblp->device_id_string[1] == 0)
@@ -1201,7 +1202,8 @@ static int usblp_probe(struct usb_interface *intf,
 	usblp_check_status(usblp, 0);
 #endif
 
-	usb_set_intfdata(intf, usblp);
+	hpref_node_init(&usblp->hpref_node, release_node);
+	usb_set_hpref_intfdata(intf, &usblp->hpref_node);
 
 	usblp->present = 1;
 
@@ -1225,7 +1227,8 @@ static int usblp_probe(struct usb_interface *intf,
 	return 0;
 
 abort_intfdata:
-	usb_set_intfdata(intf, NULL);
+	/* Abort before any HP can observe the pointer, just set to NULL. */
+	usb_set_hpref_intfdata(intf, NULL);
 abort:
 	kfree(usblp->readbuf);
 	kfree(usblp->statusbuf);
@@ -1391,35 +1394,35 @@ static int usblp_cache_device_id_string(struct usblp *usblp)
 
 static void usblp_disconnect(struct usb_interface *intf)
 {
-	struct usblp *usblp = usb_get_intfdata(intf);
+	struct usblp *usblp = NULL;
+	struct hpref_node *node;
 
 	usb_deregister_dev(intf, &usblp_class);
 
+	node = usb_get_hpref_intfdata(intf);
+	if (node)
+		usblp = container_of(node, struct usblp, hpref_node);
 	if (!usblp || !usblp->dev) {
 		dev_err(&intf->dev, "bogus disconnect\n");
 		BUG();
 	}
 
-	mutex_lock(&usblp_mutex);
 	mutex_lock(&usblp->mut);
 	usblp->present = 0;
 	wake_up(&usblp->wwait);
 	wake_up(&usblp->rwait);
-	usb_set_intfdata(intf, NULL);
 
 	usblp_unlink_urbs(usblp);
 	mutex_unlock(&usblp->mut);
 	usb_poison_anchored_urbs(&usblp->urbs);
 
 	if (!usblp->used)
-		usblp_cleanup(usblp);
-
-	mutex_unlock(&usblp_mutex);
+		usb_clear_hpref_intfdata(intf);
 }
 
 static int usblp_suspend(struct usb_interface *intf, pm_message_t message)
 {
-	struct usblp *usblp = usb_get_intfdata(intf);
+	struct usblp *usblp = container_of(usb_get_hpref_intfdata(intf), struct usblp, hpref_node);
 
 	usblp_unlink_urbs(usblp);
 #if 0 /* XXX Do we want this? What if someone is reading, should we fail? */
@@ -1433,7 +1436,7 @@ static int usblp_suspend(struct usb_interface *intf, pm_message_t message)
 
 static int usblp_resume(struct usb_interface *intf)
 {
-	struct usblp *usblp = usb_get_intfdata(intf);
+	struct usblp *usblp = container_of(usb_get_hpref_intfdata(intf), struct usblp, hpref_node);
 	int r;
 
 	r = handle_bidir(usblp);

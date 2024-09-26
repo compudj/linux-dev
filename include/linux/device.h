@@ -31,6 +31,7 @@
 #include <linux/device/class.h>
 #include <linux/device/driver.h>
 #include <linux/cleanup.h>
+#include <linux/hpref.h>
 #include <asm/device.h>
 
 struct device;
@@ -732,6 +733,7 @@ struct device {
 					   core doesn't touch it */
 	void		*driver_data;	/* Driver data, set and get with
 					   dev_set_drvdata/dev_get_drvdata */
+	struct hpref_node *hpref_driver_data; /* Driver data protected with hpref. */
 	struct mutex		mutex;	/* mutex to synchronize calls to
 					 * its driver.
 					 */
@@ -938,6 +940,31 @@ static inline void *dev_get_drvdata(const struct device *dev)
 static inline void dev_set_drvdata(struct device *dev, void *data)
 {
 	dev->driver_data = data;
+}
+
+static inline struct hpref_node *dev_hpref_drvdata_hp_refcount_inc(const struct device *dev)
+{
+	return hpref_hp_refcount_inc(&dev->hpref_driver_data);
+}
+
+/* Getter when driver data is guaranteed to exist. */
+static inline struct hpref_node *dev_get_hpref_drvdata(const struct device *dev)
+{
+	return dev->hpref_driver_data;
+}
+
+static inline void dev_set_hpref_drvdata(struct device *dev, struct hpref_node *hpref_driver_data)
+{
+	rcu_assign_pointer(dev->hpref_driver_data, hpref_driver_data);
+}
+
+static inline void dev_clear_hpref_drvdata(struct device *dev)
+{
+	struct hpref_node *node = dev->hpref_driver_data;
+
+	rcu_assign_pointer(dev->hpref_driver_data, NULL);
+	hpref_synchronize(node);
+	hpref_refcount_dec(node);
 }
 
 static inline struct pm_subsys_data *dev_to_psd(struct device *dev)

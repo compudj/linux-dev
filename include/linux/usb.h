@@ -293,6 +293,27 @@ static inline void usb_set_intfdata(struct usb_interface *intf, void *data)
 	dev_set_drvdata(&intf->dev, data);
 }
 
+static inline struct hpref_node *usb_hpref_intfdata_hp_refcount_inc(struct usb_interface *intf)
+{
+	return dev_hpref_drvdata_hp_refcount_inc(&intf->dev);
+}
+
+/* Getter when intfdata is guaranteed to exist. */
+static inline struct hpref_node *usb_get_hpref_intfdata(struct usb_interface *intf)
+{
+	return dev_get_hpref_drvdata(&intf->dev);
+}
+
+static inline void usb_set_hpref_intfdata(struct usb_interface *intf, struct hpref_node *node)
+{
+	dev_set_hpref_drvdata(&intf->dev, node);
+}
+
+static inline void usb_clear_hpref_intfdata(struct usb_interface *intf)
+{
+	dev_clear_hpref_drvdata(&intf->dev);
+}
+
 struct usb_interface *usb_get_intf(struct usb_interface *intf);
 void usb_put_intf(struct usb_interface *intf);
 
