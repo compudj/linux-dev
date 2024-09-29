@@ -926,6 +926,8 @@ struct task_struct {
 	unsigned short			migration_disabled;
 	unsigned short			migration_flags;
 
+	struct hlist_head		hazptr_ctx_list;
+
 #ifdef CONFIG_PREEMPT_RCU
 	int				rcu_read_lock_nesting;
 	union rcu_special		rcu_read_unlock_special;

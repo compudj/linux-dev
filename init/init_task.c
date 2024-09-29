@@ -154,6 +154,7 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 	.perf_event_mutex = __MUTEX_INITIALIZER(init_task.perf_event_mutex),
 	.perf_event_list = LIST_HEAD_INIT(init_task.perf_event_list),
 #endif
+	.hazptr_ctx_list = HLIST_HEAD_INIT,
 #ifdef CONFIG_PREEMPT_RCU
 	.rcu_read_lock_nesting = 0,
 	.rcu_read_unlock_special.s = 0,
