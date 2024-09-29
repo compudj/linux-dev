@@ -16,7 +16,7 @@
 #include <linux/debug_locks.h>
 #include <linux/rtmutex.h>
 #include <linux/sched/wake_q.h>
-
+#include <linux/hpref.h>
 
 /*
  * This is a helper for the struct rt_mutex_waiter below. A waiter goes in two
@@ -52,6 +52,7 @@ struct rt_waiter_node {
 struct rt_mutex_waiter {
 	struct rt_waiter_node	tree;
 	struct rt_waiter_node	pi_tree;
+	struct hpref_node	hpref_node;
 	struct task_struct	*task;
 	struct rt_mutex_base	*lock;
 	unsigned int		wake_state;
@@ -208,6 +209,13 @@ static inline void debug_rt_mutex_free_waiter(struct rt_mutex_waiter *waiter)
 		memset(waiter, 0x22, sizeof(*waiter));
 }
 
+static inline void rt_mutex_release(struct hpref_node *node)
+{
+	struct rt_mutex_waiter *waiter = container_of(node, struct rt_mutex_waiter, hpref_node);
+
+	//TODO
+}
+
 static inline void rt_mutex_init_waiter(struct rt_mutex_waiter *waiter)
 {
 	debug_rt_mutex_init_waiter(waiter);
@@ -215,6 +223,7 @@ static inline void rt_mutex_init_waiter(struct rt_mutex_waiter *waiter)
 	RB_CLEAR_NODE(&waiter->tree.entry);
 	waiter->wake_state = TASK_NORMAL;
 	waiter->task = NULL;
+	hpref_node_init(&waiter->hpref_node, rt_mutex_release);
 }
 
 static inline void rt_mutex_init_rtlock_waiter(struct rt_mutex_waiter *waiter)

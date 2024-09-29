@@ -681,6 +681,7 @@ static int __sched rt_mutex_adjust_prio_chain(struct task_struct *task,
 {
 	struct rt_mutex_waiter *waiter, *top_waiter = orig_waiter;
 	struct rt_mutex_waiter *prerequeue_top_waiter;
+	struct hpref_hp waiter_hp;
 	int ret = 0, depth = 0;
 	struct rt_mutex_base *lock;
 	bool detect_deadlock;
@@ -722,16 +723,25 @@ static int __sched rt_mutex_adjust_prio_chain(struct task_struct *task,
 	 * caller or our own code below (goto retry/again) dropped all
 	 * locks.
 	 */
+	guard(preempt)();
  retry:
+	/*
+	 * Get the waiter on which @task is blocked on.
+	 */
+	waiter_hp = hpref_hp_acquire(task->pi_blocked_on);
+	if (!hpref_hp_to_node(waiter_hp))
+		goto out_put_task;
+	waiter = container_of(hpref_hp_to_node(waiter_hp), struct rt_mutex_waiter, hp_node);
+
+	lock = waiter->lock;
+
+	raw_spin_lock(&lock->wait_lock);
+
+
 	/*
 	 * [1] Task cannot go away as we did a get_task() before !
 	 */
 	raw_spin_lock_irq(&task->pi_lock);
-
-	/*
-	 * [2] Get the waiter on which @task is blocked on.
-	 */
-	waiter = task->pi_blocked_on;
 
 	/*
 	 * [3] check_exit_conditions_1() protected by task->pi_lock.
@@ -829,6 +839,7 @@ static int __sched rt_mutex_adjust_prio_chain(struct task_struct *task,
 	 * [4] Get the next lock; per holding task->pi_lock we can't unblock
 	 * and guarantee @lock's existence.
 	 */
+	//TODO remove
 	lock = waiter->lock;
 	/*
 	 * [5] We need to trylock here as we are holding task->pi_lock,
@@ -839,6 +850,7 @@ static int __sched rt_mutex_adjust_prio_chain(struct task_struct *task,
 	 * inverting this lock order is infeasible from a life-time
 	 * perspective.
 	 */
+	//TODO remove
 	if (!raw_spin_trylock(&lock->wait_lock)) {
 		raw_spin_unlock_irq(&task->pi_lock);
 		cpu_relax();
@@ -1741,6 +1753,7 @@ static inline int __rt_mutex_slowlock_locked(struct rt_mutex_base *lock,
 	ret = __rt_mutex_slowlock(lock, ww_ctx, state, RT_MUTEX_MIN_CHAINWALK,
 				  &waiter);
 
+	//TODO: wait HP
 	debug_rt_mutex_free_waiter(&waiter);
 	return ret;
 }
@@ -1849,6 +1862,7 @@ static void __sched rtlock_slowlock_locked(struct rt_mutex_base *lock)
 	 * We might have to fix that up:
 	 */
 	fixup_rt_mutex_waiters(lock, true);
+	//TODO: wait HP
 	debug_rt_mutex_free_waiter(&waiter);
 
 	trace_contention_end(lock, 0);
