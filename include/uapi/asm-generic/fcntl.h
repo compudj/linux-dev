@@ -92,6 +92,13 @@
 /* a horrid kludge trying to make sure that this will fail on old kernels */
 #define O_TMPFILE (__O_TMPFILE | O_DIRECTORY)
 
+/*
+ * __O_PRIVATE is meant to be used only internally by memfd.
+ */
+#ifndef __O_PRIVATE
+#define __O_PRIVATE	040000000
+#endif
+
 #ifndef O_NDELAY
 #define O_NDELAY	O_NONBLOCK
 #endif

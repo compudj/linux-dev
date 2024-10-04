@@ -12,6 +12,8 @@
 #define MFD_NOEXEC_SEAL		0x0008U
 /* executable */
 #define MFD_EXEC		0x0010U
+/* process private, copy content on fork. */
+#define MFD_PRIVATE		0x0020U
 
 /*
  * Huge page size encoding when MFD_HUGETLB is specified, and a huge page
