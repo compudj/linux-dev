@@ -98,6 +98,7 @@
 #include <linux/limits.h>
 #include <linux/refcount_types.h>
 #include <linux/spinlock_types.h>
+#include <linux/hazptr.h>
 
 struct mutex;
 
@@ -112,6 +113,8 @@ enum refcount_saturation_type {
 	REFCOUNT_SUB_UAF,
 	REFCOUNT_DEC_LEAK,
 };
+
+DECLARE_HAZPTR_DOMAIN(hazptr_domain_refcount);
 
 void refcount_warn_saturate(refcount_t *r, enum refcount_saturation_type t);
 
@@ -259,7 +262,7 @@ static inline void refcount_inc(refcount_t *r)
 }
 
 static inline __must_check __signed_wrap
-bool __refcount_sub_and_test(int i, refcount_t *r, int *oldp)
+bool __refcount_sub_and_test(int i, refcount_t *r, int *oldp, bool hazptr_protected)
 {
 	int old = atomic_fetch_sub_release(i, &r->refs);
 
@@ -268,6 +271,8 @@ bool __refcount_sub_and_test(int i, refcount_t *r, int *oldp)
 
 	if (old > 0 && old == i) {
 		smp_acquire__after_ctrl_dep();
+		if (hazptr_protected)
+			hazptr_scan(&hazptr_domain_refcount, r, NULL);
 		return true;
 	}
 
@@ -299,12 +304,22 @@ bool __refcount_sub_and_test(int i, refcount_t *r, int *oldp)
  */
 static inline __must_check bool refcount_sub_and_test(int i, refcount_t *r)
 {
-	return __refcount_sub_and_test(i, r, NULL);
+	return __refcount_sub_and_test(i, r, NULL, false);
 }
 
 static inline __must_check bool __refcount_dec_and_test(refcount_t *r, int *oldp)
 {
-	return __refcount_sub_and_test(1, r, oldp);
+	return __refcount_sub_and_test(1, r, oldp, false);
+}
+
+static inline __must_check bool hazptr_refcount_sub_and_test(int i, refcount_t *r)
+{
+	return __refcount_sub_and_test(i, r, NULL, true);
+}
+
+static inline __must_check bool __hazptr_refcount_dec_and_test(refcount_t *r, int *oldp)
+{
+	return __refcount_sub_and_test(1, r, oldp, true);
 }
 
 /**
@@ -323,6 +338,11 @@ static inline __must_check bool __refcount_dec_and_test(refcount_t *r, int *oldp
 static inline __must_check bool refcount_dec_and_test(refcount_t *r)
 {
 	return __refcount_dec_and_test(r, NULL);
+}
+
+static inline __must_check bool hazptr_refcount_dec_and_test(refcount_t *r)
+{
+	return __hazptr_refcount_dec_and_test(r, NULL);
 }
 
 static inline void __refcount_dec(refcount_t *r, int *oldp)
@@ -349,6 +369,31 @@ static inline void __refcount_dec(refcount_t *r, int *oldp)
 static inline void refcount_dec(refcount_t *r)
 {
 	__refcount_dec(r, NULL);
+}
+
+/*
+ * hazptr_load_refcount_inc: Load a pointer to a reference counter and
+ * increment the refcount.
+ * Return the reference counter address on success, else return NULL.
+ *
+ * Reference counters used with hazptr_load_refcount_inc should be
+ * decremented to 0 with either hazptr_refcount_dec_and_test or
+ * hazptr_refcount_sub_and_test.
+ */
+static inline refcount_t *hazptr_load_refcount_inc(refcount_t * const *r_p)
+{
+	struct hazptr_slot *slot;
+	refcount_t *r, *hr;
+
+	guard(preempt)();
+	hr = hazptr_load_try_protect(&hazptr_domain_refcount, r_p, &slot);
+	if (!hr)
+		return NULL;
+	r = hr;
+	if (!refcount_inc_not_zero(r))
+		r = NULL;
+	hazptr_release(slot, hr);
+	return r;
 }
 
 extern __must_check bool refcount_dec_if_one(refcount_t *r);

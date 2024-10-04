@@ -7,8 +7,12 @@
 #include <linux/refcount.h>
 #include <linux/spinlock.h>
 #include <linux/bug.h>
+#include <linux/hazptr.h>
 
 #define REFCOUNT_WARN(str)	WARN_ONCE(1, "refcount_t: " str ".\n")
+
+/* Refcount hazard pointer domain. */
+DEFINE_HAZPTR_DOMAIN(hazptr_domain_refcount);
 
 void refcount_warn_saturate(refcount_t *r, enum refcount_saturation_type t)
 {
