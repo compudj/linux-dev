@@ -317,7 +317,7 @@ static unsigned int sane_fdtable_size(struct fdtable *fdt, unsigned int max_fds)
 struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int *errorp)
 {
 	struct files_struct *newf;
-	struct file **old_fds, **new_fds;
+	struct file **old_fds, **new_fds, **iter_fds;
 	unsigned int open_files, i;
 	struct fdtable *old_fdt, *new_fdt;
 
@@ -378,7 +378,7 @@ struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int
 	copy_fd_bitmaps(new_fdt, old_fdt, open_files / BITS_PER_LONG);
 
 	old_fds = old_fdt->fd;
-	new_fds = new_fdt->fd;
+	iter_fds = new_fds = new_fdt->fd;
 
 	for (i = open_files; i != 0; i--) {
 		struct file *f = *old_fds++;
@@ -399,6 +399,15 @@ struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int
 
 	/* clear the remainder */
 	memset(new_fds, 0, (new_fdt->max_fds - open_files) * sizeof(struct file *));
+
+	for (; iter_fds < new_fds; iter_fds++) {
+		struct file *f = *iter_fds;
+
+		if (!(f->f_flags & __O_PRIVATE))
+			continue;
+		/* Copy file content. */
+		//TODO
+	}
 
 	rcu_assign_pointer(newf->fdt, new_fdt);
 
