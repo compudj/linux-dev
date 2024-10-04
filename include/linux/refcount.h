@@ -98,6 +98,7 @@
 #include <linux/limits.h>
 #include <linux/refcount_types.h>
 #include <linux/spinlock_types.h>
+#include <linux/hp.h>
 
 struct mutex;
 
@@ -112,6 +113,8 @@ enum refcount_saturation_type {
 	REFCOUNT_SUB_UAF,
 	REFCOUNT_DEC_LEAK,
 };
+
+DECLARE_PER_CPU(struct hp_slot, hp_domain_refcount);
 
 void refcount_warn_saturate(refcount_t *r, enum refcount_saturation_type t);
 
@@ -259,7 +262,7 @@ static inline void refcount_inc(refcount_t *r)
 }
 
 static inline __must_check __signed_wrap
-bool __refcount_sub_and_test(int i, refcount_t *r, int *oldp)
+bool __refcount_sub_and_test(int i, refcount_t *r, int *oldp, bool hp_protected)
 {
 	int old = atomic_fetch_sub_release(i, &r->refs);
 
@@ -268,6 +271,8 @@ bool __refcount_sub_and_test(int i, refcount_t *r, int *oldp)
 
 	if (old > 0 && old == i) {
 		smp_acquire__after_ctrl_dep();
+		if (hp_protected)
+			hp_scan(&hp_domain_refcount, r, NULL);
 		return true;
 	}
 
@@ -299,12 +304,22 @@ bool __refcount_sub_and_test(int i, refcount_t *r, int *oldp)
  */
 static inline __must_check bool refcount_sub_and_test(int i, refcount_t *r)
 {
-	return __refcount_sub_and_test(i, r, NULL);
+	return __refcount_sub_and_test(i, r, NULL, false);
 }
 
 static inline __must_check bool __refcount_dec_and_test(refcount_t *r, int *oldp)
 {
-	return __refcount_sub_and_test(1, r, oldp);
+	return __refcount_sub_and_test(1, r, oldp, false);
+}
+
+static inline __must_check bool hp_refcount_sub_and_test(int i, refcount_t *r)
+{
+	return __refcount_sub_and_test(i, r, NULL, true);
+}
+
+static inline __must_check bool __hp_refcount_dec_and_test(refcount_t *r, int *oldp)
+{
+	return __refcount_sub_and_test(1, r, oldp, true);
 }
 
 /**
@@ -323,6 +338,11 @@ static inline __must_check bool __refcount_dec_and_test(refcount_t *r, int *oldp
 static inline __must_check bool refcount_dec_and_test(refcount_t *r)
 {
 	return __refcount_dec_and_test(r, NULL);
+}
+
+static inline __must_check bool hp_refcount_dec_and_test(refcount_t *r)
+{
+	return __hp_refcount_dec_and_test(r, NULL);
 }
 
 static inline void __refcount_dec(refcount_t *r, int *oldp)
@@ -349,6 +369,31 @@ static inline void __refcount_dec(refcount_t *r, int *oldp)
 static inline void refcount_dec(refcount_t *r)
 {
 	__refcount_dec(r, NULL);
+}
+
+/*
+ * hp_dereference_refcount_inc: Dereference a pointer to a reference
+ * counter and increment the refcount.
+ * Return the reference counter address on success, else return NULL.
+ *
+ * Reference counters used with hp_dereference_refcount_inc should be
+ * decremented to 0 with either hp_refcount_dec_and_test or
+ * hp_refcount_sub_and_test.
+ */
+static inline refcount_t *hp_dereference_refcount_inc(refcount_t * const *r_p)
+{
+	struct hp_ctx ctx;
+	refcount_t *r;
+
+	guard(preempt)();
+	ctx = hp_dereference_allocate(&hp_domain_refcount, (void * const *) r_p);
+	r = hp_ctx_addr(ctx);
+	if (!r)
+		return NULL;
+	if (!refcount_inc_not_zero(r))
+		r = NULL;
+	hp_retire(ctx);
+	return r;
 }
 
 extern __must_check bool refcount_dec_if_one(refcount_t *r);
