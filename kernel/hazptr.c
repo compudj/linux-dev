@@ -8,6 +8,9 @@
 
 #include <linux/hazptr.h>
 #include <linux/percpu.h>
+#include <linux/sharedptr.h>
+
+DEFINE_HAZPTR_DOMAIN(hazptr_domain_sharedptr);
 
 /*
  * hazptr_scan: Scan hazard pointer domain for @addr.
