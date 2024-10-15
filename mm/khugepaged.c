@@ -1427,7 +1427,8 @@ out:
 	return result;
 }
 
-static void collect_mm_slot(struct khugepaged_mm_slot *mm_slot)
+/* Returns true if khugepaged_mm_lock is unlocked, false otherwise. */
+static bool collect_mm_slot(struct khugepaged_mm_slot *mm_slot)
 {
 	struct mm_slot *slot = &mm_slot->slot;
 	struct mm_struct *mm = slot->mm;
@@ -1444,11 +1445,12 @@ static void collect_mm_slot(struct khugepaged_mm_slot *mm_slot)
 		 *
 		 * clear_bit(MMF_VM_HUGEPAGE, &mm->flags);
 		 */
-
-		/* khugepaged_mm_lock actually not necessary for the below */
+		spin_unlock(&khugepaged_mm_lock);
 		mm_slot_free(mm_slot_cache, mm_slot);
 		mmdrop(mm);
+		return true;
 	}
+	return false;
 }
 
 #ifdef CONFIG_SHMEM
@@ -2474,7 +2476,8 @@ breakouterloop_mmap_lock:
 			khugepaged_full_scans++;
 		}
 
-		collect_mm_slot(mm_slot);
+		if (collect_mm_slot(mm_slot))
+			spin_lock(&khugepaged_mm_lock);
 	}
 
 	return progress;
@@ -2574,9 +2577,8 @@ static int khugepaged(void *none)
 	spin_lock(&khugepaged_mm_lock);
 	mm_slot = khugepaged_scan.mm_slot;
 	khugepaged_scan.mm_slot = NULL;
-	if (mm_slot)
-		collect_mm_slot(mm_slot);
-	spin_unlock(&khugepaged_mm_lock);
+	if (mm_slot && !collect_mm_slot(mm_slot))
+		spin_unlock(&khugepaged_mm_lock);
 	return 0;
 }
 
