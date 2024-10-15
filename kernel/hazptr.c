@@ -20,6 +20,7 @@ DEFINE_HAZPTR_DOMAIN(hazptr_domain_sharedptr);
  * @addr.
  * Wait to observe that each slot contains a value that differs from
  * @addr before returning.
+ * Should be called from preemptible context if @on_match_cb is NULL.
  */
 void hazptr_scan(struct hazptr_domain *hazptr_domain, void *addr,
 	     void (*on_match_cb)(int cpu, struct hazptr_slot *slot, void *addr))
@@ -27,8 +28,11 @@ void hazptr_scan(struct hazptr_domain *hazptr_domain, void *addr,
 	struct hazptr_slot __percpu *percpu_slots = hazptr_domain->percpu_slots;
 	int cpu;
 
-	/* Should only be called from preemptible context. */
-	lockdep_assert_preemption_enabled();
+	/*
+	 * Busy-wait should only be done from preemptible context.
+	 */
+	if (!on_match_ptr)
+		lockdep_assert_preemption_enabled();
 
 	/*
 	 * Store A precedes hazptr_scan(): it unpublishes addr (sets it to
