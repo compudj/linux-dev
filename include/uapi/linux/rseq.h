@@ -13,6 +13,11 @@
 #include <linux/types.h>
 #include <asm/byteorder.h>
 
+/*
+ * Maximum length of rseq reset area list.
+ */
+#define RSEQ_RESET_AREA_LIST_LIMIT	2048
+
 enum rseq_cpu_id_state {
 	RSEQ_CPU_ID_UNINITIALIZED		= -1,
 	RSEQ_CPU_ID_REGISTRATION_FAILED		= -2,
@@ -52,6 +57,20 @@ struct rseq_cs {
 	__u64 post_commit_offset;
 	__u64 abort_ip;
 } __attribute__((aligned(4 * sizeof(__u64))));
+
+struct rseq_reset_area {
+	/* Pointer to area to update on preemption. */
+	__u64 ptr_area;
+	/* Pointer to value to use for update. If NULL, use zeroes. */
+	__u64 ptr_value;
+	/* Area length. */
+	__u32 len;
+
+	/* Pointer to next rseq_reset_area. NULL for end of list. */
+	__u64 next;
+	/* Pointer to previous rseq_reset_area. */
+	__u64 prev;
+};
 
 /*
  * struct rseq is aligned on 4 * 8 bytes to ensure it is always
@@ -147,6 +166,22 @@ struct rseq {
 	 * (allocated uniquely within a memory map).
 	 */
 	__u32 mm_cid;
+
+	/*
+	 * List of areas to reset on preemption or signal delivery.
+	 * This list head is updated by userspace with single-copy
+	 * atomicity semantics.
+	 * If this list head is NULL, then the list is empty.
+	 * The list ends with a reset area that has a NULL next pointer.
+	 * Userspace should ensure the reset area structure is populated
+	 * before inserting it into the list head or next pointers from
+	 * a program order perspective.
+	 * Userspace should ensure the reset area structure is removed
+	 * from the list by updating the previous next pointer (or list
+	 * head) before reclaiming its memory from a program order
+	 * perspective.
+	 */
+	__u64 reset_area_list;
 
 	/*
 	 * Flexible array member at end of structure, after last feature field.

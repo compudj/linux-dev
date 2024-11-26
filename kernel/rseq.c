@@ -301,6 +301,107 @@ static int rseq_ip_fixup(struct pt_regs *regs)
 	return 0;
 }
 
+static int copy_tofrom_user(char __user *dst, const char __user *src, size_t len)
+{
+	switch (len) {
+	case 4:
+	{
+		u32 v;
+
+		if (get_user(v, src))
+			return -EFAULT;
+		if (put_user(v, dst))
+			return -EFAULT;
+		break;
+	}
+#ifdef CONFIG_64BIT
+	case 8:
+	{
+		u64 v;
+
+		if (get_user(v, src))
+			return -EFAULT;
+		if (put_user(v, dst))
+			return -EFAULT;
+		break;
+	}
+#endif
+	default:
+		for (; len > 0; len--, src++, dst++) {
+			u8 v;
+
+			if (get_user(v, src))
+				return -EFAULT;
+			if (put_user(v, dst))
+				return -EFAULT;
+		}
+		break;
+	}
+	return 0;
+}
+
+static int rseq_reset_area_list(struct task_struct *t)
+{
+	struct rseq_reset_area __user *urseq_reset_area, krseq_reset_area;
+	unsigned int limit = RSEQ_RESET_AREA_LIST_LIMIT;
+	u64 ptr;
+
+	/*
+	 * Skip if rseq registration length does not include extended
+	 * rseq fields.
+	 */
+	if (t->rseq_len == ORIG_RSEQ_SIZE)
+		return 0;
+
+#ifdef CONFIG_64BIT
+	if (get_user(ptr, &t->rseq->reset_area_list))
+		return -EFAULT;
+#else
+	if (copy_from_user(&ptr, &t->rseq->reset_area_list, sizeof(ptr)))
+		return -EFAULT;
+#endif
+	if (!ptr)
+		goto end;	/* Empty list. */
+	if (ptr >= TASK_SIZE)
+		return -EINVAL;
+	urseq_reset_area = container_of((__u64 __user *)(unsigned long)ptr, struct rseq_reset_area __user, next);
+	if (copy_from_user(&krseq_reset_area, urseq_reset_area, sizeof(krseq_reset_area)))
+		return -EFAULT;
+
+	for (;;) {
+		if (krseq_reset_area.ptr_area) {
+			if (!krseq_reset_area.ptr_value) {
+				/* Clear area. */
+				if (clear_user((void __user *)(unsigned long)krseq_reset_area.ptr_area, krseq_reset_area.len))
+					return -EFAULT;
+			} else {
+				if (copy_tofrom_user((void __user *)(unsigned long)krseq_reset_area.ptr_area,
+						     (const void __user *)(unsigned long)krseq_reset_area.ptr_value,
+						     krseq_reset_area.len))
+					return -EFAULT;
+			}
+		}
+		ptr = krseq_reset_area.next;
+		if (!ptr)
+			break;	/* End of list. */
+		if (ptr >= TASK_SIZE)
+			return -EINVAL;
+		urseq_reset_area = container_of((__u64 __user *)(unsigned long)ptr, struct rseq_reset_area __user, next);
+		if (copy_from_user(&krseq_reset_area, urseq_reset_area, sizeof(krseq_reset_area)))
+			return -EFAULT;
+
+		/*
+		 * Avoid excessively long or circular lists:
+		 */
+		if (!--limit)
+			return -E2BIG;
+
+		cond_resched();
+	}
+end:
+	return 0;
+}
+
 /*
  * This resume handler must always be executed between any of:
  * - preemption,
@@ -331,6 +432,8 @@ void __rseq_handle_notify_resume(struct ksignal *ksig, struct pt_regs *regs)
 			goto error;
 	}
 	if (unlikely(rseq_update_cpu_node_id(t)))
+		goto error;
+	if (unlikely(rseq_reset_area_list(t)))
 		goto error;
 	return;
 
