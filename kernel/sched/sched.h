@@ -3587,31 +3587,31 @@ static inline void __mm_cid_put(struct mm_struct *mm, int cid)
 static inline void mm_cid_put_lazy(struct task_struct *t)
 {
 	struct mm_struct *mm = t->mm;
-	struct mm_cid __percpu *pcpu_cid = mm->pcpu_cid;
+	struct mm_percpu_struct __percpu *mm_percpu = mm->mm_percpu;
 	int cid;
 
 	lockdep_assert_irqs_disabled();
-	cid = __this_cpu_read(pcpu_cid->cid);
+	cid = __this_cpu_read(mm_percpu->pcpu_cid.cid);
 	if (!mm_cid_is_lazy_put(cid) ||
-	    !try_cmpxchg(&this_cpu_ptr(pcpu_cid)->cid, &cid, MM_CID_UNSET))
+	    !try_cmpxchg(&this_cpu_ptr(mm_percpu)->pcpu_cid.cid, &cid, MM_CID_UNSET))
 		return;
 	__mm_cid_put(mm, mm_cid_clear_lazy_put(cid));
 }
 
 static inline int mm_cid_pcpu_unset(struct mm_struct *mm)
 {
-	struct mm_cid __percpu *pcpu_cid = mm->pcpu_cid;
+	struct mm_percpu_struct __percpu *mm_percpu = mm->mm_percpu;
 	int cid, res;
 
 	lockdep_assert_irqs_disabled();
-	cid = __this_cpu_read(pcpu_cid->cid);
+	cid = __this_cpu_read(mm_percpu->pcpu_cid.cid);
 	for (;;) {
 		if (mm_cid_is_unset(cid))
 			return MM_CID_UNSET;
 		/*
 		 * Attempt transition from valid or lazy-put to unset.
 		 */
-		res = cmpxchg(&this_cpu_ptr(pcpu_cid)->cid, cid, MM_CID_UNSET);
+		res = cmpxchg(&this_cpu_ptr(mm_percpu)->pcpu_cid.cid, cid, MM_CID_UNSET);
 		if (res == cid)
 			break;
 		cid = res;
@@ -3633,8 +3633,8 @@ static inline void mm_cid_put(struct mm_struct *mm)
 static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
 {
 	struct cpumask *cidmask = mm_cidmask(mm);
-	struct mm_cid __percpu *pcpu_cid = mm->pcpu_cid;
-	int cid = __this_cpu_read(pcpu_cid->recent_cid);
+	struct mm_percpu_struct __percpu *mm_percpu = mm->mm_percpu;
+	int cid = __this_cpu_read(mm_percpu->pcpu_cid.recent_cid);
 
 	/* Try to re-use recent cid. This improves cache locality. */
 	if (!mm_cid_is_unset(cid) && !cpumask_test_and_set_cpu(cid, cidmask))
@@ -3676,10 +3676,10 @@ static inline int __mm_cid_try_get(struct task_struct *t, struct mm_struct *mm)
  */
 static inline void mm_cid_snapshot_time(struct rq *rq, struct mm_struct *mm)
 {
-	struct mm_cid *pcpu_cid = per_cpu_ptr(mm->pcpu_cid, cpu_of(rq));
+	struct mm_percpu_struct *mm_percpu = per_cpu_ptr(mm->mm_percpu, cpu_of(rq));
 
 	lockdep_assert_rq_held(rq);
-	WRITE_ONCE(pcpu_cid->time, rq->clock);
+	WRITE_ONCE(mm_percpu->pcpu_cid.time, rq->clock);
 }
 
 static inline int __mm_cid_get(struct rq *rq, struct task_struct *t,
@@ -3739,24 +3739,24 @@ end:
 static inline int mm_cid_get(struct rq *rq, struct task_struct *t,
 			     struct mm_struct *mm)
 {
-	struct mm_cid __percpu *pcpu_cid = mm->pcpu_cid;
+	struct mm_percpu_struct __percpu *mm_percpu = mm->mm_percpu;
 	struct cpumask *cpumask;
 	int cid;
 
 	lockdep_assert_rq_held(rq);
 	cpumask = mm_cidmask(mm);
-	cid = __this_cpu_read(pcpu_cid->cid);
+	cid = __this_cpu_read(mm_percpu->pcpu_cid.cid);
 	if (mm_cid_is_valid(cid)) {
 		mm_cid_snapshot_time(rq, mm);
 		return cid;
 	}
 	if (mm_cid_is_lazy_put(cid)) {
-		if (try_cmpxchg(&this_cpu_ptr(pcpu_cid)->cid, &cid, MM_CID_UNSET))
+		if (try_cmpxchg(&this_cpu_ptr(mm_percpu)->pcpu_cid.cid, &cid, MM_CID_UNSET))
 			__mm_cid_put(mm, mm_cid_clear_lazy_put(cid));
 	}
 	cid = __mm_cid_get(rq, t, mm);
-	__this_cpu_write(pcpu_cid->cid, cid);
-	__this_cpu_write(pcpu_cid->recent_cid, cid);
+	__this_cpu_write(mm_percpu->pcpu_cid.cid, cid);
+	__this_cpu_write(mm_percpu->pcpu_cid.recent_cid, cid);
 
 	return cid;
 }
@@ -3767,7 +3767,7 @@ static inline void switch_mm_cid(struct rq *rq,
 {
 	/*
 	 * Provide a memory barrier between rq->curr store and load of
-	 * {prev,next}->mm->pcpu_cid[cpu] on rq->curr->mm transition.
+	 * {prev,next}->mm->mm_percpu[cpu]->pcpu_cid.cid on rq->curr->mm transition.
 	 *
 	 * Should be adapted if context_switch() is modified.
 	 */
@@ -3786,7 +3786,8 @@ static inline void switch_mm_cid(struct rq *rq,
 	} else {                                        // to user
 		/*
 		 * kernel -> user transition does not provide a barrier
-		 * between rq->curr store and load of {prev,next}->mm->pcpu_cid[cpu].
+		 * between rq->curr store and load of
+		 * {prev,next}->mm->mm_percpu[cpu]->pcpu_cid.cid.
 		 * Provide it here.
 		 */
 		if (!prev->mm) {                        // from kernel

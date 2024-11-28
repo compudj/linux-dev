@@ -10294,12 +10294,12 @@ void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t)
 	 * can expect that the number of allowed cids can reach the number of
 	 * allowed CPUs.
 	 */
-	dst_pcpu_cid = per_cpu_ptr(mm->pcpu_cid, cpu_of(dst_rq));
+	dst_pcpu_cid = &per_cpu_ptr(mm->mm_percpu, cpu_of(dst_rq))->pcpu_cid;
 	dst_cid_is_set = !mm_cid_is_unset(READ_ONCE(dst_pcpu_cid->cid)) ||
 			 !mm_cid_is_unset(READ_ONCE(dst_pcpu_cid->recent_cid));
 	if (dst_cid_is_set && atomic_read(&mm->mm_users) >= READ_ONCE(mm->nr_cpus_allowed))
 		return;
-	src_pcpu_cid = per_cpu_ptr(mm->pcpu_cid, src_cpu);
+	src_pcpu_cid = &per_cpu_ptr(mm->mm_percpu, src_cpu)->pcpu_cid;
 	src_rq = cpu_rq(src_cpu);
 	src_cid = __sched_mm_cid_migrate_from_fetch_cid(src_rq, t, src_pcpu_cid);
 	if (src_cid == -1)
@@ -10386,7 +10386,7 @@ static void sched_mm_cid_remote_clear_old(struct mm_struct *mm, int cpu)
 	 * while is irrelevant.
 	 */
 	rq_clock = READ_ONCE(rq->clock);
-	pcpu_cid = per_cpu_ptr(mm->pcpu_cid, cpu);
+	pcpu_cid = &per_cpu_ptr(mm->mm_percpu, cpu)->pcpu_cid;
 
 	/*
 	 * In order to take care of infrequently scheduled tasks, bump the time
@@ -10412,7 +10412,7 @@ static void sched_mm_cid_remote_clear_weight(struct mm_struct *mm, int cpu,
 	struct mm_cid *pcpu_cid;
 	int cid;
 
-	pcpu_cid = per_cpu_ptr(mm->pcpu_cid, cpu);
+	pcpu_cid = &per_cpu_ptr(mm->mm_percpu, cpu)->pcpu_cid;
 	cid = READ_ONCE(pcpu_cid->cid);
 	if (!mm_cid_is_valid(cid) || cid < weight)
 		return;

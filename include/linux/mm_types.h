@@ -784,6 +784,17 @@ struct mm_cid {
 	int cid;
 	int recent_cid;
 };
+
+struct mm_percpu_struct {
+	/**
+	 * @pcpu_cid: Per-cpu current cid.
+	 *
+	 * Keep track of the currently allocated mm_cid for each cpu.
+	 * The per-cpu mm_cid values are serialized by their respective
+	 * runqueue locks.
+	 */
+	struct mm_cid pcpu_cid;
+};
 #endif
 
 struct kioctx_table;
@@ -840,13 +851,11 @@ struct mm_struct {
 
 #ifdef CONFIG_SCHED_MM_CID
 		/**
-		 * @pcpu_cid: Per-cpu current cid.
+		 * @mm_percpu: Per-cpu mm fields.
 		 *
-		 * Keep track of the currently allocated mm_cid for each cpu.
-		 * The per-cpu mm_cid values are serialized by their respective
-		 * runqueue locks.
+		 * Keep track of per-cpu fields associated with this mm.
 		 */
-		struct mm_cid __percpu *pcpu_cid;
+		struct mm_percpu_struct __percpu *mm_percpu;
 		/*
 		 * @mm_cid_next_scan: Next mm_cid scan (in jiffies).
 		 *
@@ -1220,7 +1229,7 @@ static inline void mm_init_cid(struct mm_struct *mm, struct task_struct *p)
 	int i;
 
 	for_each_possible_cpu(i) {
-		struct mm_cid *pcpu_cid = per_cpu_ptr(mm->pcpu_cid, i);
+		struct mm_cid *pcpu_cid = &per_cpu_ptr(mm->mm_percpu, i)->pcpu_cid;
 
 		pcpu_cid->cid = MM_CID_UNSET;
 		pcpu_cid->recent_cid = MM_CID_UNSET;
@@ -1233,20 +1242,20 @@ static inline void mm_init_cid(struct mm_struct *mm, struct task_struct *p)
 	cpumask_clear(mm_cidmask(mm));
 }
 
-static inline int mm_alloc_cid_noprof(struct mm_struct *mm, struct task_struct *p)
+static inline int mm_alloc_percpu_noprof(struct mm_struct *mm, struct task_struct *p)
 {
-	mm->pcpu_cid = alloc_percpu_noprof(struct mm_cid);
-	if (!mm->pcpu_cid)
+	mm->mm_percpu = alloc_percpu_noprof(struct mm_percpu_struct);
+	if (!mm->mm_percpu)
 		return -ENOMEM;
 	mm_init_cid(mm, p);
 	return 0;
 }
-#define mm_alloc_cid(...)	alloc_hooks(mm_alloc_cid_noprof(__VA_ARGS__))
+#define mm_alloc_percpu(...)	alloc_hooks(mm_alloc_percpu_noprof(__VA_ARGS__))
 
-static inline void mm_destroy_cid(struct mm_struct *mm)
+static inline void mm_destroy_percpu(struct mm_struct *mm)
 {
-	free_percpu(mm->pcpu_cid);
-	mm->pcpu_cid = NULL;
+	free_percpu(mm->mm_percpu);
+	mm->mm_percpu = NULL;
 }
 
 static inline unsigned int mm_cid_size(void)
@@ -1268,8 +1277,8 @@ static inline void mm_set_cpus_allowed(struct mm_struct *mm, const struct cpumas
 }
 #else /* CONFIG_SCHED_MM_CID */
 static inline void mm_init_cid(struct mm_struct *mm, struct task_struct *p) { }
-static inline int mm_alloc_cid(struct mm_struct *mm, struct task_struct *p) { return 0; }
-static inline void mm_destroy_cid(struct mm_struct *mm) { }
+static inline int mm_alloc_percpu(struct mm_struct *mm, struct task_struct *p) { return 0; }
+static inline void mm_destroy_percpu(struct mm_struct *mm) { }
 
 static inline unsigned int mm_cid_size(void)
 {
