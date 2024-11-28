@@ -784,8 +784,18 @@ struct mm_cid {
 	int cid;
 	int recent_cid;
 };
+#endif
 
+#ifdef CONFIG_MM_PERCPU_STRUCT
 struct mm_percpu_struct {
+# ifdef CONFIG_ARCH_HAS_MM_PERCPU_TLB_FLUSH
+	/*
+	 * Flag indicating whether a TLB flush IPI is pending for this
+	 * CPU.
+	 */
+	int tlb_flush_pending;
+# endif
+# ifdef CONFIG_SCHED_MM_CID
 	/**
 	 * @pcpu_cid: Per-cpu current cid.
 	 *
@@ -794,6 +804,7 @@ struct mm_percpu_struct {
 	 * runqueue locks.
 	 */
 	struct mm_cid pcpu_cid;
+# endif
 };
 #endif
 
@@ -849,13 +860,15 @@ struct mm_struct {
 		 */
 		atomic_t mm_users;
 
-#ifdef CONFIG_SCHED_MM_CID
+#ifdef CONFIG_MM_PERCPU_STRUCT
 		/**
 		 * @mm_percpu: Per-cpu mm fields.
 		 *
 		 * Keep track of per-cpu fields associated with this mm.
 		 */
 		struct mm_percpu_struct __percpu *mm_percpu;
+#endif
+#ifdef CONFIG_SCHED_MM_CID
 		/*
 		 * @mm_cid_next_scan: Next mm_cid scan (in jiffies).
 		 *
@@ -1242,22 +1255,6 @@ static inline void mm_init_cid(struct mm_struct *mm, struct task_struct *p)
 	cpumask_clear(mm_cidmask(mm));
 }
 
-static inline int mm_alloc_percpu_noprof(struct mm_struct *mm, struct task_struct *p)
-{
-	mm->mm_percpu = alloc_percpu_noprof(struct mm_percpu_struct);
-	if (!mm->mm_percpu)
-		return -ENOMEM;
-	mm_init_cid(mm, p);
-	return 0;
-}
-#define mm_alloc_percpu(...)	alloc_hooks(mm_alloc_percpu_noprof(__VA_ARGS__))
-
-static inline void mm_destroy_percpu(struct mm_struct *mm)
-{
-	free_percpu(mm->mm_percpu);
-	mm->mm_percpu = NULL;
-}
-
 static inline unsigned int mm_cid_size(void)
 {
 	return 2 * cpumask_size();	/* mm_cpus_allowed(), mm_cidmask(). */
@@ -1277,8 +1274,6 @@ static inline void mm_set_cpus_allowed(struct mm_struct *mm, const struct cpumas
 }
 #else /* CONFIG_SCHED_MM_CID */
 static inline void mm_init_cid(struct mm_struct *mm, struct task_struct *p) { }
-static inline int mm_alloc_percpu(struct mm_struct *mm, struct task_struct *p) { return 0; }
-static inline void mm_destroy_percpu(struct mm_struct *mm) { }
 
 static inline unsigned int mm_cid_size(void)
 {
@@ -1286,6 +1281,76 @@ static inline unsigned int mm_cid_size(void)
 }
 static inline void mm_set_cpus_allowed(struct mm_struct *mm, const struct cpumask *cpumask) { }
 #endif /* CONFIG_SCHED_MM_CID */
+
+#ifdef CONFIG_ARCH_HAS_MM_PERCPU_TLB_FLUSH
+static inline void mm_init_percpu_tlb_flush(struct mm_struct *mm)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct mm_percpu_struct *mm_percpu = per_cpu_ptr(mm->mm_percpu, cpu);
+
+		mm_percpu->tlb_flush_pending = 0;
+	}
+}
+
+static inline void set_tlb_flush_pending(int cpu, struct mm_struct *mm)
+{
+	WRITE_ONCE(per_cpu_ptr(mm->mm_percpu, cpu)->tlb_flush_pending, 1);
+}
+
+static inline void clear_tlb_flush_pending(int cpu, struct mm_struct *mm)
+{
+	WRITE_ONCE(per_cpu_ptr(mm->mm_percpu, cpu)->tlb_flush_pending, 0);
+}
+
+static inline bool test_tlb_flush_pending(int cpu, struct mm_struct *mm)
+{
+	return READ_ONCE(per_cpu_ptr(mm->mm_percpu, cpu)->tlb_flush_pending);
+}
+
+static inline void update_mm_cpumask(struct mm_struct *mm)
+{
+	int cpu;
+
+	/*
+	 * Iterate over each online cpu mm_percpu to sample the
+	 * tlb_flush_pending state, reflect it into the mm_cpumask.
+	 */
+	for_each_online_cpu(cpu) {
+		cpumask_assign_cpu(cpu, mm_cpumask(mm),
+				   test_tlb_flush_pending(cpu, mm));
+	}
+}
+#else
+static inline void mm_init_percpu_tlb_flush(struct mm_struct *mm) { }
+static inline void set_tlb_flush_pending(int cpu, struct mm_struct *mm) { }
+static inline void clear_tlb_flush_pending(int cpu, struct mm_struct *mm) { }
+static inline bool test_tlb_flush_pending(int cpu, struct mm_struct *mm) { return false; }
+static inline void update_mm_cpumask(struct mm_struct *mm) { }
+#endif
+
+#ifdef CONFIG_MM_PERCPU_STRUCT
+static inline int mm_alloc_percpu_noprof(struct mm_struct *mm, struct task_struct *p)
+{
+	mm->mm_percpu = alloc_percpu_noprof(struct mm_percpu_struct);
+	if (!mm->mm_percpu)
+		return -ENOMEM;
+	mm_init_percpu_tlb_flush(mm);
+	mm_init_cid(mm, p);
+	return 0;
+}
+#define mm_alloc_percpu(...)	alloc_hooks(mm_alloc_percpu_noprof(__VA_ARGS__))
+
+static inline void mm_destroy_percpu(struct mm_struct *mm)
+{
+	free_percpu(mm->mm_percpu);
+	mm->mm_percpu = NULL;
+}
+#else
+static inline int mm_alloc_percpu(struct mm_struct *mm, struct task_struct *p) { return 0; }
+static inline void mm_destroy_percpu(struct mm_struct *mm) { }
+#endif
 
 struct mmu_gather;
 extern void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm);

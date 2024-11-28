@@ -898,6 +898,7 @@ static void cleanup_lazy_tlbs(struct mm_struct *mm)
 	 * - A delayed freeing and RCU-like quiescing sequence based on mm
 	 *   switching to avoid IPIs completely.
 	 */
+	update_mm_cpumask(mm);
 	on_each_cpu_mask(mm_cpumask(mm), do_shoot_lazy_tlb, (void *)mm, 1);
 	if (IS_ENABLED(CONFIG_DEBUG_VM_SHOOT_LAZIES))
 		on_each_cpu(do_check_lazy_tlb, (void *)mm, 1);

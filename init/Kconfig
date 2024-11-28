@@ -1075,9 +1075,13 @@ config EXT_GROUP_SCHED
 
 endif #CGROUP_SCHED
 
+config MM_PERCPU_STRUCT
+	bool
+
 config SCHED_MM_CID
 	def_bool y
 	depends on SMP && RSEQ
+	select MM_PERCPU_STRUCT
 
 config UCLAMP_TASK_GROUP
 	bool "Utilization clamping per group of tasks"
@@ -1852,6 +1856,10 @@ config KALLSYMS_ABSOLUTE_PERCPU
 	default X86_64 && SMP
 
 # end of the "standard kernel features (expert users)" menu
+
+config ARCH_HAS_MM_PERCPU_TLB_FLUSH
+	bool
+	select MM_PERCPU_STRUCT
 
 config ARCH_HAS_MEMBARRIER_CALLBACKS
 	bool
