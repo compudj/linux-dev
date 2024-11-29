@@ -426,6 +426,7 @@ static void install_ldt(struct mm_struct *mm, struct ldt_struct *ldt)
 	smp_store_release(&mm->context.ldt, ldt);
 
 	/* Activate the LDT for all CPUs using currents mm. */
+	update_mm_cpumask(mm);
 	on_each_cpu_mask(mm_cpumask(mm), flush_ldt, mm, true);
 
 	mutex_unlock(&mm->context.lock);

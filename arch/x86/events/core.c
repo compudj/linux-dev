@@ -2512,8 +2512,10 @@ static void x86_pmu_event_mapped(struct perf_event *event, struct mm_struct *mm)
 	 */
 	mmap_assert_write_locked(mm);
 
-	if (atomic_inc_return(&mm->context.perf_rdpmc_allowed) == 1)
+	if (atomic_inc_return(&mm->context.perf_rdpmc_allowed) == 1) {
+		update_mm_cpumask(mm);
 		on_each_cpu_mask(mm_cpumask(mm), cr4_update_pce, NULL, 1);
+	}
 }
 
 static void x86_pmu_event_unmapped(struct perf_event *event, struct mm_struct *mm)
@@ -2521,8 +2523,10 @@ static void x86_pmu_event_unmapped(struct perf_event *event, struct mm_struct *m
 	if (!(event->hw.flags & PERF_EVENT_FLAG_USER_READ_CNT))
 		return;
 
-	if (atomic_dec_and_test(&mm->context.perf_rdpmc_allowed))
+	if (atomic_dec_and_test(&mm->context.perf_rdpmc_allowed)) {
+		update_mm_cpumask(mm);
 		on_each_cpu_mask(mm_cpumask(mm), cr4_update_pce, NULL, 1);
+	}
 }
 
 static int x86_pmu_event_idx(struct perf_event *event)

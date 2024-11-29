@@ -259,6 +259,7 @@ static inline bool arch_tlbbatch_should_defer(struct mm_struct *mm)
 	bool should_defer = false;
 
 	/* If remote CPUs need to be flushed then defer batch the flush */
+	update_mm_cpumask(mm);
 	if (cpumask_any_but(mm_cpumask(mm), get_cpu()) < nr_cpu_ids)
 		should_defer = true;
 	put_cpu();
@@ -282,6 +283,7 @@ static inline void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *b
 					     unsigned long uaddr)
 {
 	inc_mm_tlb_gen(mm);
+	update_mm_cpumask(mm);
 	cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, 0, -1UL);
 }

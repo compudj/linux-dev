@@ -820,6 +820,7 @@ static void mm_enable_lam(struct mm_struct *mm)
 	 * point, kernel threads may be using the mm.  IPI those kernel
 	 * threads if they exist.
 	 */
+	update_mm_cpumask(mm);
 	on_each_cpu_mask(mm_cpumask(mm), enable_lam_func, mm, true);
 	set_bit(MM_CONTEXT_LOCK_LAM, &mm->context.flags);
 }

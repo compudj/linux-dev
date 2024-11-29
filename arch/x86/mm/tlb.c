@@ -569,8 +569,8 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
 		 * cpu_tlbstate_shared.is_lazy whether or not to send an IPI.
 		 */
 		if (WARN_ON_ONCE(prev != &init_mm &&
-				 !cpumask_test_cpu(cpu, mm_cpumask(next))))
-			cpumask_set_cpu(cpu, mm_cpumask(next));
+				 !test_tlb_flush_pending(cpu, next)))
+			set_tlb_flush_pending(cpu, next);
 
 		/*
 		 * If the CPU is not in lazy TLB mode, we are just switching
@@ -611,14 +611,13 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
 		 * but the bitmap manipulation can cause cache line contention.
 		 */
 		if (prev != &init_mm) {
-			VM_WARN_ON_ONCE(!cpumask_test_cpu(cpu,
-						mm_cpumask(prev)));
-			cpumask_clear_cpu(cpu, mm_cpumask(prev));
+			VM_WARN_ON_ONCE(!test_tlb_flush_pending(cpu, prev));
+			clear_tlb_flush_pending(cpu, prev);
 		}
 
 		/* Start receiving IPIs and then read tlb_gen (and LAM below) */
 		if (next != &init_mm)
-			cpumask_set_cpu(cpu, mm_cpumask(next));
+			set_tlb_flush_pending(cpu, next);
 		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
 
 		choose_new_asid(next, next_tlb_gen, &new_asid, &need_flush);
@@ -1020,6 +1019,7 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	 * a local TLB flush is needed. Optimize this use-case by calling
 	 * flush_tlb_func_local() directly in this case.
 	 */
+	update_mm_cpumask(mm);
 	if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
 		flush_tlb_multi(mm_cpumask(mm), info);
 	} else if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {

@@ -936,6 +936,7 @@ const cpumask_t *sgx_encl_cpumask(struct sgx_encl *encl)
 		if (!mmget_not_zero(encl_mm->mm))
 			continue;
 
+		update_mm_cpumask(encl_mm->mm);
 		cpumask_or(cpumask, cpumask, mm_cpumask(encl_mm->mm));
 
 		mmput_async(encl_mm->mm);
