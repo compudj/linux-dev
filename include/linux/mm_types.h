@@ -1087,6 +1087,8 @@ struct mm_struct {
 			 MT_FLAGS_USE_RCU)
 extern struct mm_struct init_mm;
 
+extern DECLARE_PER_CPU(cpumask_t, percpu_mm_cpumask);
+
 /* Pointer magic because the dynamic array size confuses some compilers. */
 static inline void mm_init_cpumask(struct mm_struct *mm)
 {
@@ -1099,7 +1101,7 @@ static inline void mm_init_cpumask(struct mm_struct *mm)
 /* Future-safe accessor for struct mm_struct's cpu_vm_mask. */
 static inline cpumask_t *mm_cpumask(struct mm_struct *mm)
 {
-	return (struct cpumask *)&mm->cpu_bitmap;
+	return this_cpu_ptr(&percpu_mm_cpumask);
 }
 
 #ifdef CONFIG_LRU_GEN
@@ -1312,14 +1314,15 @@ static inline bool test_tlb_flush_pending(int cpu, struct mm_struct *mm)
 static inline void update_mm_cpumask(struct mm_struct *mm)
 {
 	int cpu;
+	cpumask_t *cpumask = mm_cpumask(mm);
 
 	/*
-	 * Iterate over each online cpu mm_percpu to sample the
+	 * Iterate over each possible cpu mm_percpu to sample the
 	 * tlb_flush_pending state, reflect it into the mm_cpumask.
 	 */
-	for_each_online_cpu(cpu) {
-		cpumask_assign_cpu(cpu, mm_cpumask(mm),
-				   test_tlb_flush_pending(cpu, mm));
+	for_each_possible_cpu(cpu) {
+		__cpumask_assign_cpu(cpu, cpumask,
+				     test_tlb_flush_pending(cpu, mm));
 	}
 }
 #else
