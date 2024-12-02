@@ -1087,7 +1087,7 @@ struct mm_struct {
 			 MT_FLAGS_USE_RCU)
 extern struct mm_struct init_mm;
 
-extern DECLARE_PER_CPU(cpumask_t, percpu_mm_cpumask);
+DECLARE_PER_CPU(cpumask_t, percpu_mm_cpumask);
 
 /* Pointer magic because the dynamic array size confuses some compilers. */
 static inline void mm_init_cpumask(struct mm_struct *mm)
