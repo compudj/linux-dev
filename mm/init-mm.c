@@ -17,6 +17,8 @@
 #define INIT_MM_CONTEXT(name)
 #endif
 
+DEFINE_PER_CPU(cpumask_t, percpu_mm_cpumask);
+
 const struct vm_operations_struct vma_dummy_vm_ops;
 
 /*
