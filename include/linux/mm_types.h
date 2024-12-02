@@ -794,6 +794,7 @@ struct mm_percpu_struct {
 	 * CPU.
 	 */
 	int tlb_flush_pending;
+	unsigned int nr_updates;
 # endif
 # ifdef CONFIG_SCHED_MM_CID
 	/**
@@ -1293,6 +1294,7 @@ static inline void mm_init_percpu_tlb_flush(struct mm_struct *mm)
 		struct mm_percpu_struct *mm_percpu = per_cpu_ptr(mm->mm_percpu, cpu);
 
 		mm_percpu->tlb_flush_pending = 0;
+		mm_percpu->nr_updates = 0;
 	}
 }
 
@@ -1313,16 +1315,26 @@ static inline bool test_tlb_flush_pending(int cpu, struct mm_struct *mm)
 
 static inline void update_mm_cpumask(struct mm_struct *mm)
 {
-	int cpu;
+	struct mm_percpu_struct *mm_percpu = this_cpu_ptr(mm->mm_percpu);
 	cpumask_t *cpumask = mm_cpumask(mm);
-
-	/*
-	 * Iterate over each possible cpu mm_percpu to sample the
-	 * tlb_flush_pending state, reflect it into the mm_cpumask.
-	 */
-	for_each_possible_cpu(cpu) {
-		__cpumask_assign_cpu(cpu, cpumask,
-				     test_tlb_flush_pending(cpu, mm));
+	int cpu;
+	
+	if (mm_percpu->nr_updates == 1024) {
+		/*
+		 * Iterate over each possible cpu mm_percpu to sample the
+		 * tlb_flush_pending state, reflect it into the mm_cpumask.
+		 */
+		for_each_possible_cpu(cpu) {
+			__cpumask_assign_cpu(cpu, cpumask,
+					     test_tlb_flush_pending(cpu, mm));
+		}
+		mm_percpu->nr_updates = 0;
+	} else {
+		for_each_clear_bit(cpu, cpumask_bits(cpumask), small_cpumask_bits) {
+			if (test_tlb_flush_pending(cpu, mm))
+				__cpumask_set_cpu(cpu, cpumask);
+		}
+		mm_percpu->nr_updates++;
 	}
 }
 #else
