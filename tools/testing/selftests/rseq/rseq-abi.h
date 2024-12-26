@@ -53,6 +53,41 @@ struct rseq_abi_cs {
 	__u64 abort_ip;
 } __attribute__((aligned(4 * sizeof(__u64))));
 
+union rseq_ptr {
+	__u64 ptr64;
+
+	/*
+	 * The "arch" field provides architecture accessor for
+	 * the ptr field based on architecture pointer size and
+	 * endianness.
+	 */
+	struct {
+#ifdef __LP64__
+		__u64 ptr;
+#elif defined(__BYTE_ORDER) ? (__BYTE_ORDER == __BIG_ENDIAN) : defined(__BIG_ENDIAN)
+		__u32 padding;		/* Initialized to zero. */
+		__u32 ptr;
+#else
+		__u32 ptr;
+		__u32 padding;		/* Initialized to zero. */
+#endif
+	} arch;
+};
+
+struct rseq_reset_area {
+	/* Pointer to area to update on preemption. */
+	__u64 ptr_area;
+	/* Pointer to value to use for update. If NULL, use zeroes. */
+	__u64 ptr_value;
+	/* Area length. */
+	__u32 len;
+
+	/* Pointer to next rseq_reset_area. NULL for end of list. */
+	union rseq_ptr next;
+	/* Pointer to previous rseq_reset_area. */
+	__u64 prev;
+};
+
 /*
  * struct rseq_abi is aligned on 4 * 8 bytes to ensure it is always
  * contained within a single cache-line.
@@ -106,26 +141,7 @@ struct rseq_abi {
 	 * atomicity semantics. This field should only be updated by the
 	 * thread which registered this data structure. Aligned on 64-bit.
 	 */
-	union {
-		__u64 ptr64;
-
-		/*
-		 * The "arch" field provides architecture accessor for
-		 * the ptr field based on architecture pointer size and
-		 * endianness.
-		 */
-		struct {
-#ifdef __LP64__
-			__u64 ptr;
-#elif defined(__BYTE_ORDER) ? (__BYTE_ORDER == __BIG_ENDIAN) : defined(__BIG_ENDIAN)
-			__u32 padding;		/* Initialized to zero. */
-			__u32 ptr;
-#else
-			__u32 ptr;
-			__u32 padding;		/* Initialized to zero. */
-#endif
-		} arch;
-	} rseq_cs;
+	union rseq_ptr rseq_cs;
 
 	/*
 	 * Restartable sequences flags field.
@@ -163,6 +179,22 @@ struct rseq_abi {
 	 * (allocated uniquely within a memory map).
 	 */
 	__u32 mm_cid;
+
+	/*
+	 * List of areas to reset on preemption or signal delivery.
+	 * This list head is updated by userspace with single-copy
+	 * atomicity semantics.
+	 * If this list head is NULL, then the list is empty.
+	 * The list ends with a reset area that has a NULL next pointer.
+	 * Userspace should ensure the reset area structure is populated
+	 * before inserting it into the list head or next pointers from
+	 * a program order perspective.
+	 * Userspace should ensure the reset area structure is removed
+	 * from the list by updating the previous next pointer (or list
+	 * head) before reclaiming its memory from a program order
+	 * perspective.
+	 */
+	union rseq_ptr reset_area_list;
 
 	/*
 	 * Flexible array member at end of structure, after last feature field.
