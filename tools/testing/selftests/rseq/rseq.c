@@ -111,7 +111,7 @@ unsigned int get_rseq_min_alloc_size(void)
 {
 	unsigned int alloc_size = rseq_size;
 
-	if (alloc_size < ORIG_RSEQ_ALLOC_SIZE)
+	if ((int) alloc_size < ORIG_RSEQ_ALLOC_SIZE)
 		alloc_size = ORIG_RSEQ_ALLOC_SIZE;
 	return alloc_size;
 }
@@ -235,12 +235,20 @@ void rseq_init(void)
 		return;
 	}
 	rseq_ownership = 1;
-	if (!rseq_available()) {
-		rseq_size = 0;
-		return;
+
+        /* Calculate the offset of the rseq area from the thread pointer. */
+        rseq_offset = (uintptr_t)&__rseq_abi - (uintptr_t)rseq_thread_pointer();
+
+        /* rseq flags are deprecated, always set to 0. */
+        rseq_flags = 0;
+	{
+		unsigned int rseq_kernel_feature_size = get_rseq_kernel_feature_size();
+
+		if (rseq_kernel_feature_size <= RSEQ_THREAD_AREA_ALLOC_SIZE)
+			rseq_size = rseq_kernel_feature_size;
+		else
+			rseq_size = ORIG_RSEQ_ALLOC_SIZE;
 	}
-	rseq_offset = (void *)&__rseq_abi - rseq_thread_pointer();
-	rseq_flags = 0;
 }
 
 static __attribute__((destructor))
