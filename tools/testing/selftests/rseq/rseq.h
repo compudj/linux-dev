@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <linux/kernel.h>
 #include "rseq-abi.h"
 #include "compiler.h"
 
@@ -372,6 +373,46 @@ int rseq_cmpeqv_trymemcpy_storev(enum rseq_mo rseq_mo, enum rseq_percpu_mode per
 		return -1;
 	default:
 		return -1;
+	}
+}
+
+static inline
+void rseq_reset_area_init(struct rseq_reset_area *area,
+			  void *ptr_area, void *ptr_reset_value, size_t len)
+{
+	area->ptr_area = (__u64)(unsigned long)ptr_area;
+	area->ptr_value = (__u64)(unsigned long)ptr_reset_value;
+	area->len = len;
+}
+
+static inline
+void rseq_reset_area_register(struct rseq_reset_area *area)
+{
+	struct rseq_abi *rseq = rseq_get_abi();
+
+	area->prev = (__u64)(unsigned long)&rseq->reset_area_list;
+	if (rseq->reset_area_list.arch.ptr) {
+		struct rseq_reset_area *old_first =
+			container_of((union rseq_ptr *)(unsigned long)rseq->reset_area_list.arch.ptr,
+				     struct rseq_reset_area, next);
+		old_first->prev = (__u64)(unsigned long)&area->next;
+	}
+	area->next.ptr64 = rseq->reset_area_list.ptr64;
+	rseq_barrier();
+	RSEQ_WRITE_ONCE(rseq->reset_area_list.arch.ptr, (unsigned long)&area->next);
+}
+
+static inline
+void rseq_reset_area_unregister(struct rseq_reset_area *area)
+{
+	RSEQ_WRITE_ONCE(((union rseq_ptr *)(unsigned long)area->prev)->arch.ptr,
+			area->next.arch.ptr);
+	rseq_barrier();
+	if (area->next.ptr64) {
+		struct rseq_reset_area *next_area =
+			container_of((union rseq_ptr *)(unsigned long)area->next.arch.ptr,
+				     struct rseq_reset_area, next);
+		next_area->prev = area->prev;
 	}
 }
 
