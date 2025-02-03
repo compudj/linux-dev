@@ -701,6 +701,48 @@ static __always_inline bool PageAnon(const struct page *page)
 	return folio_test_anon(page_folio(page));
 }
 
+#ifdef CONFIG_SKSM
+static __always_inline bool folio_test_sksm(const struct folio *folio)
+{
+	return !hlist_unhashed_lockless(&folio->page.sksm_node);
+}
+#else
+static __always_inline bool folio_test_sksm(const struct folio *folio)
+{
+	return false;
+}
+#endif
+
+static __always_inline bool PageSKSM(const struct page *page)
+{
+	return folio_test_sksm(page_folio(page));
+}
+
+#ifdef CONFIG_SKSM
+static inline void set_page_checksum(struct page *page, u32 checksum)
+{
+	page->checksum = checksum;
+}
+
+static inline void init_page_sksm_node(struct page *page)
+{
+	INIT_HLIST_NODE(&page->sksm_node);
+}
+
+void __sksm_page_remove(struct page *page);
+
+static inline void sksm_page_remove(struct page *page)
+{
+	if (!PageSKSM(page))
+		return;
+	__sksm_page_remove(page);
+}
+#else
+static inline void set_page_checksum(struct page *page, u32 checksum) { }
+static inline void init_page_sksm_node(struct page *page) { }
+static inline void sksm_page_remove(struct page *page) { }
+#endif
+
 static __always_inline bool __folio_test_movable(const struct folio *folio)
 {
 	return ((unsigned long)folio->mapping & PAGE_MAPPING_FLAGS) ==

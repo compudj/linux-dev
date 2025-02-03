@@ -19,6 +19,7 @@
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
+#include <linux/types.h>
 
 #include <asm/mmu.h>
 
@@ -215,6 +216,12 @@ struct page {
 	 */
 	struct page *kmsan_shadow;
 	struct page *kmsan_origin;
+#endif
+
+#ifdef CONFIG_SKSM
+	/* TODO: move those fields into unused union fields instead. */
+	struct hlist_node sksm_node;
+	u32 checksum;
 #endif
 } _struct_page_alignment;
 

@@ -3618,6 +3618,8 @@ static bool wp_can_reuse_anon_folio(struct folio *folio,
 	 */
 	if (folio_test_ksm(folio) || folio_ref_count(folio) > 3)
 		return false;
+	if (folio_test_sksm(folio))
+		return false;
 	if (!folio_test_lru(folio))
 		/*
 		 * We cannot easily detect+handle references from

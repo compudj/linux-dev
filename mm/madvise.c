@@ -22,6 +22,7 @@
 #include <linux/string.h>
 #include <linux/uio.h>
 #include <linux/ksm.h>
+#include <linux/sksm.h>
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/blkdev.h>
@@ -1318,6 +1319,8 @@ static int madvise_vma_behavior(struct vm_area_struct *vma,
 		return madvise_guard_install(vma, prev, start, end);
 	case MADV_GUARD_REMOVE:
 		return madvise_guard_remove(vma, prev, start, end);
+	case MADV_MERGE:
+		return sksm_merge(vma, start, end);
 	}
 
 	anon_name = anon_vma_name(vma);
@@ -1422,6 +1425,9 @@ madvise_behavior_valid(int behavior)
 #ifdef CONFIG_MEMORY_FAILURE
 	case MADV_SOFT_OFFLINE:
 	case MADV_HWPOISON:
+#endif
+#ifdef CONFIG_SKSM
+	case MADV_MERGE:
 #endif
 		return true;
 

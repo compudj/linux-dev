@@ -118,6 +118,10 @@ static inline void ksm_exit(struct mm_struct *mm)
 {
 }
 
+static inline void ksm_map_zero_page(struct mm_struct *mm)
+{
+}
+
 static inline void ksm_might_unmap_zero_page(struct mm_struct *mm, pte_t pte)
 {
 }

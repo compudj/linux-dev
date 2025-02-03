@@ -1122,6 +1122,7 @@ __always_inline bool free_pages_prepare(struct page *page,
 			return false;
 	}
 
+	sksm_page_remove(page);
 	page_cpupid_reset_last(page);
 	page->flags &= ~PAGE_FLAGS_CHECK_AT_PREP;
 	reset_page_owner(page, order);
@@ -1509,6 +1510,8 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 
 	set_page_private(page, 0);
 	set_page_refcounted(page);
+	set_page_checksum(page, 0);
+	init_page_sksm_node(page);
 
 	arch_alloc_page(page, order);
 	debug_pagealloc_map_pages(page, 1 << order);
