@@ -79,6 +79,7 @@ struct statmount;
 struct mnt_id_req;
 struct xattr_args;
 struct file_attr;
+struct pokevec;
 
 #include <linux/types.h>
 #include <linux/aio_abi.h>
@@ -957,6 +958,7 @@ asmlinkage long sys_statx(int dfd, const char __user *path, unsigned flags,
 			  unsigned mask, struct statx __user *buffer);
 asmlinkage long sys_rseq(struct rseq __user *rseq, uint32_t rseq_len,
 			 int flags, uint32_t sig);
+asmlinkage long sys_pokev(const struct pokevec * pokevec, int pokevcnt);
 asmlinkage long sys_open_tree(int dfd, const char __user *path, unsigned flags);
 asmlinkage long sys_open_tree_attr(int dfd, const char __user *path,
 				   unsigned flags,
