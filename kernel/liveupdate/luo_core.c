@@ -291,7 +291,7 @@ void luo_free_unpreserve(void *mem, size_t size)
 		return;
 
 	folio = virt_to_folio(mem);
-	WARN_ON_ONCE(kho_unpreserve_folio(folio));
+	kho_unpreserve_folio(folio);
 	folio_put(folio);
 }
 
