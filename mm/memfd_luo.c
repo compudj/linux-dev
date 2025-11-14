@@ -138,7 +138,7 @@ static struct memfd_luo_folio_ser *memfd_luo_preserve_folios(struct file *file, 
 err_unpreserve:
 	i--;
 	for (; i >= 0; i--)
-		WARN_ON_ONCE(kho_unpreserve_folio(folios[i]));
+		kho_unpreserve_folio(folios[i]);
 	vfree(pfolios);
 err_unpin:
 	unpin_folios(folios, nr_folios);
@@ -170,7 +170,7 @@ static void memfd_luo_unpreserve_folios(void *fdt, struct memfd_luo_folio_ser *p
 
 		folio = pfn_folio(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
 
-		WARN_ON_ONCE(kho_unpreserve_folio(folio));
+		kho_unpreserve_folio(folio);
 		unpin_folio(folio);
 	}
 
