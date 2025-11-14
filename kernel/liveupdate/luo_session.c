@@ -98,7 +98,9 @@ struct luo_session_global {
 	struct luo_session_head incoming;
 	struct luo_session_head outgoing;
 	bool deserialized;
-} luo_session_global;
+};
+
+static struct luo_session_global luo_session_global;
 
 static struct luo_session *luo_session_alloc(const char *name)
 {
