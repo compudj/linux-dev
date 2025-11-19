@@ -588,6 +588,7 @@ static void check_mm(struct mm_struct *mm)
 			 "Please make sure 'struct resident_page_types[]' is updated as well");
 
 	for (i = 0; i < NR_MM_COUNTERS; i++) {
+		WARN_ON_ONCE(percpu_counter_tree_precise_sum(&mm->rss_stat[i]) != percpu_counter_sum(&mm->rss_stat_old[i]));
 		if (unlikely(percpu_counter_tree_precise_compare_value(&mm->rss_stat[i], 0) != 0))
 			pr_alert("BUG: Bad rss-counter state mm:%p type:%s val:%d Comm:%s Pid:%d\n",
 				 mm, resident_page_types[i],
@@ -693,6 +694,7 @@ void __mmdrop(struct mm_struct *mm)
 	put_user_ns(mm->user_ns);
 	mm_pasid_drop(mm);
 	mm_destroy_cid(mm);
+	percpu_counter_destroy_many(mm->rss_stat_old, NR_MM_COUNTERS);
 	for (i = 0; i < NR_MM_COUNTERS; i++)
 		percpu_counter_tree_destroy(&mm->rss_stat[i]);
 	free_mm(mm);
@@ -1090,6 +1092,10 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	if (mm_alloc_cid(mm, p))
 		goto fail_cid;
 
+	if (percpu_counter_init_many(mm->rss_stat_old, 0, GFP_KERNEL_ACCOUNT,
+				     NR_MM_COUNTERS))
+		goto fail_pcpu_old;
+
 	for (i = 0; i < NR_MM_COUNTERS; i++) {
 		if (percpu_counter_tree_init(&mm->rss_stat[i], RSS_STAT_BATCH_SIZE, GFP_KERNEL_ACCOUNT))
 			goto fail_pcpu;
@@ -1102,6 +1108,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 fail_pcpu:
 	for (i--; i >= 0; i--)
 		percpu_counter_tree_destroy(&mm->rss_stat[i]);
+fail_pcpu_old:
 	mm_destroy_cid(mm);
 fail_cid:
 	destroy_context(mm);

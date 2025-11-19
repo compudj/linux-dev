@@ -2686,7 +2686,29 @@ static inline bool get_user_page_fast_only(unsigned long addr,
  */
 static inline unsigned long get_mm_counter(struct mm_struct *mm, int member)
 {
-	return percpu_counter_tree_approximate_sum_positive(&mm->rss_stat[member]);
+	unsigned long oldcount, newcount, precise;
+	long olddelta, newdelta;
+	unsigned int new_max_inaccuracy = percpu_counter_tree_inaccuracy(&mm->rss_stat[member]);
+
+	oldcount = percpu_counter_read_positive(&mm->rss_stat_old[member]);
+	newcount = percpu_counter_tree_approximate_sum_positive(&mm->rss_stat[member]);
+	precise = percpu_counter_tree_precise_sum_positive(&mm->rss_stat[member]);
+	olddelta = (long)oldcount - (long)precise;
+	newdelta = (long)newcount - (long)precise;
+	if (abs(olddelta) > new_max_inaccuracy) {
+		static long max_delta;
+
+		if (max_delta < abs(olddelta)) {
+			max_delta = abs(olddelta);
+			pr_alert("BUG: Inaccurate legacy rss-counter approximation: mm:%p member:%d precise:%lu oldapprox:%lu olddelta:%ld newapprox:%lu newdelta:%ld newmaxinaccuracy:%u Comm:%s Pid:%d\n",
+				 mm, member,
+				 precise, oldcount, olddelta, newcount, newdelta, new_max_inaccuracy,
+				 current->comm,
+				 task_pid_nr(current));
+		}
+	}
+	WARN_ON_ONCE(abs(newdelta) > new_max_inaccuracy);
+	return newcount;
 }
 
 static inline unsigned long get_mm_counter_sum(struct mm_struct *mm, int member)
@@ -2698,6 +2720,7 @@ void mm_trace_rss_stat(struct mm_struct *mm, int member);
 
 static inline void add_mm_counter(struct mm_struct *mm, int member, long value)
 {
+	percpu_counter_add(&mm->rss_stat_old[member], value);
 	percpu_counter_tree_add(&mm->rss_stat[member], value);
 
 	mm_trace_rss_stat(mm, member);
@@ -2705,6 +2728,7 @@ static inline void add_mm_counter(struct mm_struct *mm, int member, long value)
 
 static inline void inc_mm_counter(struct mm_struct *mm, int member)
 {
+	percpu_counter_inc(&mm->rss_stat_old[member]);
 	percpu_counter_tree_add(&mm->rss_stat[member], 1);
 
 	mm_trace_rss_stat(mm, member);
@@ -2712,6 +2736,7 @@ static inline void inc_mm_counter(struct mm_struct *mm, int member)
 
 static inline void dec_mm_counter(struct mm_struct *mm, int member)
 {
+	percpu_counter_dec(&mm->rss_stat_old[member]);
 	percpu_counter_tree_add(&mm->rss_stat[member], -1);
 
 	mm_trace_rss_stat(mm, member);
