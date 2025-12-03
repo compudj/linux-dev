@@ -10379,6 +10379,9 @@ static bool mm_update_max_cids(struct mm_struct *mm)
 
 	/* Check whether owner mode must be changed */
 	if (!mc->percpu) {
+		/* May per-cpu memory be needed at the next fork ? */
+		if (mc->users >= mc->max_cids)
+			mc->need_percpu = true;
 		/* Enable per CPU mode when the number of users is above max_cids */
 		if (mc->users > mc->max_cids)
 			mc->pcpu_thrs = mm_cid_calc_pcpu_thrs(mc);
@@ -10565,14 +10568,12 @@ void sched_mm_cid_fork(struct task_struct *t)
 
 	guard(mutex)(&mm->mm_cid.mutex);
 	scoped_guard(raw_spinlock_irq, &mm->mm_cid.lock) {
-		struct mm_cid_pcpu *pcp = this_cpu_ptr(mm->mm_cid.pcpu);
+		struct mm_cid_pcpu *pcp;
 
 		/* First user ? */
 		if (!mm->mm_cid.users) {
 			sched_mm_cid_add_user(t, mm);
 			t->mm_cid.cid = mm_get_cid(mm);
-			/* Required for execve() */
-			pcp->cid = t->mm_cid.cid;
 			return;
 		}
 
@@ -10582,20 +10583,31 @@ void sched_mm_cid_fork(struct task_struct *t)
 			return;
 		}
 
+		pcp = this_cpu_ptr(mm->mm_cid.pcpu);
 		/* Handle the mode change and transfer current's CID */
 		percpu = !!mm->mm_cid.percpu;
-		if (!percpu)
+		if (!percpu) {
 			mm_cid_transit_to_task(current, pcp);
-		else
+		} else {
 			mm_cid_transfer_to_cpu(current, pcp);
+		}
 	}
-
 	if (percpu) {
 		mm_cid_fixup_tasks_to_cpus();
 	} else {
 		mm_cid_fixup_cpus_to_tasks(mm);
 		t->mm_cid.cid = mm_get_cid(mm);
 	}
+}
+
+int sched_mm_cid_alloc_percpu(struct task_struct *t)
+{
+	struct mm_struct *mm = t->mm;
+
+	guard(mutex)(&mm->mm_cid.mutex);
+	if (!mm->mm_cid.need_percpu || mm->mm_cid.pcpu)
+		return 0;
+	return mm_alloc_cid_percpu(mm);
 }
 
 static bool sched_mm_cid_remove_user(struct task_struct *t)
@@ -10664,7 +10676,7 @@ void sched_mm_cid_exit(struct task_struct *t)
 		/* Last user */
 		scoped_guard(raw_spinlock_irq, &mm->mm_cid.lock) {
 			/* Required across execve() */
-			if (t == current)
+			if (mm->mm_cid.pcpu && t == current)
 				mm_cid_transit_to_task(t, this_cpu_ptr(mm->mm_cid.pcpu));
 			/* Ignore mode change. There is nothing to do. */
 			sched_mm_cid_remove_user(t);
@@ -10732,6 +10744,7 @@ static void mm_cid_irq_work(struct irq_work *work)
 
 void mm_init_cid(struct mm_struct *mm, struct task_struct *p)
 {
+	mm->mm_cid.pcpu = NULL;
 	mm->mm_cid.max_cids = 0;
 	mm->mm_cid.percpu = 0;
 	mm->mm_cid.transit = 0;
@@ -10739,6 +10752,7 @@ void mm_init_cid(struct mm_struct *mm, struct task_struct *p)
 	mm->mm_cid.users = 0;
 	mm->mm_cid.pcpu_thrs = 0;
 	mm->mm_cid.update_deferred = 0;
+	mm->mm_cid.need_percpu = 0;
 	raw_spin_lock_init(&mm->mm_cid.lock);
 	mutex_init(&mm->mm_cid.mutex);
 	mm->mm_cid.irq_work = IRQ_WORK_INIT_HARD(mm_cid_irq_work);

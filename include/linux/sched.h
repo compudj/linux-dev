@@ -2306,6 +2306,7 @@ static __always_inline void alloc_tag_restore(struct alloc_tag *tag, struct allo
 void sched_mm_cid_before_execve(struct task_struct *t);
 void sched_mm_cid_after_execve(struct task_struct *t);
 void sched_mm_cid_fork(struct task_struct *t);
+int sched_mm_cid_alloc_percpu(struct task_struct *t);
 void sched_mm_cid_exit(struct task_struct *t);
 static __always_inline int task_mm_cid(struct task_struct *t)
 {
@@ -2315,6 +2316,7 @@ static __always_inline int task_mm_cid(struct task_struct *t)
 static inline void sched_mm_cid_before_execve(struct task_struct *t) { }
 static inline void sched_mm_cid_after_execve(struct task_struct *t) { }
 static inline void sched_mm_cid_fork(struct task_struct *t) { }
+static inline int sched_mm_cid_alloc_percpu(struct task_struct *t) { return 0; }
 static inline void sched_mm_cid_exit(struct task_struct *t) { }
 static __always_inline int task_mm_cid(struct task_struct *t)
 {

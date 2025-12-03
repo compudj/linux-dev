@@ -1066,6 +1066,8 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 		mm->def_flags = 0;
 	}
 
+	mm_init_cid(mm, p);
+
 	if (futex_mm_init(mm))
 		goto fail_mm_init;
 
@@ -1078,9 +1080,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	if (init_new_context(p, mm))
 		goto fail_nocontext;
 
-	if (mm_alloc_cid(mm, p))
-		goto fail_cid;
-
 	if (percpu_counter_init_many(mm->rss_stat, 0, GFP_KERNEL_ACCOUNT,
 				     NR_MM_COUNTERS))
 		goto fail_pcpu;
@@ -1090,8 +1089,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	return mm;
 
 fail_pcpu:
-	mm_destroy_cid(mm);
-fail_cid:
 	destroy_context(mm);
 fail_nocontext:
 	mm_free_id(mm);
@@ -1533,6 +1530,8 @@ static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 		return 0;
 
 	if (clone_flags & CLONE_VM) {
+		if (sched_mm_cid_alloc_percpu(current))
+			return -ENOMEM;
 		mmget(oldmm);
 		mm = oldmm;
 	} else {

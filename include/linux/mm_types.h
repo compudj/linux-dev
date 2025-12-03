@@ -1353,15 +1353,14 @@ static inline unsigned long *mm_cidmask(struct mm_struct *mm)
 
 void mm_init_cid(struct mm_struct *mm, struct task_struct *p);
 
-static inline int mm_alloc_cid_noprof(struct mm_struct *mm, struct task_struct *p)
+static inline int mm_alloc_cid_percpu_noprof(struct mm_struct *mm)
 {
 	mm->mm_cid.pcpu = alloc_percpu_noprof(struct mm_cid_pcpu);
 	if (!mm->mm_cid.pcpu)
 		return -ENOMEM;
-	mm_init_cid(mm, p);
 	return 0;
 }
-#define mm_alloc_cid(...)	alloc_hooks(mm_alloc_cid_noprof(__VA_ARGS__))
+#define mm_alloc_cid_percpu(...)	alloc_hooks(mm_alloc_cid_percpu_noprof(__VA_ARGS__))
 
 static inline void mm_destroy_cid(struct mm_struct *mm)
 {
@@ -1377,7 +1376,7 @@ static inline unsigned int mm_cid_size(void)
 
 #else /* CONFIG_SCHED_MM_CID */
 static inline void mm_init_cid(struct mm_struct *mm, struct task_struct *p) { }
-static inline int mm_alloc_cid(struct mm_struct *mm, struct task_struct *p) { return 0; }
+static inline int mm_alloc_cid_percpu(struct mm_struct *mm) { return 0; }
 static inline void mm_destroy_cid(struct mm_struct *mm) { }
 static inline unsigned int mm_cid_size(void)
 {

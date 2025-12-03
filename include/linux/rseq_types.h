@@ -135,6 +135,7 @@ struct mm_cid_pcpu {
  *			do not actually share the MM.
  * @pcpu_thrs:		Threshold for switching back from per CPU mode
  * @update_deferred:	A deferred switch back to per task mode is pending.
+ * @need_percpu:	Per CPU storage may be needed at the next fork.
  */
 struct mm_mm_cid {
 	/* Hotpath read mostly members */
@@ -155,6 +156,7 @@ struct mm_mm_cid {
 	unsigned int		users;
 	unsigned int		pcpu_thrs;
 	unsigned int		update_deferred;
+	unsigned int		need_percpu;
 }____cacheline_aligned_in_smp;
 #else /* CONFIG_SCHED_MM_CID */
 struct mm_mm_cid { };
