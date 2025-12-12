@@ -10460,27 +10460,30 @@ static void mm_cid_fixup_cpus_to_tasks(struct mm_struct *mm)
 	for_each_possible_cpu(cpu) {
 		struct mm_cid_pcpu *pcp = per_cpu_ptr(mm->mm_cid.pcpu, cpu);
 		struct rq *rq = cpu_rq(cpu);
+		struct task_struct *curr;
 
 		/* Remote access to mm::mm_cid::pcpu requires rq_lock */
 		guard(rq_lock_irq)(rq);
+		curr = rcu_dereference_protected(rq->curr,
+						 lockdep_is_held(__rq_lockp(rq)));
 		/* Is the CID still owned by the CPU? */
 		if (cid_on_cpu(pcp->cid)) {
 			/*
 			 * If rq->curr has @mm, transfer it with the
 			 * transition bit set. Otherwise drop it.
 			 */
-			if (rq->curr->mm == mm && rq->curr->mm_cid.active)
-				mm_cid_transit_to_task(rq->curr, pcp);
+			if (curr->mm == mm && curr->mm_cid.active)
+				mm_cid_transit_to_task(curr, pcp);
 			else
 				mm_drop_cid_on_cpu(mm, pcp);
 
-		} else if (rq->curr->mm == mm && rq->curr->mm_cid.active) {
-			unsigned int cid = rq->curr->mm_cid.cid;
+		} else if (curr->mm == mm && curr->mm_cid.active) {
+			unsigned int cid = curr->mm_cid.cid;
 
 			/* Ensure it has the transition bit set */
 			if (!cid_in_transit(cid)) {
 				cid = cid_to_transit_cid(cid);
-				rq->curr->mm_cid.cid = cid;
+				curr->mm_cid.cid = cid;
 				pcp->cid = cid;
 			}
 		}
