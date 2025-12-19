@@ -1276,7 +1276,7 @@ extern struct mm_struct init_mm;
 
 #define MM_STRUCT_FLEXIBLE_ARRAY_INIT				\
 {								\
-	[0 ... sizeof(cpumask_t)-1] = 0				\
+	[0 ... sizeof(cpumask_t) + MM_CID_STATIC_SIZE - 1] = 0	\
 }
 
 /* Pointer magic because the dynamic array size confuses some compilers. */
@@ -1468,6 +1468,9 @@ static inline unsigned int mm_cid_size(void)
 	return 2 * cpumask_size();	/* mm_cpus_allowed(), mm_cidmask(). */
 }
 
+/* Use NR_CPUS as worse case for static allocation. */
+#define MM_CID_STATIC_SIZE	(2 * sizeof(cpumask_t))
+
 static inline void mm_set_cpus_allowed(struct mm_struct *mm, const struct cpumask *cpumask)
 {
 	struct cpumask *mm_allowed = mm_cpus_allowed(mm);
@@ -1489,6 +1492,9 @@ static inline unsigned int mm_cid_size(void)
 {
 	return 0;
 }
+
+#define MM_CID_STATIC_SIZE	0
+
 static inline void mm_set_cpus_allowed(struct mm_struct *mm, const struct cpumask *cpumask) { }
 #endif /* CONFIG_SCHED_MM_CID */
 
