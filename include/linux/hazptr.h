@@ -190,7 +190,6 @@ void hazptr_release(struct hazptr_ctx *ctx, void *addr)
 		return;
 	guard(preempt)();
 	slot = ctx->slot;
-	WARN_ON_ONCE(slot->addr != addr);
 	smp_store_release(&slot->addr, NULL);
 	if (unlikely(hazptr_slot_is_backup(ctx, slot)))
 		hazptr_unchain_backup_slot(ctx);
