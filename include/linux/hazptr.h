@@ -68,6 +68,8 @@ struct hazptr_percpu_slots {
 
 DECLARE_PER_CPU(struct hazptr_percpu_slots, hazptr_percpu_slots);
 
+void *__hazptr_acquire(struct hazptr_ctx *ctx, void * const * addr_p, struct hazptr_slot *slot);
+
 /*
  * hazptr_synchronize: Wait until @addr is released from all slots.
  *
@@ -89,24 +91,6 @@ struct hazptr_slot *hazptr_chain_backup_slot(struct hazptr_ctx *ctx);
  * hazptr_unchain_backup_slot: Unchain backup slot from overflow list.
  */
 void hazptr_unchain_backup_slot(struct hazptr_ctx *ctx);
-
-static inline
-struct hazptr_slot *hazptr_get_free_percpu_slot(struct hazptr_ctx *ctx)
-{
-	struct hazptr_percpu_slots *percpu_slots = this_cpu_ptr(&hazptr_percpu_slots);
-	unsigned int idx;
-
-	for (idx = 0; idx < NR_HAZPTR_PERCPU_SLOTS; idx++) {
-		struct hazptr_slot *slot = &percpu_slots->slots[idx];
-
-		if (!slot->addr) {
-			percpu_slots->slots_ctx[idx].ctx = ctx;
-			return slot;
-		}
-	}
-	/* All slots are in use. */
-	return NULL;
-}
 
 static inline
 bool hazptr_slot_is_backup(struct hazptr_ctx *ctx, struct hazptr_slot *slot)
@@ -160,56 +144,35 @@ void hazptr_note_context_switch(void)
 static inline
 void *hazptr_acquire(struct hazptr_ctx *ctx, void * const * addr_p)
 {
-	struct hazptr_slot *slot = NULL;
+	struct hazptr_percpu_slots *percpu_slots;
+	struct hazptr_slot *slot;
 	void *addr, *addr2;
 
-	ctx->slot = NULL;
 	/*
 	 * Load @addr_p to know which address should be protected.
 	 */
 	addr = READ_ONCE(*addr_p);
-	for (;;) {
-		if (!addr)
-			return NULL;
+	if (unlikely(!addr))
+		return NULL;
 
-		guard(preempt)();
-		if (likely(!hazptr_slot_is_backup(ctx, slot))) {
-			slot = hazptr_get_free_percpu_slot(ctx);
-			/*
-			 * If all the per-CPU slots are already in use, fallback
-			 * to the backup slot.
-			 */
-			if (unlikely(!slot))
-				slot = hazptr_chain_backup_slot(ctx);
-		}
-		WRITE_ONCE(slot->addr, addr);	/* Store B */
+	guard(preempt)();
+	percpu_slots = this_cpu_ptr(&hazptr_percpu_slots);
+	slot = &percpu_slots->slots[0];
+	if (unlikely(slot->addr))
+		return __hazptr_acquire(ctx, addr_p, NULL);
+	percpu_slots->slots_ctx[0].ctx = ctx;
 
-		/* Memory ordering: Store B before Load A. */
-		smp_mb();
+	WRITE_ONCE(slot->addr, addr);	/* Store B */
 
-		/*
-		 * Re-load @addr_p after storing it to the hazard pointer slot.
-		 */
-		addr2 = READ_ONCE(*addr_p);	/* Load A */
-		if (likely(ptr_eq(addr2, addr))) {
-			ctx->slot = slot;
-			/* Success. Break loop, enable preemption and return. */
-			break;
-		}
-		/*
-		 * If @addr_p content has changed since the first load,
-		 * release the hazard pointer and try again.
-		 */
-		WRITE_ONCE(slot->addr, NULL);
-		if (!addr2) {
-			if (hazptr_slot_is_backup(ctx, slot))
-				hazptr_unchain_backup_slot(ctx);
-			/* Loaded NULL. Enable preemption and return NULL. */
-			return NULL;
-		}
-		addr = addr2;
-		/* Enable preemption and retry. */
-	}
+	/* Memory ordering: Store B before Load A. */
+	smp_mb();
+	/*
+	 * Re-load @addr_p after storing it to the hazard pointer slot.
+	 */
+	addr2 = READ_ONCE(*addr_p);	/* Load A */
+	if (unlikely(!ptr_eq(addr2, addr)))
+		return __hazptr_acquire(ctx, addr_p, slot);
+	ctx->slot = slot;
 	/*
 	 * Use addr2 loaded from the second READ_ONCE() to preserve
 	 * address dependency ordering.
