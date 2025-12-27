@@ -52,8 +52,18 @@ struct hazptr_ctx {
 	struct hlist_node preempt_node;
 };
 
+struct hazptr_slot_ctx {
+	struct hazptr_ctx *ctx;
+};
+
 struct hazptr_percpu_slots {
 	struct hazptr_slot slots[NR_HAZPTR_PERCPU_SLOTS];
+	/*
+	 * The slot ctx array is populated with the same index as
+	 * slot array. The slot ctx items contain pointers which are
+	 * only meaningful when the corresponding slot addr is non-NULL.
+	 */
+	struct hazptr_slot_ctx slots_ctx[NR_HAZPTR_PERCPU_SLOTS];
 } ____cacheline_aligned;
 
 DECLARE_PER_CPU(struct hazptr_percpu_slots, hazptr_percpu_slots);
@@ -81,7 +91,7 @@ struct hazptr_slot *hazptr_chain_backup_slot(struct hazptr_ctx *ctx);
 void hazptr_unchain_backup_slot(struct hazptr_ctx *ctx);
 
 static inline
-struct hazptr_slot *hazptr_get_free_percpu_slot(void)
+struct hazptr_slot *hazptr_get_free_percpu_slot(struct hazptr_ctx *ctx)
 {
 	struct hazptr_percpu_slots *percpu_slots = this_cpu_ptr(&hazptr_percpu_slots);
 	unsigned int idx;
@@ -89,8 +99,10 @@ struct hazptr_slot *hazptr_get_free_percpu_slot(void)
 	for (idx = 0; idx < NR_HAZPTR_PERCPU_SLOTS; idx++) {
 		struct hazptr_slot *slot = &percpu_slots->slots[idx];
 
-		if (!READ_ONCE(slot->addr))
+		if (!slot->addr) {
+			percpu_slots->slots_ctx[idx].ctx = ctx;
 			return slot;
+		}
 	}
 	/* All slots are in use. */
 	return NULL;
@@ -103,42 +115,33 @@ bool hazptr_slot_is_backup(struct hazptr_ctx *ctx, struct hazptr_slot *slot)
 }
 
 static inline
-void hazptr_chain_task_ctx(struct hazptr_ctx *ctx)
-{
-	hlist_add_head(&ctx->preempt_node, &current->hazptr_ctx_list);
-}
-
-static inline
-void hazptr_unchain_task_ctx(struct hazptr_ctx *ctx)
-{
-	hlist_del(&ctx->preempt_node);
-}
-
-static inline
 void hazptr_note_context_switch(void)
 {
-	struct hazptr_ctx *ctx;
+	struct hazptr_percpu_slots *percpu_slots = this_cpu_ptr(&hazptr_percpu_slots);
+	unsigned int idx;
 
-	hlist_for_each_entry(ctx, &current->hazptr_ctx_list, preempt_node) {
-		struct hazptr_slot *slot;
+	for (idx = 0; idx < NR_HAZPTR_PERCPU_SLOTS; idx++) {
+		struct hazptr_slot *slot = &percpu_slots->slots[idx], *backup_slot;
+		struct hazptr_ctx *ctx;
 
-		if (hazptr_slot_is_backup(ctx, ctx->slot))
+		if (!slot->addr)
 			continue;
-		slot = hazptr_chain_backup_slot(ctx);
+		ctx = percpu_slots->slots_ctx[idx].ctx;
+		backup_slot = hazptr_chain_backup_slot(ctx);
 		/*
 		 * Move hazard pointer from per-CPU slot to backup slot.
 		 * This requires hazard pointer synchronize to iterate
 		 * on per-CPU slots with load-acquire before iterating
 		 * on the overflow list.
 		 */
-		WRITE_ONCE(slot->addr, ctx->slot->addr);
+		WRITE_ONCE(backup_slot->addr, slot->addr);
 		/*
 		 * store-release orders store to backup slot addr before
 		 * store to per-CPU slot addr.
 		 */
-		smp_store_release(&ctx->slot->addr, NULL);
+		smp_store_release(&slot->addr, NULL);
 		/* Use the backup slot for context. */
-		ctx->slot = slot;
+		ctx->slot = backup_slot;
 	}
 }
 
@@ -170,9 +173,8 @@ void *hazptr_acquire(struct hazptr_ctx *ctx, void * const * addr_p)
 			return NULL;
 
 		guard(preempt)();
-		hazptr_chain_task_ctx(ctx);
 		if (likely(!hazptr_slot_is_backup(ctx, slot))) {
-			slot = hazptr_get_free_percpu_slot();
+			slot = hazptr_get_free_percpu_slot(ctx);
 			/*
 			 * If all the per-CPU slots are already in use, fallback
 			 * to the backup slot.
@@ -202,12 +204,10 @@ void *hazptr_acquire(struct hazptr_ctx *ctx, void * const * addr_p)
 		if (!addr2) {
 			if (hazptr_slot_is_backup(ctx, slot))
 				hazptr_unchain_backup_slot(ctx);
-			hazptr_unchain_task_ctx(ctx);
 			/* Loaded NULL. Enable preemption and return NULL. */
 			return NULL;
 		}
 		addr = addr2;
-		hazptr_unchain_task_ctx(ctx);
 		/* Enable preemption and retry. */
 	}
 	/*
@@ -231,7 +231,6 @@ void hazptr_release(struct hazptr_ctx *ctx, void *addr)
 	smp_store_release(&slot->addr, NULL);
 	if (unlikely(hazptr_slot_is_backup(ctx, slot)))
 		hazptr_unchain_backup_slot(ctx);
-	hazptr_unchain_task_ctx(ctx);
 }
 
 void hazptr_init(void);

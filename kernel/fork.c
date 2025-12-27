@@ -1774,7 +1774,6 @@ init_task_pid(struct task_struct *task, enum pid_type type, struct pid *pid)
 
 static inline void rcu_copy_process(struct task_struct *p)
 {
-	INIT_HLIST_HEAD(&p->hazptr_ctx_list);
 #ifdef CONFIG_PREEMPT_RCU
 	p->rcu_read_lock_nesting = 0;
 	p->rcu_read_unlock_special.s = 0;
