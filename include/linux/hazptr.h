@@ -28,6 +28,7 @@
 
 /* 8 slots (each sizeof(void *)) fit in a single cache line. */
 #define NR_HAZPTR_PERCPU_SLOTS	8
+#define HAZPTR_WILDCARD		((void *) 0x1UL)
 
 /*
  * Hazard pointer slot.
@@ -146,38 +147,29 @@ void *hazptr_acquire(struct hazptr_ctx *ctx, void * const * addr_p)
 {
 	struct hazptr_percpu_slots *percpu_slots;
 	struct hazptr_slot *slot;
-	void *addr, *addr2;
-
-	/*
-	 * Load @addr_p to know which address should be protected.
-	 */
-	addr = READ_ONCE(*addr_p);
-	if (unlikely(!addr))
-		return NULL;
+	void *addr;
 
 	guard(preempt)();
 	percpu_slots = this_cpu_ptr(&hazptr_percpu_slots);
 	slot = &percpu_slots->slots[0];
 	if (unlikely(slot->addr))
 		return __hazptr_acquire(ctx, addr_p, NULL);
+	WRITE_ONCE(slot->addr, HAZPTR_WILDCARD);	/* Store B */
 	percpu_slots->slots_ctx[0].ctx = ctx;
-
-	WRITE_ONCE(slot->addr, addr);	/* Store B */
-
 	/* Memory ordering: Store B before Load A. */
 	smp_mb();
 	/*
-	 * Re-load @addr_p after storing it to the hazard pointer slot.
+	 * Load @addr_p after storing wildcard to the hazard pointer slot.
 	 */
-	addr2 = READ_ONCE(*addr_p);	/* Load A */
-	if (unlikely(!ptr_eq(addr2, addr)))
-		return __hazptr_acquire(ctx, addr_p, slot);
-	ctx->slot = slot;
+	addr = READ_ONCE(*addr_p);	/* Load A */
 	/*
-	 * Use addr2 loaded from the second READ_ONCE() to preserve
-	 * address dependency ordering.
+	 * We don't care about ordering of Store C. It will simply
+	 * replace the wildcard by a more specific address. If addr is
+	 * NULL, we simply store NULL into the slot.
 	 */
-	return addr2;
+	WRITE_ONCE(slot->addr, addr);	/* Store C */
+	ctx->slot = slot;
+	return addr;
 }
 
 /* Release the protected hazard pointer from @slot. */

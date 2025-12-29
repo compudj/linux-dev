@@ -62,7 +62,7 @@ struct hazptr_slot *hazptr_get_free_percpu_slot(struct hazptr_ctx *ctx)
  */
 void *__hazptr_acquire(struct hazptr_ctx *ctx, void * const * addr_p, struct hazptr_slot *slot)
 {
-	void *addr, *addr2;
+	void *addr;
 
 	/*
 	 * Release slot from fast path.
@@ -76,52 +76,34 @@ void *__hazptr_acquire(struct hazptr_ctx *ctx, void * const * addr_p, struct haz
 	 * Load @addr_p to know which address should be protected.
 	 */
 	addr = READ_ONCE(*addr_p);
-	for (;;) {
-		if (!addr)
-			return NULL;
-
-		if (likely(!hazptr_slot_is_backup(ctx, slot))) {
-			slot = hazptr_get_free_percpu_slot(ctx);
-			/*
-			 * If all the per-CPU slots are already in use, fallback
-			 * to the backup slot.
-			 */
-			if (unlikely(!slot))
-				slot = hazptr_chain_backup_slot(ctx);
-		}
-		WRITE_ONCE(slot->addr, addr);	/* Store B */
-
-		/* Memory ordering: Store B before Load A. */
-		smp_mb();
-
-		/*
-		 * Re-load @addr_p after storing it to the hazard pointer slot.
-		 */
-		addr2 = READ_ONCE(*addr_p);	/* Load A */
-		if (likely(ptr_eq(addr2, addr))) {
-			ctx->slot = slot;
-			/* Success. Break loop and return. */
-			break;
-		}
-		/*
-		 * If @addr_p content has changed since the first load,
-		 * release the hazard pointer and try again.
-		 */
-		WRITE_ONCE(slot->addr, NULL);
-		if (!addr2) {
-			if (hazptr_slot_is_backup(ctx, slot))
-				hazptr_unchain_backup_slot(ctx);
-			/* Loaded NULL. */
-			return NULL;
-		}
-		addr = addr2;
-		/* Retry. */
-	}
+	if (!addr)
+		return NULL;
+	slot = hazptr_get_free_percpu_slot(ctx);
 	/*
-	 * Use addr2 loaded from the second READ_ONCE() to preserve
-	 * address dependency ordering.
+	 * If all the per-CPU slots are already in use, fallback
+	 * to the backup slot.
 	 */
-	return addr2;
+	if (unlikely(!slot))
+		slot = hazptr_chain_backup_slot(ctx);
+	WRITE_ONCE(slot->addr, addr);	/* Store B */
+
+	/* Memory ordering: Store B before Load A. */
+	smp_mb();
+
+	/*
+	 * Load @addr_p after storing wildcard to the hazard pointer slot.
+	 */
+	addr = READ_ONCE(*addr_p);	/* Load A */
+	/*
+	 * We don't care about ordering of Store C. It will simply
+	 * replace the wildcard by a more specific address. If addr is
+	 * NULL, we simply store NULL into the slot.
+	 */
+	WRITE_ONCE(slot->addr, addr);	/* Store C */
+	ctx->slot = slot;
+	if (!addr && hazptr_slot_is_backup(ctx, slot))
+		hazptr_unchain_backup_slot(ctx);
+	return addr;
 }
 EXPORT_SYMBOL_GPL(__hazptr_acquire);
 
@@ -145,7 +127,11 @@ retry:
 	snapshot_gen = overflow_list->gen;
 	hlist_for_each_entry(backup_slot, &overflow_list->head, overflow_node) {
 		/* Busy-wait if node is found. */
-		while (smp_load_acquire(&backup_slot->slot.addr) == addr) { /* Load B */
+		for (;;) {
+			void *load_addr = smp_load_acquire(&backup_slot->slot.addr);	/* Load B */
+
+			if (load_addr != addr && load_addr != HAZPTR_WILDCARD)
+				break;
 			raw_spin_unlock_irqrestore(&overflow_list->lock, flags);
 			cpu_relax();
 			raw_spin_lock_irqsave(&overflow_list->lock, flags);
@@ -174,7 +160,7 @@ void hazptr_synchronize_cpu_slots(int cpu, void *addr)
 		struct hazptr_slot *slot = &percpu_slots->slots[idx];
 
 		/* Busy-wait if node is found. */
-		smp_cond_load_acquire(&slot->addr, VAL != addr); /* Load B */
+		smp_cond_load_acquire(&slot->addr, VAL != addr && VAL != HAZPTR_WILDCARD); /* Load B */
 	}
 }
 
