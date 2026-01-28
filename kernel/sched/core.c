@@ -10664,8 +10664,18 @@ void sched_mm_cid_exit(struct task_struct *t)
 			scoped_guard(raw_spinlock_irq, &mm->mm_cid.lock) {
 				if (!__sched_mm_cid_exit(t))
 					return;
-				/* Mode change required. Transfer currents CID */
-				mm_cid_transit_to_task(current, this_cpu_ptr(mm->mm_cid.pcpu));
+				/*
+				 * Task is exiting, mode change required.
+				 * Drop CID immediately before trying to
+				 * grab any runqueue lock to prevent
+				 * mm_get_cid() (called from mm_cid_switch_to())
+				 * from another CPU from hanging with
+				 * runqueue lock held.
+				 */
+				if (cid_on_cpu(t->mm_cid.cid)) {
+					mm_drop_cid_on_cpu(mm, this_cpu_ptr(mm->mm_cid.pcpu));
+					current->mm_cid.cid = MM_CID_UNSET;
+				}
 			}
 			mm_cid_fixup_cpus_to_tasks(mm);
 			return;
