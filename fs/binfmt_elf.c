@@ -160,6 +160,28 @@ static int padzero(unsigned long address)
 #define ELF_BASE_PLATFORM NULL
 #endif
 
+#ifdef CONFIG_RSEQ
+/*
+ * Before rseq became extensible, its original size was 32 bytes even
+ * though the active rseq area was only 20 bytes.
+ *
+ * Exposing a 32 bytes feature size would make life needlessly painful
+ * for userspace. Therefore, expose a 30 bytes rseq feature size
+ * (excluding the slice_ctrl reserved fields) rather than 32 bytes.
+ * Due to the requirement of registering an rseq_size of at least 32
+ * bytes, the extra two reserved bytes will be allocated and available
+ * nevertheless.
+ */
+static unsigned long rseq_feature_size(void)
+{
+	unsigned long end_offset = offsetof(struct rseq, end);
+
+	if (end_offset == offsetofend(struct rseq, slice_ctrl))
+		return offsetofend(struct rseq, slice_ctrl.granted);
+	return end_offset;
+}
+#endif
+
 static int
 create_elf_tables(struct linux_binprm *bprm, const struct elfhdr *exec,
 		unsigned long interp_load_addr,
@@ -285,7 +307,7 @@ create_elf_tables(struct linux_binprm *bprm, const struct elfhdr *exec,
 		NEW_AUX_ENT(AT_EXECFD, bprm->execfd);
 	}
 #ifdef CONFIG_RSEQ
-	NEW_AUX_ENT(AT_RSEQ_FEATURE_SIZE, offsetof(struct rseq, end));
+	NEW_AUX_ENT(AT_RSEQ_FEATURE_SIZE, rseq_feature_size());
 	NEW_AUX_ENT(AT_RSEQ_ALIGN, __alignof__(struct rseq));
 #endif
 #undef NEW_AUX_ENT
