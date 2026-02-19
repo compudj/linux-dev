@@ -56,6 +56,26 @@ static void backtrace_test_saved(void)
 }
 #endif
 
+#ifdef CONFIG_USER_STACKTRACE_SUPPORT
+static void backtrace_test_user_saved(void)
+{
+	unsigned long entries[8];
+	unsigned int nr_entries;
+
+	pr_info("Testing a saved user backtrace.\n");
+	pr_info("The following trace is a kernel self test and not a bug!\n");
+
+	nr_entries = stack_trace_save_user(entries, ARRAY_SIZE(entries));
+	stack_trace_print(entries, nr_entries, 0);
+}
+#else
+static void backtrace_test_user_saved(void)
+{
+	pr_info("Saved user backtrace test skipped.\n");
+}
+#endif
+
+
 static int backtrace_regression_test(void)
 {
 	pr_info("====[ backtrace testing ]===========\n");
@@ -63,6 +83,7 @@ static int backtrace_regression_test(void)
 	backtrace_test_normal();
 	backtrace_test_bh();
 	backtrace_test_saved();
+	backtrace_test_user_saved();
 
 	pr_info("====[ end of backtrace testing ]====\n");
 	return 0;
