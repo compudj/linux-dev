@@ -44,7 +44,8 @@ struct hazptr_slot *hazptr_get_free_percpu_slot(struct hazptr_ctx *ctx)
 	struct hazptr_percpu_slots *percpu_slots = this_cpu_ptr(&hazptr_percpu_slots);
 	unsigned int idx;
 
-	for (idx = 0; idx < NR_HAZPTR_PERCPU_SLOTS; idx++) {
+	/* Slot 0 has already been checked by fast path. */
+	for (idx = 1; idx < NR_HAZPTR_PERCPU_SLOTS; idx++) {
 		struct hazptr_slot_item *item = &percpu_slots->items[idx];
 		struct hazptr_slot *slot = &item->slot;
 
