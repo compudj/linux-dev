@@ -86,6 +86,59 @@ struct rseq_slice_ctrl {
 	};
 };
 
+/**
+ * rseq_rl_cs - Robust list unlock transaction descriptor
+ *
+ * rseq_rl_cs describes a transaction which begins with a successful
+ * robust mutex unlock followed by clearing a robust list pending ops.
+ *
+ * Userspace prepares for a robust_list unlock transaction by storing
+ * the address of a struct rseq_rl_cs descriptor into its per-thread
+ * rseq area rseq_rl_cs field. After the transaction is over, userspace
+ * clears the rseq_rl_cs pointer.
+ *
+ * A thread is considered to be within a rseq_rl_cs transaction if
+ * either of those conditions are true:
+ *
+ * - ip >= post_cond_store_ip && ip < post_success_ip && ll_sc_success(pt_regs)
+ * - ip >= post_success_ip && ip < post_clear_op_pending_ip
+ *
+ * If the kernel terminates a process within an active robust list
+ * unlock transaction, it should consider the robust list op pending
+ * as empty even if it contains an op pending address.
+ */
+struct rseq_rl_cs {
+	/* Version of this structure. */
+	__u32 version;
+	/* Reserved flags. */
+	__u32 flags;
+	/*
+	 * Address immediately after store which unlocks the robust
+	 * mutex. This store is usually implemented with an atomic
+	 * exchange, or linked-load/store-conditional. In case it is
+	 * implemented with ll/sc, the kernel needs to check whether the
+	 * conditional store has succeeded with the appropriate registers
+	 * or flags, as defined by the architecture ABI.
+	 */
+	__u64 post_cond_store_ip;
+	/*
+	 * For architectures implementing atomic exchange as ll/sc,
+	 * a conditional branch is needed to handle failure.
+	 * The unlock success IP is the address immediately after
+	 * the conditional branch instruction after which the kernel
+	 * can assume that the ll/sc has succeeded without checking
+	 * registers or flags. For architectures where the the mutex
+	 * unlock store instruction cannot fail, this address is equal
+	 * to post_cond_store_ip.
+	 */
+	__u64 post_success_ip;
+	/*
+	 * Address after the instruction which clears the op pending
+	 * list. This store is the last instruction of this sequence.
+	 */
+	__u64 post_clear_op_pending_ip;
+} __attribute__((aligned(4 * sizeof(__u64))));
+
 /*
  * struct rseq is aligned on 4 * 8 bytes to ensure it is always
  * contained within a single cache-line.
@@ -179,6 +232,28 @@ struct rseq {
 	 * kernel and user space.
 	 */
 	struct rseq_slice_ctrl slice_ctrl;
+
+	/*
+	 * Restartable sequences rseq_rl_cs field.
+	 *
+	 * Contains NULL when no robust list unlock transaction is
+	 * active for the current thread, or holds a pointer to the
+	 * currently active struct rseq_rl_cs.
+	 *
+	 * Updated by user-space, which sets the address of the currently
+	 * active rseq_rl_cs at some point before the beginning of the
+	 * transaction, and set to NULL by user-space at some point
+	 * after the transaction has completed.
+	 *
+	 * Read by the kernel. Set by user-space with single-copy
+	 * atomicity semantics. This field should only be updated by the
+	 * thread which registered this data structure. Aligned on
+	 * 64-bit.
+	 *
+	 * 32-bit architectures should update the low order bits of the
+	 * rseq_cs field, leaving the high order bits initialized to 0.
+	 */
+	__u64 rseq_rl_cs;
 
 	/*
 	 * Flexible array member at end of structure, after last feature field.
