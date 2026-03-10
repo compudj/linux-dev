@@ -32,6 +32,8 @@ VERSION {
 #endif
 		getrandom;
 		__vdso_getrandom;
+		__vdso_robust_futex_unlock;
+		__vdso_robust_pi_futex_try_unlock;
 	local: *;
 	};
 }

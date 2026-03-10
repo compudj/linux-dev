@@ -30,6 +30,8 @@ VERSION
 		__vdso_clock_gettime64;
 		__vdso_clock_getres_time64;
 		__vdso_getcpu;
+		__vdso_robust_futex_unlock;
+		__vdso_robust_pi_futex_try_unlock;
 	};
 
 	LINUX_2.5 {
