@@ -1124,6 +1124,17 @@ out:
 	return ret != -EINTR ? ret : -ERESTARTNOINTR;
 }
 
+static int futex_try_unlock_pi_fast(u32 __user * uaddr, u32 uval, u32 vpid)
+{
+	u32 nval;
+
+	if (uval & FUTEX_WAITERS)
+		return false;
+	if (futex_cmpxchg_value_locked(&nval, uaddr, uval, 0) || nval != uval)
+		return false;
+	return true;
+}
+
 /*
  * Userspace attempted a TID -> 0 atomic transition, and failed.
  * This is the in-kernel slowpath: we look up the PI state (if any),
@@ -1147,6 +1158,15 @@ retry:
 	 */
 	if ((uval & FUTEX_TID_MASK) != vpid)
 		return -EPERM;
+
+	/* Clear the pending_op_list. */
+	clear_robust_list_pending_op(current);
+
+	/*
+	 * Handle being called directly without userspace fast-path.
+	 */
+	if (futex_try_unlock_pi_fast(uaddr, uval, vpid))
+		return 0;
 
 	ret = get_futex_key(uaddr, flags, &key, FUTEX_WRITE);
 	if (ret)
