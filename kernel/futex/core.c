@@ -1969,6 +1969,38 @@ int futex_hash_prctl(unsigned long arg2, unsigned long arg3, unsigned long arg4)
 	return ret;
 }
 
+int futex_unlock_robust(u32 __user * uaddr, unsigned int flags)
+{
+	u32 uval, nval;
+	int err;
+
+	clear_robust_list_pending_op(current);
+retry:
+	if (get_user(uval, uaddr))
+		return -EFAULT;
+	if ((err = futex_cmpxchg_value_locked(&nval, uaddr, uval, 0))) {
+		switch (err) {
+		case -EFAULT:
+			if (fault_in_user_writeable(uaddr))
+				return -EFAULT;
+			goto retry;
+
+		case -EAGAIN:
+			cond_resched();
+			goto retry;
+
+		default:
+			WARN_ON_ONCE(1);
+			return err;
+		}
+	}
+	if (nval != uval)
+		goto retry;
+	if (nval & FUTEX_WAITERS)
+		futex_wake(uaddr, flags, 1, FUTEX_BITSET_MATCH_ANY);
+	return 0;
+}
+
 static int __init futex_init(void)
 {
 	unsigned long hashsize, i;

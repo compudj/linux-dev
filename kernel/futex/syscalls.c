@@ -154,6 +154,8 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 					     uaddr2);
 	case FUTEX_CMP_REQUEUE_PI:
 		return futex_requeue(uaddr, flags, uaddr2, flags, val, val2, &val3, 1);
+	case FUTEX_UNLOCK_ROBUST:
+		return futex_unlock_robust(uaddr, flags);
 	}
 	return -ENOSYS;
 }
@@ -515,4 +517,3 @@ SYSCALL_DEFINE6(futex_time32, u32 __user *, uaddr, int, op, u32, val,
 	return do_futex(uaddr, op, val, tp, uaddr2, (unsigned long)utime, val3);
 }
 #endif /* CONFIG_COMPAT_32BIT_TIME */
-

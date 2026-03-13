@@ -447,4 +447,6 @@ extern int futex_unlock_pi(u32 __user *uaddr, unsigned int flags);
 
 extern int futex_lock_pi(u32 __user *uaddr, unsigned int flags, ktime_t *time, int trylock);
 
+extern int futex_unlock_robust(u32 __user * uaddr, unsigned int flags);
+
 #endif /* _FUTEX_H */
