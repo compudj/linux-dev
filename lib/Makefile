@@ -223,6 +223,8 @@ obj-$(CONFIG_CPU_RMAP) += cpu_rmap.o
 
 obj-$(CONFIG_CLOSURES) += closure.o
 
+obj-$(CONFIG_RCU_TXN) += rcu_txn.o
+
 obj-$(CONFIG_DQL) += dynamic_queue_limits.o
 
 obj-$(CONFIG_GLOB) += glob.o

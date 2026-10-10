@@ -22853,6 +22853,13 @@ M:	Patrick Lerda <patrick9876@free.fr>
 S:	Maintained
 F:	drivers/media/rc/ir-rcmm-decoder.c
 
+RCU PSEUDO-TRANSACTIONS
+M:	Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+L:	rcu@vger.kernel.org
+S:	Maintained
+F:	include/linux/rcu_txn*.h
+F:	lib/rcu_txn*
+
 RCUTORTURE TEST FRAMEWORK
 M:	"Paul E. McKenney" <paulmck@kernel.org>
 M:	Josh Triplett <josh@joshtriplett.org>
