@@ -7,8 +7,11 @@
 
 #include <kunit/test.h>
 #include <linux/bug.h>
+#include <linux/debug_locks.h>
 #include <linux/kthread.h>
+#include <linux/list_bl.h>
 #include <linux/minmax.h>
+#include <linux/panic.h>
 #include <linux/rcu_txn.h>
 #include <linux/rcu_txn_hlist.h>
 #include <linux/rcu_txn_list.h>
@@ -1975,6 +1978,135 @@ static void rcu_txn_test_list_concurrent(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cross_violations, 0);
 }
 
+/* Expect no new report since @tainted and @locks were sampled. */
+static void expect_no_report(struct kunit *test, bool tainted, int locks)
+{
+	KUNIT_EXPECT_EQ(test, test_taint(TAINT_WARN), tainted);
+	KUNIT_EXPECT_EQ(test, debug_locks, locks);
+}
+
+/*
+ * Commit and cancel from atomic context: under a bit spinlock, as a hash
+ * table with hlist_bl buckets takes, and under a raw spinlock.  Lockdep and
+ * the might_sleep() checks must report nothing.
+ *
+ * A one-record commit and a cancel install no proxy.  Their descriptors must
+ * go to kfree_rcu() too, not to kfree(), so each has its case.
+ *
+ * A kfree() takes SLUB's barn->lock only once the per-CPU sheaf is full.
+ * With a reserve before each free, the free would only refill what the
+ * reserve took.  So the bulk cases reserve ATOMIC_BULK descriptors first.
+ * Then they commit, or cancel, all of them under the raw spinlock.
+ *
+ * The checks compare against the state before the test.  Once lockdep is off
+ * or TAINT_WARN is set, they cannot fail.  The test is skipped then.
+ */
+#define ATOMIC_BULK	4096	/* descriptors: more than a sheaf holds */
+
+static void rcu_txn_test_commit_atomic(struct kunit *test)
+{
+	static DEFINE_RAW_SPINLOCK(raw_lock);
+	void __rcu *s1 = RCU_INITIALIZER(T(0));
+	void __rcu *s2 = RCU_INITIALIZER(T(1));
+	bool tainted = test_taint(TAINT_WARN);
+	struct hlist_bl_head bucket;
+	int locks = debug_locks;
+	struct rcu_txn txn, *txns;
+	unsigned long flags;
+	int err, i;
+
+	if (!IS_ENABLED(CONFIG_PROVE_RAW_LOCK_NESTING))
+		kunit_skip(test, "needs CONFIG_PROVE_RAW_LOCK_NESTING");
+	if (!locks)
+		kunit_skip(test, "lockdep is already off");
+	if (tainted)
+		kunit_skip(test, "TAINT_WARN is already set");
+
+	INIT_HLIST_BL_HEAD(&bucket);
+
+	/* Two records, under a bit spinlock. */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txn, 2));
+	hlist_bl_lock(&bucket);
+	rcu_txn_record(&txn, &s1, T(0), T(10), TAG);
+	rcu_txn_record(&txn, &s2, T(1), T(11), TAG);
+	err = rcu_txn_commit(&txn);
+	hlist_bl_unlock(&bucket);
+	KUNIT_EXPECT_EQ(test, err, 0);
+	expect_no_report(test, tainted, locks);
+
+	/* Two records, under a raw spinlock with interrupts off. */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txn, 2));
+	raw_spin_lock_irqsave(&raw_lock, flags);
+	rcu_txn_record(&txn, &s1, T(10), T(20), TAG);
+	rcu_txn_record(&txn, &s2, T(11), T(21), TAG);
+	err = rcu_txn_commit(&txn);
+	raw_spin_unlock_irqrestore(&raw_lock, flags);
+	KUNIT_EXPECT_EQ(test, err, 0);
+	expect_no_report(test, tainted, locks);
+
+	/* One record. */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txn, 2));
+	hlist_bl_lock(&bucket);
+	rcu_txn_record(&txn, &s1, T(20), T(40), TAG);
+	err = rcu_txn_commit(&txn);
+	hlist_bl_unlock(&bucket);
+	KUNIT_EXPECT_EQ(test, err, 0);
+	expect_no_report(test, tainted, locks);
+
+	/* A cancel, with one record. */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txn, 2));
+	hlist_bl_lock(&bucket);
+	rcu_txn_record(&txn, &s1, T(40), T(50), TAG);
+	rcu_txn_cancel(&txn);
+	hlist_bl_unlock(&bucket);
+	expect_no_report(test, tainted, locks);
+
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s1), T(40));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s2), T(21));
+
+	/*
+	 * Commit a sheaf's worth of one-record transactions under the raw
+	 * spinlock.  Reserve their descriptors first.  A failed expectation
+	 * allocates, so count the failures under the lock and check them after.
+	 */
+	txns = kunit_kcalloc(test, ATOMIC_BULK, sizeof(*txns), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, txns);
+	for (i = 0; i < ATOMIC_BULK; i++) {
+		rcu_txn_init(&txns[i], GFP_KERNEL);
+		KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txns[i], 1));
+	}
+	err = 0;
+	raw_spin_lock_irqsave(&raw_lock, flags);
+	for (i = 0; i < ATOMIC_BULK; i++) {
+		rcu_txn_record(&txns[i], &s1, T(40 + i), T(41 + i), TAG);
+		if (rcu_txn_commit(&txns[i]))
+			err++;
+	}
+	raw_spin_unlock_irqrestore(&raw_lock, flags);
+	KUNIT_EXPECT_EQ(test, err, 0);
+	expect_no_report(test, tainted, locks);
+
+	/* As many cancels. */
+	for (i = 0; i < ATOMIC_BULK; i++) {
+		rcu_txn_init(&txns[i], GFP_KERNEL);
+		KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txns[i], 1));
+	}
+	raw_spin_lock_irqsave(&raw_lock, flags);
+	for (i = 0; i < ATOMIC_BULK; i++) {
+		rcu_txn_record(&txns[i], &s2, T(21), T(22), TAG);
+		rcu_txn_cancel(&txns[i]);
+	}
+	raw_spin_unlock_irqrestore(&raw_lock, flags);
+	expect_no_report(test, tainted, locks);
+
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s1), T(40 + ATOMIC_BULK));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s2), T(21));
+}
+
 static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_single_record),
 	KUNIT_CASE(rcu_txn_test_multi_record),
@@ -2030,6 +2162,7 @@ static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_list_debug_disjoint_compose),
 	KUNIT_CASE(rcu_txn_test_list_debug_unlinked),
 	KUNIT_CASE_SLOW(rcu_txn_test_list_concurrent),
+	KUNIT_CASE(rcu_txn_test_commit_atomic),
 	{}
 };
 
