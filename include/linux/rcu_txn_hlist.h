@@ -11,7 +11,9 @@
  * rcu_txn_hlist: an RCU list with a single-pointer head, shaped like hlist, for
  * a single writer (writers mutually excluded, as with hlist_add_head_rcu()).
  * Its edits are recorded into a transaction of <linux/rcu_txn.h>, whose commit
- * makes all of them, on one bucket or on many, visible to readers at once.
+ * makes all of them, on one bucket or on many, visible to readers at once.  It
+ * is the hash-bucket sibling of the circular <linux/rcu_txn_list.h>: its head
+ * is one pointer, half the footprint of a sentinel-node head.
  *
  * Forward-only readers, and pprev
  * -------------------------------
@@ -23,7 +25,8 @@
  *           struct rcu_txn_hlist_node **pprev;  (slot ptr; writer-only) }
  *
  * Readers walk forward only and never load pprev, so each operation has exactly
- * one reader-visible edge: the next slot it re-points.
+ * one reader-visible edge: the next slot it re-points.  This is where the hlist
+ * differs from <linux/rcu_txn_list.h>, whose prev is reader-visible.
  *
  * Single updates and transactions
  * -------------------------------
