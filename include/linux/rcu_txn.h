@@ -363,6 +363,13 @@ static inline void *rcu_txn_resolve(void *v, unsigned long tag)
  */
 #define rcu_txn_dereference(p, tag)	rcu_txn_dereference_check(p, tag, 0)
 
+/*
+ * The optional lockdep condition of an iterator, as for
+ * list_for_each_entry_rcu(): the condition if one was given, else 0.
+ */
+#define __rcu_txn_cond(cond...)			___rcu_txn_cond(0, ## cond, 0)
+#define ___rcu_txn_cond(zero, cond, extra...)	((zero) || (cond))
+
 /**
  * rcu_txn_slot() - the engine's view of an RCU-protected pointer's address
  * @pp: address of an __rcu pointer, of any type

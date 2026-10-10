@@ -8,6 +8,7 @@
 #include <kunit/test.h>
 #include <linux/bug.h>
 #include <linux/rcu_txn.h>
+#include <linux/rcu_txn_hlist.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/task.h>
 #include <linux/string.h>
@@ -913,6 +914,387 @@ static void rcu_txn_test_debug_load_proxy(struct kunit *test)
 	rcu_txn_cancel(&txn);
 }
 
+/*
+ * <linux/rcu_txn_hlist.h>
+ */
+
+struct hn {
+	struct rcu_txn_hlist_node node;
+	int key;
+};
+
+/* Freed with the test: a removed node stays valid for any reader. */
+static struct rcu_txn_hlist_node *hn_new(struct kunit *test, int key)
+{
+	struct hn *n = kunit_kzalloc(test, sizeof(*n), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, n);
+	n->key = key;
+	return &n->node;
+}
+
+/* Build the list @keys by prepending in reverse. */
+static void hlist_build(struct kunit *test, struct rcu_txn_hlist_head *head,
+			const int *keys, int nr)
+{
+	int i;
+
+	for (i = nr - 1; i >= 0; i--)
+		rcu_txn_hlist_add_head_rcu(hn_new(test, keys[i]), head);
+}
+
+/* The test is the chain's only writer, and owns every node until it ends. */
+static struct rcu_txn_hlist_node *hlist_find(struct rcu_txn_hlist_head *head,
+					     int key)
+{
+	struct hn *n;
+
+	rcu_txn_hlist_for_each_entry_rcu(n, head, node, true)
+		if (n->key == key)
+			return &n->node;
+	return NULL;
+}
+
+/*
+ * The forward walk gives @want, and each node's pprev points to the slot that
+ * points to it: &head->first for the first node, &prev->next thereafter.  A
+ * torn pprev is invisible to the forward walk but breaks the next edit, hence
+ * the separate check.
+ */
+static void hlist_expect(struct kunit *test, struct rcu_txn_hlist_head *head,
+			 const int *want, int nr)
+{
+	struct rcu_txn_hlist_node __rcu **slot = &head->first;
+	struct rcu_txn_hlist_node *p;
+	int i = 0;
+
+	rcu_txn_hlist_for_each_rcu(p, head, true) {
+		if (i < nr)
+			KUNIT_EXPECT_EQ(test,
+					container_of(p, struct hn, node)->key,
+					want[i]);
+		KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(p->pprev), slot);
+		slot = &p->next;
+		i++;
+	}
+	KUNIT_EXPECT_EQ(test, i, nr);
+}
+
+static void rcu_txn_test_hlist_add(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3 };
+	static const int behind[] = { 1, 2, 9, 3 };
+	static const int before[] = { 1, 8, 2, 9, 3 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+
+	KUNIT_EXPECT_TRUE(test, rcu_txn_hlist_empty(&head, true));
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	hlist_expect(test, &head, keys, ARRAY_SIZE(keys));
+
+	rcu_txn_hlist_add_behind_rcu(hn_new(test, 9), hlist_find(&head, 2));
+	hlist_expect(test, &head, behind, ARRAY_SIZE(behind));
+
+	rcu_txn_hlist_add_before_rcu(hn_new(test, 8), hlist_find(&head, 2));
+	hlist_expect(test, &head, before, ARRAY_SIZE(before));
+}
+
+static void rcu_txn_test_hlist_del(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3, 4, 5 };
+	static const int middle[] = { 1, 2, 4, 5 };
+	static const int ends[] = { 2, 4 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn_hlist_node *removed;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	removed = hlist_find(&head, 3);
+	rcu_txn_hlist_del_rcu(removed);
+	hlist_expect(test, &head, middle, ARRAY_SIZE(middle));
+	/* A reader standing on the removed node still reaches the chain. */
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_hlist_next_check(removed, true),
+			    hlist_find(&head, 4));
+
+	rcu_txn_hlist_del_rcu(hlist_find(&head, 1));	/* first */
+	rcu_txn_hlist_del_rcu(hlist_find(&head, 5));	/* last */
+	hlist_expect(test, &head, ends, ARRAY_SIZE(ends));
+}
+
+static void rcu_txn_test_hlist_replace(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3 };
+	static const int want[] = { 1, 22, 3 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	rcu_txn_hlist_replace_rcu(hlist_find(&head, 2), hn_new(test, 22));
+	hlist_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/*
+ * Composition on one bucket, with neighbourhoods that touch: the case the
+ * _prepare forms read their own writes for.
+ */
+
+/* Delete the adjacent 2 and 3 from 1..5 in one transaction. */
+static void rcu_txn_test_hlist_compose_adjacent_del(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3, 4, 5 };
+	static const int want[] = { 1, 4, 5 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn_hlist_node *e2, *e3;
+	struct rcu_txn txn;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	e2 = hlist_find(&head, 2);
+	e3 = hlist_find(&head, 3);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_hlist_del_prepare(&txn, e2);
+	rcu_txn_hlist_del_prepare(&txn, e3);	/* the neighbour of e2 */
+	/* &1->next, chained, and the pprev of 3 and of 4. */
+	KUNIT_EXPECT_EQ(test, txn.nr, 3);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	hlist_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/* Delete 2 and insert 9 into the same gap, behind 1, in one transaction. */
+static void rcu_txn_test_hlist_compose_del_and_add(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3 };
+	static const int want[] = { 1, 9, 3 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn_hlist_node *e1, *e2;
+	struct rcu_txn txn;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	e1 = hlist_find(&head, 1);
+	e2 = hlist_find(&head, 2);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_hlist_del_prepare(&txn, e2);
+	rcu_txn_hlist_add_behind_prepare(&txn, hn_new(test, 9), e1);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	hlist_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/* Three consecutive deletes in one transaction: &1->next is chained twice. */
+static void rcu_txn_test_hlist_compose_triple_del(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3, 4, 5 };
+	static const int want[] = { 1, 5 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn_hlist_node *e[3];
+	struct rcu_txn txn;
+	int i;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	for (i = 0; i < ARRAY_SIZE(e); i++)
+		e[i] = hlist_find(&head, i + 2);	/* 2, 3, 4 */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	for (i = 0; i < ARRAY_SIZE(e); i++)
+		rcu_txn_hlist_del_prepare(&txn, e[i]);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	hlist_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/*
+ * Insert 9 behind 1, then delete 1, in that order: the fresh node inherits
+ * &1->next as the slot that points to it, and the next operation removes the
+ * node that slot lives in.  add_behind must have recorded &9->next as 2's
+ * pprev, and del(1) must then re-point head->first to the pending 9 rather than
+ * to the committed 2, and record &head->first as 9's pprev.
+ *
+ * A wrong pprev for 2 leaves the forward order intact here: only the pprev
+ * check catches it.
+ */
+static void rcu_txn_test_hlist_compose_add_then_del_host(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3 };
+	static const int want[] = { 9, 2, 3 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn_hlist_node *e1;
+	struct rcu_txn txn;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	e1 = hlist_find(&head, 1);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_hlist_add_behind_prepare(&txn, hn_new(test, 9), e1);
+	rcu_txn_hlist_del_prepare(&txn, e1);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	hlist_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/*
+ * Delete the first node, then insert before its successor.  add_before loads
+ * 2's pprev as the transaction leaves it, &head->first, which del(1) recorded.
+ * The committed &1->next would publish head->first == 1.
+ */
+static void rcu_txn_test_hlist_compose_del_then_add_before(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3 };
+	static const int want[] = { 9, 2, 3 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn_hlist_node *e1, *e2;
+	struct rcu_txn txn;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	e1 = hlist_find(&head, 1);
+	e2 = hlist_find(&head, 2);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_hlist_del_prepare(&txn, e1);
+	rcu_txn_hlist_add_before_prepare(&txn, hn_new(test, 9), e2);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	hlist_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/*
+ * Two buckets in one transaction: a node leaves one and its replacement
+ * enters the other.  The edges are installed as proxies, so that at any instant
+ * the key is in exactly one bucket.
+ */
+static void rcu_txn_test_hlist_move(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3 };
+	static const int from[] = { 1, 3 };
+	static const int to[] = { 2 };
+	struct rcu_txn_hlist_head a = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn_hlist_head b = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn txn;
+
+	hlist_build(test, &a, keys, ARRAY_SIZE(keys));
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_hlist_del_prepare(&txn, hlist_find(&a, 2));
+	rcu_txn_hlist_add_head_prepare(&txn, hn_new(test, 2), &b);
+	/* The two forward edges, and the pprev of 3. */
+	KUNIT_EXPECT_EQ(test, txn.nr, 3);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	hlist_expect(test, &a, from, ARRAY_SIZE(from));
+	hlist_expect(test, &b, to, ARRAY_SIZE(to));
+}
+
+/*
+ * One _prepare alone: an update with a successor records its forward edge and
+ * the successor's pprev, and commits through the descriptor.
+ */
+static void rcu_txn_test_hlist_prepare_alone(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3 };
+	static const int want[] = { 1, 3 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn txn;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_hlist_del_prepare(&txn, hlist_find(&head, 2));
+	KUNIT_EXPECT_EQ(test, txn.nr, 2);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	hlist_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/*
+ * Every kind of edit in one transaction over 1..5: del(2), add_behind(9, 1),
+ * replace(4, 44), add_before(8, 5).  The last re-points the slot that the
+ * replace made 5's, inside the fresh node 44, and so loads 5's pending pprev
+ * to find it.
+ */
+static void hlist_prepare_mixed(struct kunit *test, struct rcu_txn *txn,
+				struct rcu_txn_hlist_head *head)
+{
+	struct rcu_txn_hlist_node *e1 = hlist_find(head, 1);
+	struct rcu_txn_hlist_node *e2 = hlist_find(head, 2);
+	struct rcu_txn_hlist_node *e4 = hlist_find(head, 4);
+	struct rcu_txn_hlist_node *e5 = hlist_find(head, 5);
+
+	rcu_txn_hlist_del_prepare(txn, e2);
+	rcu_txn_hlist_add_behind_prepare(txn, hn_new(test, 9), e1);
+	rcu_txn_hlist_replace_prepare(txn, e4, hn_new(test, 44));
+	rcu_txn_hlist_add_before_prepare(txn, hn_new(test, 8), e5);
+}
+
+static void rcu_txn_test_hlist_compose_mixed(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3, 4, 5 };
+	static const int want[] = { 1, 9, 3, 44, 8, 5 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn txn;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	rcu_txn_init(&txn, GFP_KERNEL);
+	hlist_prepare_mixed(test, &txn, &head);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	hlist_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/*
+ * The same transaction, cancelled: nothing was written outside it, so the chain
+ * and every pprev are as they were.  A later single update then finds the
+ * pprev it relies on.
+ */
+static void rcu_txn_test_hlist_cancel(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3, 4, 5 };
+	static const int want[] = { 1, 2, 4, 5 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn txn;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	rcu_txn_init(&txn, GFP_KERNEL);
+	hlist_prepare_mixed(test, &txn, &head);
+	rcu_txn_cancel(&txn);
+	hlist_expect(test, &head, keys, ARRAY_SIZE(keys));
+
+	rcu_txn_hlist_del_rcu(hlist_find(&head, 3));
+	hlist_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/*
+ * Out of memory after two edits, the sticky state set by hand as a failed
+ * record() leaves it: commit() reports it and publishes nothing, and the edits
+ * recorded before the failure leave no pprev behind either.
+ */
+static void rcu_txn_test_hlist_oom(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3, 4, 5 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn_hlist_node *e1, *e2, *e4;
+	struct rcu_txn txn;
+
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	e1 = hlist_find(&head, 1);
+	e2 = hlist_find(&head, 2);
+	e4 = hlist_find(&head, 4);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_hlist_del_prepare(&txn, e2);
+	rcu_txn_hlist_add_behind_prepare(&txn, hn_new(test, 9), e1);
+	txn.state = RCU_TXN_OOM;
+	rcu_txn_hlist_replace_prepare(&txn, e4, hn_new(test, 44));
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), -ENOMEM);
+	hlist_expect(test, &head, keys, ARRAY_SIZE(keys));
+}
+
+/*
+ * An add_behind anchored on a node that the same transaction deleted: it
+ * records the successor's pprev from a slot that the delete already moved it
+ * from.
+ */
+static void rcu_txn_test_hlist_debug_ghost_anchor(struct kunit *test)
+{
+	static const int keys[] = { 1, 2, 3 };
+	struct rcu_txn_hlist_head head = RCU_TXN_HLIST_HEAD_INIT;
+	struct rcu_txn_hlist_node *e2;
+	struct rcu_txn txn;
+
+	need_debug(test);
+	hlist_build(test, &head, keys, ARRAY_SIZE(keys));
+	e2 = hlist_find(&head, 2);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_hlist_del_prepare(&txn, e2);
+	kunit_warning_suppress(test) {
+		rcu_txn_hlist_add_behind_prepare(&txn, hn_new(test, 9), e2);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	rcu_txn_cancel(&txn);
+	hlist_expect(test, &head, keys, ARRAY_SIZE(keys));
+}
+
 static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_single_record),
 	KUNIT_CASE(rcu_txn_test_multi_record),
@@ -946,6 +1328,20 @@ static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_debug_disjoint),
 	KUNIT_CASE(rcu_txn_test_debug_stale_chain),
 	KUNIT_CASE(rcu_txn_test_debug_load_proxy),
+	KUNIT_CASE(rcu_txn_test_hlist_add),
+	KUNIT_CASE(rcu_txn_test_hlist_del),
+	KUNIT_CASE(rcu_txn_test_hlist_replace),
+	KUNIT_CASE(rcu_txn_test_hlist_compose_adjacent_del),
+	KUNIT_CASE(rcu_txn_test_hlist_compose_del_and_add),
+	KUNIT_CASE(rcu_txn_test_hlist_compose_triple_del),
+	KUNIT_CASE(rcu_txn_test_hlist_compose_add_then_del_host),
+	KUNIT_CASE(rcu_txn_test_hlist_compose_del_then_add_before),
+	KUNIT_CASE(rcu_txn_test_hlist_move),
+	KUNIT_CASE(rcu_txn_test_hlist_prepare_alone),
+	KUNIT_CASE(rcu_txn_test_hlist_compose_mixed),
+	KUNIT_CASE(rcu_txn_test_hlist_cancel),
+	KUNIT_CASE(rcu_txn_test_hlist_oom),
+	KUNIT_CASE(rcu_txn_test_hlist_debug_ghost_anchor),
 	{}
 };
 
