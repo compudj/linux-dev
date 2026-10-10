@@ -7,8 +7,11 @@
 
 #include <kunit/test.h>
 #include <linux/bug.h>
+#include <linux/debug_locks.h>
 #include <linux/kthread.h>
+#include <linux/list_bl.h>
 #include <linux/minmax.h>
+#include <linux/panic.h>
 #include <linux/rcu_txn.h>
 #include <linux/rcu_txn_hlist.h>
 #include <linux/rcu_txn_list.h>
@@ -1992,6 +1995,87 @@ static void rcu_txn_test_list_concurrent(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cross_violations, 0);
 }
 
+/* Did the kernel report something since @tainted and @locks were sampled? */
+static void expect_no_report(struct kunit *test, bool tainted, int locks)
+{
+	KUNIT_EXPECT_EQ(test, test_taint(TAINT_WARN), tainted);
+	KUNIT_EXPECT_EQ(test, debug_locks, locks);
+}
+
+/*
+ * A commit from atomic context: under a bit spinlock, which is how a hash
+ * table with hlist_bl buckets excludes its writers, and under a raw spinlock.
+ * On PREEMPT_RT neither may take a sleeping lock, which lockdep and the
+ * might_sleep() checks would report.
+ *
+ * The transaction reserves its records before it takes the lock, so recording
+ * and committing allocate nothing, and the descriptor of a commit that
+ * installed proxies is handed to kfree_rcu().
+ *
+ * A descriptor that installed none is released under the lock as well, by a
+ * commit of one record or by a cancel.  On PREEMPT_RT that has to be
+ * kfree_rcu() too, but these checks did not report a kfree() there when
+ * tried: those two cases only exercise the path.
+ */
+static void rcu_txn_test_commit_atomic(struct kunit *test)
+{
+	static DEFINE_RAW_SPINLOCK(raw_lock);
+	void __rcu *s1 = RCU_INITIALIZER(T(0));
+	void __rcu *s2 = RCU_INITIALIZER(T(1));
+	bool tainted = test_taint(TAINT_WARN);
+	struct hlist_bl_head bucket;
+	int locks = debug_locks;
+	unsigned long flags;
+	struct rcu_txn txn;
+	int err;
+
+	INIT_HLIST_BL_HEAD(&bucket);
+
+	/* Two records, under a bit spinlock. */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txn, 2));
+	hlist_bl_lock(&bucket);
+	rcu_txn_record(&txn, &s1, T(0), T(10), TAG);
+	rcu_txn_record(&txn, &s2, T(1), T(11), TAG);
+	err = rcu_txn_commit(&txn);
+	hlist_bl_unlock(&bucket);
+	KUNIT_EXPECT_EQ(test, err, 0);
+	expect_no_report(test, tainted, locks);
+
+	/* Two records, under a raw spinlock with interrupts off. */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txn, 2));
+	raw_spin_lock_irqsave(&raw_lock, flags);
+	rcu_txn_record(&txn, &s1, T(10), T(20), TAG);
+	rcu_txn_record(&txn, &s2, T(11), T(21), TAG);
+	err = rcu_txn_commit(&txn);
+	raw_spin_unlock_irqrestore(&raw_lock, flags);
+	KUNIT_EXPECT_EQ(test, err, 0);
+	expect_no_report(test, tainted, locks);
+
+	/* One record. */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txn, 2));
+	hlist_bl_lock(&bucket);
+	rcu_txn_record(&txn, &s1, T(20), T(40), TAG);
+	err = rcu_txn_commit(&txn);
+	hlist_bl_unlock(&bucket);
+	KUNIT_EXPECT_EQ(test, err, 0);
+	expect_no_report(test, tainted, locks);
+
+	/* A cancel of such a handle. */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txn, 2));
+	hlist_bl_lock(&bucket);
+	rcu_txn_record(&txn, &s1, T(40), T(50), TAG);
+	rcu_txn_cancel(&txn);
+	hlist_bl_unlock(&bucket);
+	expect_no_report(test, tainted, locks);
+
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s1), T(40));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s2), T(21));
+}
+
 static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_single_record),
 	KUNIT_CASE(rcu_txn_test_multi_record),
@@ -2051,6 +2135,7 @@ static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_list_compose_moves),
 	KUNIT_CASE(rcu_txn_test_list_debug_disjoint_compose),
 	KUNIT_CASE_SLOW(rcu_txn_test_list_concurrent),
+	KUNIT_CASE(rcu_txn_test_commit_atomic),
 	{}
 };
 
