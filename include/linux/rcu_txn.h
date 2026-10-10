@@ -107,6 +107,21 @@
 #include <linux/string.h>
 #include <linux/types.h>
 
+#ifdef CONFIG_DEBUG_RCU_TXN
+#include <asm/current.h>
+#endif
+
+/*
+ * Contract checks that cost more than a test of the handle's state are built
+ * with CONFIG_DEBUG_RCU_TXN only.  They report every occurrence: a once-only
+ * report would hide the violations of every embedder but the first.
+ */
+#ifdef CONFIG_DEBUG_RCU_TXN
+# define RCU_TXN_WARN_ON(cond)	WARN_ON(cond)
+#else
+# define RCU_TXN_WARN_ON(cond)	BUILD_BUG_ON_INVALID(cond)
+#endif
+
 /*
  * First capacity of an unreserved handle: with its header, such a descriptor
  * fits a 256-byte allocation.  A transaction that records more should
@@ -226,6 +241,10 @@ struct rcu_txn {
 	enum rcu_txn_state state;
 	bool disjoint;			/* declared slot-disjoint */
 	bool bloom_live;		/* the descriptor's filter is armed */
+#ifdef CONFIG_DEBUG_RCU_TXN
+	/* Task that initialized or adopted the handle, and drives it. */
+	struct task_struct *owner;
+#endif
 };
 
 /*
@@ -252,6 +271,17 @@ static inline bool rcu_txn_is_proxy(const void *v, unsigned long tag)
 }
 
 /*
+ * Does @v, loaded from a slot transacted under @tag, hold an installed proxy?
+ * Unlike rcu_txn_is_proxy(), this answers false under a zero tag, which every
+ * value matches and which marks no proxy.  A zero tag is legal for a
+ * transaction that installs none.
+ */
+static inline bool __rcu_txn_holds_proxy(const void *v, unsigned long tag)
+{
+	return tag && rcu_txn_is_proxy(v, tag);
+}
+
+/*
  * Recover the record's address from a slot value that holds an installed proxy.
  *
  * Subtracting the tag is equivalent to masking it off, since
@@ -261,6 +291,7 @@ static inline bool rcu_txn_is_proxy(const void *v, unsigned long tag)
  */
 static inline struct rcu_txn_record *__rcu_txn_untag(void *v, unsigned long tag)
 {
+	RCU_TXN_WARN_ON(!rcu_txn_is_proxy(v, tag));
 	return (struct rcu_txn_record *)((unsigned long)v - tag);
 }
 
@@ -384,6 +415,96 @@ static inline void __rcu_txn_record_settle(struct rcu_txn_record *r)
 }
 
 /*
+ * CONFIG_DEBUG_RCU_TXN: runtime validation of the single-writer contract.
+ *
+ * This engine requires writer mutual exclusion -- it has no install-time CAS,
+ * no conflict detection and no abort, so two writers racing on one slot simply
+ * corrupt it, and a default build does not detect it.  With
+ * CONFIG_DEBUG_RCU_TXN a violation warns, with a report identifying the
+ * violated handle or slot.  Without it there is no check, and the handle does
+ * not carry the owner field.
+ *
+ * There is no per-structure object to claim an owner on, so the
+ * validator claims the two things that do exist:
+ *
+ *   - the handle.  Its owner is the task that initialized it, or the one
+ *     that adopted it before anything was recorded, and reserve / record /
+ *     load / commit / cancel must all run in that task.  Catches a
+ *     transaction handed between tasks mid-flight.
+ *
+ *   - the slot, which is what two racing writers actually share, and so is
+ *     where the real violation is visible.  In a correct single-writer
+ *     program a slot being recorded or installed to cannot already hold an
+ *     installed proxy.  A proxy sitting there therefore means another
+ *     writer is mid-transaction on that very slot right now.
+ *     Symmetrically, at settle each slot must still hold this writer's
+ *     proxy; anything else means a concurrent writer overwrote it.
+ */
+
+#ifdef CONFIG_DEBUG_RCU_TXN
+
+static inline void __rcu_txn_excl_claim(struct rcu_txn *t)
+{
+	t->owner = current;
+}
+
+static inline void __rcu_txn_excl_owner(const struct rcu_txn *t,
+					const char *what)
+{
+	WARN(t->owner != current,
+	     "rcu_txn %p: %s in a task other than the one that initialized or adopted the handle -- one transaction is driven end to end by one task\n",
+	     t, what);
+}
+
+/* @slot must hold no proxy: it would be another writer's. */
+static inline void __rcu_txn_excl_slot_free(void __rcu **slot,
+					    unsigned long tag, const char *what)
+{
+	void *v = rcu_access_pointer(*slot);
+
+	WARN(__rcu_txn_holds_proxy(v, tag),
+	     "rcu_txn: slot %p already holds an installed proxy (%p) at %s: another writer is mid-transaction on it\n",
+	     slot, v, what);
+}
+
+/*
+ * @r's slot must still hold the recorded old.  This is the only witness of a
+ * single-record commit, which installs no proxy.
+ */
+static inline void __rcu_txn_excl_slot_unchanged(struct rcu_txn_record *r,
+						 const char *what)
+{
+	void *v = rcu_access_pointer(*r->slot);
+
+	WARN(v != r->ptr[0],
+	     "rcu_txn: slot %p holds %p at %s, but %p was recorded as its old: a concurrent writer changed it\n",
+	     r->slot, v, what, r->ptr[0]);
+}
+
+#else	/* !CONFIG_DEBUG_RCU_TXN */
+
+static inline void __rcu_txn_excl_claim(struct rcu_txn *t)
+{
+}
+
+static inline void __rcu_txn_excl_owner(const struct rcu_txn *t,
+					const char *what)
+{
+}
+
+static inline void __rcu_txn_excl_slot_free(void __rcu **slot,
+					    unsigned long tag, const char *what)
+{
+}
+
+static inline void __rcu_txn_excl_slot_unchanged(struct rcu_txn_record *r,
+						 const char *what)
+{
+}
+
+#endif	/* CONFIG_DEBUG_RCU_TXN */
+
+/*
  * Writer side
  * ===========
  *
@@ -403,6 +524,7 @@ static inline void rcu_txn_init(struct rcu_txn *t, gfp_t gfp)
 	memset(t, 0, sizeof(*t));
 	t->state = RCU_TXN_PREPARE;
 	t->gfp = gfp;
+	__rcu_txn_excl_claim(t);
 }
 
 /*
@@ -439,9 +561,27 @@ static inline bool rcu_txn_reserve(struct rcu_txn *t, unsigned int cap)
 		WARN_ON_ONCE(t->state != RCU_TXN_OOM);
 		return false;
 	}
+	__rcu_txn_excl_owner(t, "reserve()");
 	if (t->records && cap <= t->cap)
 		return true;		/* already large enough */
 	return __rcu_txn_resize(t, cap);
+}
+
+/**
+ * rcu_txn_adopt() - take over a handle that another task got ready
+ * @t: the handle, initialized and holding no record yet
+ *
+ * One task drives a transaction end to end.  An embedder may still get a
+ * handle ready in one task, where it can sleep and fail, with rcu_txn_init()
+ * and rcu_txn_reserve(), and have another record and commit, or cancel.  The
+ * task that takes over calls this first.  The embedder makes sure that the
+ * task which got the handle ready is done with it.
+ */
+static inline void rcu_txn_adopt(struct rcu_txn *t)
+{
+	/* A handle that changes hands with records in it is mid-flight. */
+	RCU_TXN_WARN_ON(t->nr);
+	__rcu_txn_excl_claim(t);
 }
 
 /* Free a descriptor that installed no proxy: see lib/rcu_txn.c. */
@@ -581,8 +721,8 @@ bool __rcu_txn_grow(struct rcu_txn *t);
  * Records must target pairwise-distinct slots.  record() appends without
  * looking for an earlier record of the same slot; recording a slot twice
  * installs two proxies on it and settles both in record order, so the earlier
- * edit is lost.  Use rcu_txn_record_chain() when the same slot may be written
- * twice.
+ * edit is lost.  CONFIG_DEBUG_RCU_TXN warns about it at commit.  Use
+ * rcu_txn_record_chain() when the same slot may be written twice.
  *
  * Context: The caller excludes other writers of @slot.  May sleep if the
  * handle is full and its gfp_t allows it.
@@ -599,6 +739,15 @@ static inline bool rcu_txn_record(struct rcu_txn *t, void __rcu **slot,
 		WARN_ON_ONCE(t->state != RCU_TXN_OOM);
 		return false;
 	}
+	/*
+	 * Neither value may look like a proxy under @tag.  After settle the
+	 * slot holds @new_ptr directly: were it tagged, every later reader
+	 * would resolve it as a proxy and dereference garbage.
+	 */
+	RCU_TXN_WARN_ON(__rcu_txn_holds_proxy(old_ptr, tag));
+	RCU_TXN_WARN_ON(__rcu_txn_holds_proxy(new_ptr, tag));
+	__rcu_txn_excl_owner(t, "record()");
+	__rcu_txn_excl_slot_free(slot, tag, "record()");
 	if (unlikely(t->nr == t->cap) && !__rcu_txn_grow(t))
 		return false;			/* OOM, now sticky */
 	r = &t->records[t->nr++];
@@ -657,7 +806,8 @@ static inline bool rcu_txn_record(struct rcu_txn *t, void __rcu **slot,
  * from the second record on.
  *
  * Recording a slot twice on such a handle breaks the rule of rcu_txn_record(),
- * with the consequence stated there.
+ * with the consequence stated there.  CONFIG_DEBUG_RCU_TXN warns about it at
+ * the offending rcu_txn_load() or rcu_txn_record_chain().
  *
  * Call after init and before the first record().  On a handle whose reserve()
  * failed it does nothing: the failure is sticky, and commit() reports it.
@@ -672,6 +822,27 @@ static inline void rcu_txn_declare_disjoint(struct rcu_txn *t)
 	t->disjoint = true;
 }
 
+/*
+ * On a handle declared disjoint, warn when a load or a record targets a slot
+ * that the transaction has already recorded.  The load would return the
+ * committed value where its caller expects the pending one, and the record
+ * would install a second proxy on the slot.
+ */
+#ifdef CONFIG_DEBUG_RCU_TXN
+static inline void __rcu_txn_disjoint_check(const struct rcu_txn *t,
+					    void __rcu **slot, const char *what)
+{
+	WARN(t->disjoint && __rcu_txn_scan(t, slot),
+	     "rcu_txn %p: slot %p is already recorded at %s, on a handle declared disjoint\n",
+	     t, slot, what);
+}
+#else
+static inline void __rcu_txn_disjoint_check(const struct rcu_txn *t,
+					    void __rcu **slot, const char *what)
+{
+}
+#endif
+
 /**
  * rcu_txn_load() - load a slot as the transaction will leave it
  * @t: the handle
@@ -680,6 +851,10 @@ static inline void rcu_txn_declare_disjoint(struct rcu_txn *t)
  *
  * On a handle declared disjoint, this returns the committed value without
  * looking for a pending one.
+ *
+ * CONFIG_DEBUG_RCU_TXN checks that an unrecorded slot holds no proxy under
+ * @tag: this writer owns every store to the slot, and its earlier transactions
+ * settled before commit() returned.
  *
  * Context: The caller excludes other writers of @slot.
  * Return: the pending new value of the transaction's record for @slot if it
@@ -691,6 +866,7 @@ static inline void *rcu_txn_load(struct rcu_txn *t, void __rcu **slot,
 	struct rcu_txn_record *r;
 	void *v;
 
+	__rcu_txn_excl_owner(t, "load()");
 	/* A consumed handle has no record left: it reads committed values. */
 	WARN_ON_ONCE(t->state == RCU_TXN_DONE);
 	if (!t->disjoint) {
@@ -698,7 +874,9 @@ static inline void *rcu_txn_load(struct rcu_txn *t, void __rcu **slot,
 		if (r)
 			return r->ptr[1];	/* our own pending write */
 	}
+	__rcu_txn_disjoint_check(t, slot, "load()");
 	v = rcu_dereference_protected(*slot, 1);
+	RCU_TXN_WARN_ON(__rcu_txn_holds_proxy(v, tag));
 	return v;
 }
 
@@ -715,6 +893,9 @@ static inline bool __rcu_txn_chain(struct rcu_txn *t, void __rcu **slot,
 	r = __rcu_txn_find_ryw(t, slot);
 	if (!r)
 		return rcu_txn_record(t, slot, old_ptr, new_ptr, tag);
+	RCU_TXN_WARN_ON(r->tag != tag);
+	/* The caller must have read its own write. */
+	RCU_TXN_WARN_ON(r->ptr[1] != old_ptr);
 	r->ptr[1] = new_ptr;		/* committed old preserved */
 	return true;
 }
@@ -733,7 +914,8 @@ static inline bool __rcu_txn_chain(struct rcu_txn *t, void __rcu **slot,
  * rcu_txn_record() does.  See the pair's contract above.
  *
  * On the chain path @old_ptr is the record's pending value, and a different
- * @old_ptr means the caller computed @new_ptr from a stale read.
+ * @old_ptr means the caller computed @new_ptr from a stale read, which
+ * CONFIG_DEBUG_RCU_TXN warns about.
  *
  * Context: As rcu_txn_record().
  * Return: As rcu_txn_record().
@@ -747,7 +929,9 @@ static inline bool rcu_txn_record_chain(struct rcu_txn *t, void __rcu **slot,
 		WARN_ON_ONCE(t->state != RCU_TXN_OOM);
 		return false;
 	}
+	__rcu_txn_excl_owner(t, "record_chain()");
 	if (t->disjoint) {		/* no slot repeats: skip the lookup */
+		__rcu_txn_disjoint_check(t, slot, "record_chain()");
 		return rcu_txn_record(t, slot, old_ptr, new_ptr, tag);
 	}
 	return __rcu_txn_chain(t, slot, old_ptr, new_ptr, tag);
@@ -770,6 +954,7 @@ static inline bool rcu_txn_record_chain(struct rcu_txn *t, void __rcu **slot,
  */
 static inline void rcu_txn_cancel(struct rcu_txn *t)
 {
+	__rcu_txn_excl_owner(t, "cancel()");
 	/* A consumed handle must be initialized again before reuse. */
 	if (WARN_ON_ONCE(t->state == RCU_TXN_DONE))
 		return;
@@ -811,6 +996,7 @@ static inline int rcu_txn_commit(struct rcu_txn *t)
 {
 	const unsigned int nr = t->nr;
 
+	__rcu_txn_excl_owner(t, "commit()");
 	/* A consumed handle must be initialized again before reuse. */
 	if (WARN_ON_ONCE(t->state == RCU_TXN_DONE))
 		return -EINVAL;
@@ -823,6 +1009,7 @@ static inline int rcu_txn_commit(struct rcu_txn *t)
 			struct rcu_txn_record *r = &t->records[0];
 
 			/* One record: its settle store is the whole commit. */
+			__rcu_txn_excl_slot_unchanged(r, "commit");
 			__rcu_txn_record_settle(r);
 		}
 		__rcu_txn_release_desc(t);	/* no proxy: free now */

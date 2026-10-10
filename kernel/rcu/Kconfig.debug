@@ -239,4 +239,20 @@ config TRIVIAL_PREEMPT_RCU
 
 	  This has no value for production and is only for testing.
 
+config DEBUG_RCU_TXN
+	bool "Debug checks for single-writer RCU pseudo-transactions"
+	depends on DEBUG_KERNEL && RCU_TXN
+	help
+	  Enable the costlier contract checks of <linux/rcu_txn.h>: validity
+	  of the proxy tags, pairwise-distinct recorded slots, and a validator
+	  of the single-writer contract.  The validator warns when a
+	  transaction is driven by two tasks, and when a slot it records,
+	  installs to or settles was touched by another writer in the
+	  meantime.
+
+	  This adds an owner field to every transaction handle and a pairwise
+	  scan of the records to every commit of two records or more.
+
+	  Say N unless you are debugging a user of RCU pseudo-transactions.
+
 endmenu # "RCU Debugging"

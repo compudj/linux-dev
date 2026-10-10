@@ -123,14 +123,19 @@ void __rcu_txn_commit_desc(struct rcu_txn_desc *desc, unsigned int nr)
 	struct rcu_txn_record *records = desc->records;
 	unsigned int i;
 
+	__rcu_txn_assert_distinct_slots(records, nr);
 	/* Install: readers still resolve to old, the selector being 0. */
-	for (i = 0; i < nr; i++)
+	for (i = 0; i < nr; i++) {
+		__rcu_txn_excl_slot_installable(&records[i]);
 		__rcu_txn_record_install(&desc->group, &records[i]);
+	}
 	/* Flip: every proxy resolves to new. */
 	__rcu_txn_group_commit(&desc->group);
 	/* Settle. */
-	for (i = 0; i < nr; i++)
+	for (i = 0; i < nr; i++) {
+		__rcu_txn_excl_slot_ours(&records[i]);
 		__rcu_txn_record_settle(&records[i]);
+	}
 	/* A reader may still hold a proxy, which lives in the descriptor. */
 	kfree_rcu(desc, rcu_head);
 }
