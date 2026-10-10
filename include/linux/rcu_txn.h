@@ -403,6 +403,14 @@ static inline void *rcu_txn_resolve(void *v, unsigned long tag)
 	(typeof(*(p)) __force __kernel *)__rcu_txn_v;			\
 })
 
+/*
+ * Pick the optional lockdep condition of an iterator, as
+ * list_for_each_entry_rcu() does.  Return the condition if one was given,
+ * else 0.
+ */
+#define __rcu_txn_cond(cond...)			___rcu_txn_cond(0, ## cond, 0)
+#define ___rcu_txn_cond(zero, cond, extra...)	((zero) || (cond))
+
 /**
  * rcu_txn_slot() - convert the address of an RCU-protected pointer to a slot
  * @pp: address of an __rcu pointer, of any type
