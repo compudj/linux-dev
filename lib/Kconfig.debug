@@ -2844,6 +2844,19 @@ config LIST_PRIVATE_KUNIT_TEST
 
 	  If unsure, say N.
 
+config RCU_TXN_KUNIT_TEST
+	tristate "KUnit Test for single-writer RCU pseudo-transactions" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	select RCU_TXN
+	default KUNIT_ALL_TESTS
+	help
+	  This builds the KUnit test suite of the single-writer RCU
+	  pseudo-transactions defined in include/linux/rcu_txn.h.  It tests
+	  the commit of a transaction as readers observe it, and the
+	  lifecycle of a transaction handle, including its misuse.
+
+	  If unsure, say N.
+
 config HASHTABLE_KUNIT_TEST
 	tristate "KUnit Test for Kernel Hashtable structures" if !KUNIT_ALL_TESTS
 	depends on KUNIT
