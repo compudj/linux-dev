@@ -22857,6 +22857,7 @@ RCU PSEUDO-TRANSACTIONS
 M:	Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 L:	rcu@vger.kernel.org
 S:	Maintained
+F:	Documentation/RCU/rcu_txn.rst
 F:	include/linux/rcu_txn*.h
 F:	lib/rcu_txn*
 F:	lib/tests/rcu_txn_kunit.c

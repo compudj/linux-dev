@@ -12,6 +12,8 @@
  * the slots, from their old to their new targets with a single store, as
  * observed by concurrent RCU readers: at any instant, every slot of the set
  * resolves to its old target, or every slot to its new one.
+ * Documentation/RCU/rcu_txn.rst says when to use them, and describes the data
+ * structures built on them.
  *
  * The slots are the edges of the data structure that an update re-points; the
  * writer records each edge as its slot with the slot's old and new targets.
