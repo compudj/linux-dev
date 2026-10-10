@@ -212,9 +212,11 @@ Testing
 =======
 
 ``CONFIG_RCU_TXN_KUNIT_TEST`` builds the KUnit suite ``rcu_txn``, which covers
-the engine, both data structures and the debug checks::
+the engine, both data structures and the debug checks, and runs one writer
+against concurrent readers of a list::
 
 	./tools/testing/kunit/kunit.py run --arch=x86_64 \
+		--qemu_args="-smp 4" \
 		--kconfig_add CONFIG_RCU_TXN_KUNIT_TEST=y \
 		--kconfig_add CONFIG_DEBUG_KERNEL=y \
 		--kconfig_add CONFIG_DEBUG_RCU_TXN=y \

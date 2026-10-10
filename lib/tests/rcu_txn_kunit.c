@@ -7,11 +7,15 @@
 
 #include <kunit/test.h>
 #include <linux/bug.h>
+#include <linux/kthread.h>
+#include <linux/minmax.h>
 #include <linux/rcu_txn.h>
 #include <linux/rcu_txn_hlist.h>
 #include <linux/rcu_txn_list.h>
 #include <linux/rcupdate.h>
+#include <linux/sched.h>
 #include <linux/sched/task.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 
 #include "../rcu_txn_internal.h"	/* the steps of a commit */
@@ -1686,6 +1690,308 @@ static void rcu_txn_test_list_debug_disjoint_compose(struct kunit *test)
 	list_expect(test, &head, keys, ARRAY_SIZE(keys));
 }
 
+/*
+ * One writer mutating a key-sorted list while several readers iterate it
+ * forward and backward.
+ *
+ * Two invariants, because the first one alone cannot see the property this
+ * test exists for.
+ *
+ * (1) Monotonicity, per direction.  The writer keeps the list sorted by key at
+ * all times, so a forward walk must see strictly increasing keys and a reverse
+ * walk strictly decreasing ones.  Out-of-range keys and runaway walks are
+ * caught here too.
+ *
+ * What invariant (1) cannot catch is a torn two-edge publish.  Take an insert
+ * of X between P and Q publishing only its forward edge: the forward ring is
+ * P -> X -> Q, still strictly increasing, and the reverse ring is Q -> P, still
+ * strictly decreasing.  Every torn state of a two-edge operation is sorted in
+ * each direction separately.
+ *
+ * (2) Cross-direction agreement, which is where a torn publish shows.  After
+ * each forward step p -> q the reader also resolves the prev of q and requires
+ * its key to be at least p's.  A forward-only torn insert yields the
+ * predecessor that is not back-linked yet, whose key is smaller than p's.  A
+ * reverse-only torn insert is not caught: the prev of q points to X, whose key
+ * lies between p's and q's, as after a completed insert.  list_add_rcu()
+ * publishes the forward edge first, which is the tear this check is for.
+ *
+ * Invariant (2) holds only in a phase without deletes.  Under concurrent
+ * deletes it is simply false: delete p between the reader's two loads and the
+ * prev of q legitimately becomes the node before p, whose key is smaller.  With
+ * inserts alone the legal outcomes are p itself or a node inserted between p
+ * and q, both with a key at least p's.
+ *
+ * The phase change is a handshake.  The writer numbers its phases, the odd ones
+ * allowing deletes, and after publishing an odd phase waits for every reader
+ * to acknowledge that number.  A reader samples the phase at the top of an
+ * iteration and acknowledges an odd one there, so that no cross-checking walk
+ * is in flight when the writer proceeds; an acknowledgment of an earlier
+ * phase does not count.  Store-release and load-acquire order the walks and
+ * the deletes against the handshake.
+ */
+
+#define CONC_KEY_MAX		100		/* keys are 1..CONC_KEY_MAX */
+#define CONC_READERS		4
+#define CONC_STEP_LIMIT		(CONC_KEY_MAX + 8)	/* runaway-walk guard */
+#define CONC_INSERT_ROUNDS	20
+#define CONC_MIXED_OPS		20000
+
+struct cn {
+	struct rcu_txn_list_node node;
+	struct rcu_head rcu;
+	int key;
+};
+
+struct conc {
+	struct rcu_txn_list_head head;
+	unsigned long phase;	/* odd: deletes as well as inserts */
+	struct cn *live[CONC_KEY_MAX + 1];	/* the writer's: node per key */
+};
+
+struct conc_reader {
+	struct conc *conc;
+	struct task_struct *task;
+	long walks;
+	long violations;	/* invariant (1) */
+	long cross_checks;
+	long cross_violations;	/* invariant (2) */
+	unsigned long ack;	/* last odd phase seen: no cross-check in flight */
+};
+
+static int conc_reader_fn(void *arg)
+{
+	struct conc_reader *r = arg;
+	struct rcu_txn_list_head *head = &r->conc->head;
+
+	while (!kthread_should_stop()) {
+		/* Pairs with the writer's store-release of the phase. */
+		unsigned long phase = smp_load_acquire(&r->conc->phase);
+		bool insert_only = !(phase & 1);
+		struct rcu_txn_list_node *p;
+		int prev_key, steps;
+
+		if (!insert_only) {
+			/* Pairs with the writer's load-acquire of the ack. */
+			smp_store_release(&r->ack, phase);
+		}
+
+		/* Forward: strictly increasing keys, bounded. */
+		rcu_read_lock();
+		prev_key = 0;
+		steps = 0;
+		rcu_txn_list_for_each_rcu(p, head) {
+			int key = container_of(p, struct cn, node)->key;
+
+			if (key < 1 || key > CONC_KEY_MAX || key <= prev_key ||
+			    ++steps > CONC_STEP_LIMIT) {
+				r->violations++;
+				break;
+			}
+			/*
+			 * Invariant (2).  Skipped for the first step, whose
+			 * predecessor is the head.
+			 */
+			if (insert_only && prev_key) {
+				struct rcu_txn_list_node *back =
+						rcu_txn_list_prev_rcu(p);
+
+				r->cross_checks++;
+				if (back != &head->node &&
+				    container_of(back, struct cn,
+						 node)->key < prev_key)
+					r->cross_violations++;
+			}
+			prev_key = key;
+		}
+		rcu_read_unlock();
+
+		/* Reverse: strictly decreasing keys, bounded. */
+		rcu_read_lock();
+		prev_key = CONC_KEY_MAX + 1;
+		steps = 0;
+		rcu_txn_list_for_each_reverse_rcu(p, head) {
+			int key = container_of(p, struct cn, node)->key;
+
+			if (key < 1 || key > CONC_KEY_MAX || key >= prev_key ||
+			    ++steps > CONC_STEP_LIMIT) {
+				r->violations++;
+				break;
+			}
+			prev_key = key;
+		}
+		rcu_read_unlock();
+
+		r->walks += 2;
+		cond_resched();
+	}
+	return 0;
+}
+
+/* Insert @key, keeping the list sorted.  Returns false if it cannot. */
+static bool conc_insert(struct conc *c, int key)
+{
+	struct rcu_txn_list_node *succ = &c->head.node;	/* default: last */
+	struct cn *n = kmalloc(sizeof(*n), GFP_KERNEL);
+	int i;
+
+	if (!n)
+		return false;
+	n->key = key;
+	for (i = key + 1; i <= CONC_KEY_MAX; i++) {
+		if (c->live[i]) {
+			succ = &c->live[i]->node;
+			break;
+		}
+	}
+	if (rcu_txn_list_add_before_rcu(&n->node, succ, GFP_KERNEL)) {
+		kfree(n);
+		return false;
+	}
+	c->live[key] = n;
+	return true;
+}
+
+static bool conc_del(struct conc *c, int key)
+{
+	struct cn *n = c->live[key];
+
+	if (rcu_txn_list_del_rcu(&n->node, GFP_KERNEL))
+		return false;
+	c->live[key] = NULL;
+	kfree_rcu(n, rcu);
+	return true;
+}
+
+/* Replace the node of @key by a new one of the same key: order is kept. */
+static bool conc_replace(struct conc *c, int key)
+{
+	struct cn *old = c->live[key];
+	struct cn *n = kmalloc(sizeof(*n), GFP_KERNEL);
+
+	if (!n)
+		return false;
+	n->key = key;
+	if (rcu_txn_list_replace_rcu(&old->node, &n->node, GFP_KERNEL)) {
+		kfree(n);
+		return false;
+	}
+	c->live[key] = n;
+	kfree_rcu(old, rcu);
+	return true;
+}
+
+static void rcu_txn_test_list_concurrent(struct kunit *test)
+{
+	struct conc_reader *readers;
+	long walks = 0, violations = 0, cross_checks = 0, cross_violations = 0;
+	u32 rng = 2463534242u;
+	bool ok = true;
+	struct conc *c;
+	int i, key, round;
+
+	c = kunit_kzalloc(test, sizeof(*c), GFP_KERNEL);
+	readers = kunit_kcalloc(test, CONC_READERS, sizeof(*readers),
+				GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, c);
+	KUNIT_ASSERT_NOT_NULL(test, readers);
+	rcu_txn_list_init(&c->head);
+
+	for (i = 0; i < CONC_READERS; i++) {
+		readers[i].conc = c;
+		readers[i].task = kthread_run(conc_reader_fn, &readers[i],
+					      "rcu_txn_reader/%d", i);
+		if (IS_ERR(readers[i].task)) {
+			readers[i].task = NULL;
+			ok = false;
+		}
+	}
+
+	/*
+	 * An even phase, repeated: fill the list one key at a time, with
+	 * inserts only, so that the readers cross-check against concurrent
+	 * inserts.  Then hand over to an odd phase and empty it with deletes.
+	 */
+	for (round = 0; ok && round < CONC_INSERT_ROUNDS; round++) {
+		int order[CONC_KEY_MAX], other;
+
+		for (i = 0; i < CONC_KEY_MAX; i++)
+			order[i] = i + 1;
+		for (i = CONC_KEY_MAX - 1; i > 0; i--) {	/* shuffle */
+			rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+			other = rng % (i + 1);
+			swap(order[i], order[other]);
+		}
+
+		/* An even phase, after the deletes of the previous one. */
+		smp_store_release(&c->phase, (c->phase | 1) + 1);
+
+		for (i = 0; ok && i < CONC_KEY_MAX; i++) {
+			ok = conc_insert(c, order[i]);
+			/*
+			 * Let the readers walk in between.  On one cpu they
+			 * only run in this phase if the writer sleeps in it.
+			 */
+			if (i == CONC_KEY_MAX / 2)
+				schedule_timeout_uninterruptible(1);
+			else
+				cond_resched();
+		}
+
+		/* An odd phase: wait until no even phase walk is running. */
+		smp_store_release(&c->phase, c->phase + 1);
+		for (i = 0; i < CONC_READERS; i++) {
+			if (!readers[i].task)
+				continue;
+			/* Pairs with the reader's store-release of its ack. */
+			while (smp_load_acquire(&readers[i].ack) != c->phase)
+				schedule_timeout_uninterruptible(1);
+		}
+
+		for (key = 1; ok && key <= CONC_KEY_MAX; key++) {
+			if (c->live[key])
+				ok = conc_del(c, key);
+			cond_resched();
+		}
+	}
+
+	/* Then inserts, deletes and replaces, at random. */
+	for (i = 0; ok && i < CONC_MIXED_OPS; i++) {
+		rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+		key = 1 + rng % CONC_KEY_MAX;
+
+		if (!c->live[key])
+			ok = conc_insert(c, key);
+		else if (!(rng & 0x300))
+			ok = conc_replace(c, key);
+		else
+			ok = conc_del(c, key);
+		cond_resched();
+	}
+
+	for (i = 0; i < CONC_READERS; i++) {
+		if (readers[i].task)
+			kthread_stop(readers[i].task);
+		walks += readers[i].walks;
+		violations += readers[i].violations;
+		cross_checks += readers[i].cross_checks;
+		cross_violations += readers[i].cross_violations;
+	}
+	for (key = 1; key <= CONC_KEY_MAX; key++)
+		if (c->live[key])
+			conc_del(c, key);
+
+	kunit_info(test, "%ld walks, %ld cross-direction checks\n", walks,
+		   cross_checks);
+	KUNIT_EXPECT_TRUE(test, ok);
+	KUNIT_EXPECT_GT(test, walks, 0);
+	/* Forward and reverse walks stayed sorted. */
+	KUNIT_EXPECT_EQ(test, violations, 0);
+	/* No two-edge publish was ever seen torn. */
+	KUNIT_EXPECT_GT(test, cross_checks, 0);
+	KUNIT_EXPECT_EQ(test, cross_violations, 0);
+}
+
 static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_single_record),
 	KUNIT_CASE(rcu_txn_test_multi_record),
@@ -1744,6 +2050,7 @@ static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_list_move_phases),
 	KUNIT_CASE(rcu_txn_test_list_compose_moves),
 	KUNIT_CASE(rcu_txn_test_list_debug_disjoint_compose),
+	KUNIT_CASE_SLOW(rcu_txn_test_list_concurrent),
 	{}
 };
 
