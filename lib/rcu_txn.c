@@ -9,6 +9,8 @@
  */
 
 #include <linux/export.h>
+#include <linux/math.h>
+#include <linux/minmax.h>
 #include <linux/overflow.h>
 #include <linux/rcu_txn.h>
 #include <linux/rcupdate.h>
@@ -16,6 +18,24 @@
 #include <linux/string.h>
 
 #include "rcu_txn_internal.h"
+
+/* Record-sized slots that the filter takes, past the records. */
+#define RCU_TXN_BLOOM_SLOTS						\
+	DIV_ROUND_UP(RCU_TXN_BLOOM_SIZE, sizeof(struct rcu_txn_record))
+
+/*
+ * The records that a descriptor of @slots record-sized slots holds.  Once they
+ * are RCU_TXN_BLOOM_MIN or more, the filter takes the slots past them: a
+ * descriptor with slots for that many records but not for the filter as well
+ * holds RCU_TXN_BLOOM_MIN - 1 records.
+ */
+static unsigned int rcu_txn_desc_cap(unsigned int slots)
+{
+	if (slots < RCU_TXN_BLOOM_MIN)
+		return slots;
+	return max_t(unsigned int, slots - RCU_TXN_BLOOM_SLOTS,
+		     RCU_TXN_BLOOM_MIN - 1);
+}
 
 /*
  * Allocate a transaction descriptor for at least @cap records, with its flip
@@ -32,12 +52,17 @@ static struct rcu_txn_desc *rcu_txn_desc_alloc(unsigned int cap, gfp_t gfp)
 	struct rcu_txn_desc *desc;
 	size_t size;
 
-	size = kmalloc_size_roundup(struct_size(desc, records, cap));
+	size = struct_size(desc, records, cap);
+	if (cap >= RCU_TXN_BLOOM_MIN)
+		size = size_add(size, RCU_TXN_BLOOM_SLOTS *
+				      sizeof(struct rcu_txn_record));
+	size = kmalloc_size_roundup(size);
 	desc = kmalloc(size, gfp);
 	if (!desc)
 		return NULL;
 	__rcu_txn_group_init(&desc->group);
-	desc->cap = (size - sizeof(*desc)) / sizeof(desc->records[0]);
+	desc->slots = (size - sizeof(*desc)) / sizeof(desc->records[0]);
+	desc->cap = rcu_txn_desc_cap(desc->slots);
 	return desc;
 }
 
@@ -66,6 +91,13 @@ bool __rcu_txn_resize(struct rcu_txn *t, unsigned int cap)
 	if (t->nr)		/* @records is NULL until first allocated */
 		memcpy(desc->records, t->records,
 		       (size_t)t->nr * sizeof(*desc->records));
+	/*
+	 * An armed filter moves too: both descriptors hold RCU_TXN_BLOOM_MIN
+	 * records or more, so both have room for it.
+	 */
+	if (t->bloom_live)
+		memcpy(&desc->records[desc->cap], __rcu_txn_bloom(t),
+		       RCU_TXN_BLOOM_SIZE);
 	kfree(t->desc);		/* NULL if it had none */
 	t->desc = desc;
 	t->records = desc->records;

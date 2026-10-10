@@ -436,6 +436,147 @@ static void rcu_txn_test_consumed_handle(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(slot), T(1));
 }
 
+static void __rcu *bloom_slots[4096];
+
+/* An empty filter answers absent for every slot. */
+static void rcu_txn_test_bloom_empty(struct kunit *test)
+{
+	u64 bloom[RCU_TXN_BLOOM_WORDS] = {};
+	unsigned int i, present = 0;
+
+	for (i = 0; i < ARRAY_SIZE(bloom_slots); i++)
+		present += rcu_txn_bloom_test(bloom, &bloom_slots[i]);
+	KUNIT_EXPECT_EQ(test, present, 0);
+}
+
+/*
+ * No false negatives: every slot ever set still reads present, whatever is set
+ * after it.  This is the property the engine's correctness rests on.
+ */
+static void rcu_txn_test_bloom_no_false_negative(struct kunit *test)
+{
+	u64 bloom[RCU_TXN_BLOOM_WORDS] = {};
+	unsigned int i, j, missing = 0;
+
+	for (i = 0; i < ARRAY_SIZE(bloom_slots); i++) {
+		rcu_txn_bloom_set(bloom, &bloom_slots[i]);
+		/* Testing all i + 1 each round is O(n^2): sample. */
+		for (j = 0; j <= i; j += i / 16 + 1)
+			missing += !rcu_txn_bloom_test(bloom, &bloom_slots[j]);
+	}
+	for (i = 0; i < ARRAY_SIZE(bloom_slots); i++)
+		missing += !rcu_txn_bloom_test(bloom, &bloom_slots[i]);
+	KUNIT_EXPECT_EQ(test, missing, 0);
+}
+
+/*
+ * The filter still discriminates past its design fill: with an eighth of the
+ * slots set, not every absent slot reads present.  The bound only has to catch
+ * a degenerate hash.
+ */
+static void rcu_txn_test_bloom_discriminates(struct kunit *test)
+{
+	const unsigned int nr = ARRAY_SIZE(bloom_slots);
+	u64 bloom[RCU_TXN_BLOOM_WORDS] = {};
+	unsigned int i, false_positives = 0;
+
+	for (i = 0; i < nr / 8; i++)
+		rcu_txn_bloom_set(bloom, &bloom_slots[i]);
+	for (i = nr / 8; i < nr; i++)
+		false_positives += rcu_txn_bloom_test(bloom, &bloom_slots[i]);
+	KUNIT_EXPECT_LT(test, false_positives, nr - nr / 8);
+}
+
+/*
+ * The filter does not depend on insertion order.  Arming rebuilds it from the
+ * records so far, so a rebuilt filter must match one grown incrementally.
+ */
+static void rcu_txn_test_bloom_rebuild(struct kunit *test)
+{
+	u64 bloom[RCU_TXN_BLOOM_WORDS] = {}, rebuilt[RCU_TXN_BLOOM_WORDS] = {};
+	unsigned int i;
+
+	for (i = 0; i < 64; i++)
+		rcu_txn_bloom_set(bloom, &bloom_slots[i]);
+	for (i = 64; i-- > 0; )
+		rcu_txn_bloom_set(rebuilt, &bloom_slots[i]);
+	KUNIT_EXPECT_MEMEQ(test, bloom, rebuilt, sizeof(bloom));
+}
+
+/*
+ * The engine arms the filter at the first lookup that faces RCU_TXN_BLOOM_MIN
+ * records, and keeps it current from then on: slots recorded before and after
+ * the arming are both found.
+ */
+static void rcu_txn_test_bloom_arming(struct kunit *test)
+{
+	enum { NR = 2 * RCU_TXN_BLOOM_MIN };
+	void __rcu *slots[NR];
+	struct rcu_txn txn;
+	unsigned int i;
+
+	for (i = 0; i < NR; i++)
+		RCU_INIT_POINTER(slots[i], T(i));
+	rcu_txn_init(&txn, GFP_KERNEL);
+	for (i = 0; i < NR; i++) {
+		void *v = rcu_txn_load(&txn, &slots[i], TAG);
+
+		/* The lookup that faces RCU_TXN_BLOOM_MIN records arms it. */
+		KUNIT_EXPECT_EQ(test, txn.bloom_live, i >= RCU_TXN_BLOOM_MIN);
+		rcu_txn_record_chain(&txn, &slots[i], v, T(20 + i), TAG);
+	}
+	for (i = 0; i < NR; i++) {
+		void *v = rcu_txn_load(&txn, &slots[i], TAG);
+
+		KUNIT_EXPECT_PTR_EQ(test, v, T(20 + i));
+		rcu_txn_record_chain(&txn, &slots[i], v, T(100 + i), TAG);
+	}
+	KUNIT_EXPECT_EQ(test, txn.nr, NR);		/* fused */
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	KUNIT_EXPECT_TRUE(test, all_settled(slots, NR));
+
+	/* A handle declared disjoint never looks up, and never arms. */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_declare_disjoint(&txn);
+	for (i = 0; i < NR; i++) {
+		void *v = rcu_txn_load(&txn, &slots[i], TAG);
+
+		rcu_txn_record_chain(&txn, &slots[i], v, T(i), TAG);
+	}
+	KUNIT_EXPECT_FALSE(test, txn.bloom_live);
+	rcu_txn_cancel(&txn);
+}
+
+/*
+ * An armed filter moves with the records when the transaction outgrows its
+ * descriptor: every slot recorded before and after the move is still found.
+ */
+static void rcu_txn_test_bloom_grow(struct kunit *test)
+{
+	enum { NR = 8 * RCU_TXN_BLOOM_MIN };
+	void __rcu *slots[NR];
+	unsigned int i, cap = 0;
+	struct rcu_txn txn;
+
+	for (i = 0; i < NR; i++)
+		RCU_INIT_POINTER(slots[i], T(i));
+	rcu_txn_init(&txn, GFP_KERNEL);
+	for (i = 0; i < NR; i++) {
+		void *v = rcu_txn_load(&txn, &slots[i], TAG);
+
+		if (txn.bloom_live && !cap)
+			cap = txn.cap;		/* armed in this descriptor */
+		rcu_txn_record_chain(&txn, &slots[i], v, T(100 + i), TAG);
+	}
+	KUNIT_ASSERT_NE(test, cap, 0);
+	KUNIT_EXPECT_GT(test, txn.cap, cap);	/* grown since */
+	for (i = 0; i < NR; i++)
+		KUNIT_EXPECT_PTR_EQ(test, rcu_txn_load(&txn, &slots[i], TAG),
+				    T(100 + i));
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	KUNIT_EXPECT_TRUE(test, all_settled(slots, NR));
+}
+
 static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_single_record),
 	KUNIT_CASE(rcu_txn_test_multi_record),
@@ -449,6 +590,12 @@ static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_ryw_chain),
 	KUNIT_CASE(rcu_txn_test_disjoint),
 	KUNIT_CASE(rcu_txn_test_consumed_handle),
+	KUNIT_CASE(rcu_txn_test_bloom_empty),
+	KUNIT_CASE(rcu_txn_test_bloom_no_false_negative),
+	KUNIT_CASE(rcu_txn_test_bloom_discriminates),
+	KUNIT_CASE(rcu_txn_test_bloom_rebuild),
+	KUNIT_CASE(rcu_txn_test_bloom_arming),
+	KUNIT_CASE(rcu_txn_test_bloom_grow),
 	{}
 };
 

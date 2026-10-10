@@ -102,6 +102,7 @@
 #include <linux/errno.h>
 #include <linux/gfp_types.h>
 #include <linux/rcupdate.h>
+#include <linux/rcu_txn_bloom.h>	/* read-your-own-writes filter */
 #include <linux/stddef.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -197,7 +198,13 @@ struct rcu_txn_desc {
 	struct rcu_txn_group group;		/* read by installed proxies */
 	struct rcu_head rcu_head;		/* deferred-free handle */
 	unsigned int cap;			/* records it can hold */
-	struct rcu_txn_record records[] __counted_by(cap);
+	/*
+	 * Record-sized slots of the allocation: the @cap records and, in a
+	 * descriptor of RCU_TXN_BLOOM_MIN records or more, past them, the
+	 * read-your-own-writes filter (__rcu_txn_bloom()).
+	 */
+	unsigned int slots;
+	struct rcu_txn_record records[] __counted_by(slots);
 };
 
 /*
@@ -218,6 +225,7 @@ struct rcu_txn {
 	gfp_t gfp;			/* for the descriptor */
 	enum rcu_txn_state state;
 	bool disjoint;			/* declared slot-disjoint */
+	bool bloom_live;		/* the descriptor's filter is armed */
 };
 
 /*
@@ -463,9 +471,10 @@ static inline void __rcu_txn_done(struct rcu_txn *t)
 
 /*
  * Scan this transaction's records for @slot, or NULL.  Linear, so O(nr) per
- * call and O(nr^2) to build a write set.  The returned pointer is invalidated
- * by the next record() (a grow may move the records), so use it before
- * recording again.
+ * call and O(nr^2) to build a write set -- __rcu_txn_find_ryw() below is what
+ * keeps that off the hot path.  The returned pointer is invalidated by the
+ * next record() (a grow may move the records), so use it before recording
+ * again.
  */
 static inline struct rcu_txn_record *__rcu_txn_scan(const struct rcu_txn *t,
 						    void __rcu **slot)
@@ -476,6 +485,69 @@ static inline struct rcu_txn_record *__rcu_txn_scan(const struct rcu_txn *t,
 		if (t->records[i].slot == slot)
 			return &t->records[i];
 	return NULL;
+}
+
+/*
+ * RCU_TXN_BLOOM_MIN: the record count from which the read-your-own-writes
+ * filter (<linux/rcu_txn_bloom.h>) is used.  Below it the filter is never
+ * armed, nor even zeroed.
+ *
+ * rcu_txn_load() is only called on a slot about to be recorded, so loads
+ * track records one for one, and most transactions are tiny: one edge for an
+ * hlist operation, two for a list operation.  Scanning that many records is
+ * cheaper than hashing.
+ *
+ * The filter is built and armed by the first __rcu_txn_find_ryw() that faces
+ * at least this many records, then kept current by every record().  Arming on
+ * the record that crosses the threshold instead would make a transaction of
+ * exactly RCU_TXN_BLOOM_MIN records build a filter it never tests.
+ *
+ * The filter lives in the descriptor, past the records, so that the handle on
+ * the stack does not carry it.  A descriptor of this many records or more has
+ * room for it (rcu_txn_desc_alloc()).
+ */
+#define RCU_TXN_BLOOM_MIN	8
+
+static_assert(RCU_TXN_BLOOM_MIN > 1);
+
+/* The filter of the handle's descriptor: see RCU_TXN_BLOOM_MIN. */
+static inline u64 *__rcu_txn_bloom(const struct rcu_txn *t)
+{
+	return (u64 *)&t->desc->records[t->desc->cap];
+}
+
+/*
+ * Build the filter from the records so far and arm it.  See
+ * RCU_TXN_BLOOM_MIN.
+ */
+static inline void __rcu_txn_bloom_arm(struct rcu_txn *t)
+{
+	u64 *bloom = __rcu_txn_bloom(t);
+	unsigned int i;
+
+	memset(bloom, 0, RCU_TXN_BLOOM_SIZE);
+	for (i = 0; i < t->nr; i++)
+		rcu_txn_bloom_set(bloom, t->records[i].slot);
+	t->bloom_live = true;
+}
+
+/*
+ * __rcu_txn_scan() behind the filter: a clear bit means the slot is not
+ * recorded, and the scan is skipped.  All k bits set leaves the answer to the
+ * scan, which rules out a false positive.  The filter never changes the answer.
+ */
+static inline struct rcu_txn_record *__rcu_txn_find_ryw(struct rcu_txn *t,
+							void __rcu **slot)
+{
+	if (unlikely(!t->bloom_live)) {
+		/* Armed on first use: see RCU_TXN_BLOOM_MIN. */
+		if (t->nr < RCU_TXN_BLOOM_MIN)
+			return __rcu_txn_scan(t, slot);
+		__rcu_txn_bloom_arm(t);
+	}
+	if (!rcu_txn_bloom_test(__rcu_txn_bloom(t), slot))
+		return NULL;			/* definitely absent */
+	return __rcu_txn_scan(t, slot);
 }
 
 /*
@@ -531,6 +603,8 @@ static inline bool rcu_txn_record(struct rcu_txn *t, void __rcu **slot,
 		return false;			/* OOM, now sticky */
 	r = &t->records[t->nr++];
 	__rcu_txn_record_set(r, slot, old_ptr, new_ptr, tag);
+	if (unlikely(t->bloom_live))	/* armed: keep it current */
+		rcu_txn_bloom_set(__rcu_txn_bloom(t), slot);
 	return true;
 }
 
@@ -579,7 +653,8 @@ static inline bool rcu_txn_record(struct rcu_txn *t, void __rcu **slot,
  * a list, may write the same slot.
  *
  * This skips the lookup among the records so far on every load and record, a
- * scan: a small saving from the second record on.
+ * scan or, past RCU_TXN_BLOOM_MIN records, a Bloom filter test: a small saving
+ * from the second record on.
  *
  * Recording a slot twice on such a handle breaks the rule of rcu_txn_record(),
  * with the consequence stated there.
@@ -619,7 +694,7 @@ static inline void *rcu_txn_load(struct rcu_txn *t, void __rcu **slot,
 	/* A consumed handle has no record left: it reads committed values. */
 	WARN_ON_ONCE(t->state == RCU_TXN_DONE);
 	if (!t->disjoint) {
-		r = __rcu_txn_scan(t, slot);
+		r = __rcu_txn_find_ryw(t, slot);
 		if (r)
 			return r->ptr[1];	/* our own pending write */
 	}
@@ -637,7 +712,7 @@ static inline bool __rcu_txn_chain(struct rcu_txn *t, void __rcu **slot,
 {
 	struct rcu_txn_record *r;
 
-	r = __rcu_txn_scan(t, slot);
+	r = __rcu_txn_find_ryw(t, slot);
 	if (!r)
 		return rcu_txn_record(t, slot, old_ptr, new_ptr, tag);
 	r->ptr[1] = new_ptr;		/* committed old preserved */
