@@ -200,7 +200,9 @@ Samples
 table of ``rcu_txn_hlist`` buckets, and kept in an ``rcu_txn_list`` as their
 LRU.  Its lookups run under RCU alone, and each of its changes is one
 transaction over both structures.  ``rcu_txn_cache_mutex`` excludes its
-writers with a single mutex.  ``CONFIG_SAMPLE_RCU_TXN`` builds it.
+writers with a single mutex; ``rcu_txn_cache_node_lock`` with a spinlock in
+every node, taken in the order of their addresses, so that its writers run in
+parallel.  ``CONFIG_SAMPLE_RCU_TXN`` builds them.
 
 Debugging
 =========
