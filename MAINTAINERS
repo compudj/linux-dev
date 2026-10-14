@@ -22862,6 +22862,7 @@ F:	Documentation/litmus-tests/rcu/RCU-txn+*
 F:	include/linux/rcu_txn*.h
 F:	lib/rcu_txn*
 F:	lib/tests/rcu_txn_kunit.c
+F:	samples/rcu_txn/
 
 RCUTORTURE TEST FRAMEWORK
 M:	"Paul E. McKenney" <paulmck@kernel.org>

@@ -103,6 +103,19 @@ config SAMPLE_KFIFO
 
 	  If in doubt, say "N" here.
 
+config SAMPLE_RCU_TXN
+	tristate "Build RCU pseudo-transaction examples -- loadable modules only"
+	depends on m
+	select RCU_TXN
+	help
+	  Build sample modules of a cache on RCU pseudo-transactions: a hash
+	  table of rcu_txn_hlist buckets, with an rcu_txn_list as its LRU,
+	  that threads look entries up in under RCU alone while other threads
+	  insert, update, delete and evict them.  Each module runs for a while
+	  when it is loaded, then reports what it did.
+
+	  If in doubt, say "N" here.
+
 config SAMPLE_KDB
 	tristate "Build kdb command example -- loadable modules only"
 	depends on KGDB_KDB && m

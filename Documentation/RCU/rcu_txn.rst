@@ -193,6 +193,15 @@ section, if it passes them a lockdep condition for that exclusion, such as
 	backward edge, and a move six, the moved node's own included: each
 	allocates a descriptor.
 
+Samples
+=======
+
+``samples/rcu_txn/`` holds a cache whose entries are found by key in a hash
+table of ``rcu_txn_hlist`` buckets, and kept in an ``rcu_txn_list`` as their
+LRU.  Its lookups run under RCU alone, and each of its changes is one
+transaction over both structures.  ``rcu_txn_cache_mutex`` excludes its
+writers with a single mutex.  ``CONFIG_SAMPLE_RCU_TXN`` builds it.
+
 Debugging
 =========
 
