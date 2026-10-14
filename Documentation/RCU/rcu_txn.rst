@@ -245,7 +245,12 @@ Samples
 buckets finds its entries by key.  An ``rcu_txn_list`` keeps the same
 entries as an LRU.  Lookups run under RCU alone.  Each change is one
 transaction over both structures.  ``rcu_txn_cache_mutex`` excludes its
-writers with a single mutex.  ``CONFIG_SAMPLE_RCU_TXN`` builds it.
+writers with a single mutex.  ``rcu_txn_cache_node_lock`` gives every node a
+spinlock instead.  Writers on entries far apart thus run in parallel.  They
+take these locks in the order of their addresses, which avoids deadlocks.  An
+operation of at most ``RCU_TXN_LOCAL_CAP`` records runs as a local
+transaction, started once its locks are held.  So a deletion cannot fail.
+``CONFIG_SAMPLE_RCU_TXN`` builds them.
 
 Debugging
 =========
