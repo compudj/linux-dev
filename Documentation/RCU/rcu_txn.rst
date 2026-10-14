@@ -238,6 +238,15 @@ exclusion, such as ``lockdep_is_held()`` of its lock.  This works as with
 	An ``_rcu`` operation runs a local transaction.  It allocates
 	nothing, and cannot fail in any context but NMI.
 
+Samples
+=======
+
+``samples/rcu_txn/`` holds a cache.  A hash table of ``rcu_txn_hlist``
+buckets finds its entries by key.  An ``rcu_txn_list`` keeps the same
+entries as an LRU.  Lookups run under RCU alone.  Each change is one
+transaction over both structures.  ``rcu_txn_cache_mutex`` excludes its
+writers with a single mutex.  ``CONFIG_SAMPLE_RCU_TXN`` builds it.
+
 Debugging
 =========
 
