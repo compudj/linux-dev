@@ -1,0 +1,55 @@
+C RCU-txn+sync+free+nolock
+
+(*
+ * Result: Sometimes
+ *
+ * Without an RCU read-side critical section around the load and the
+ * resolution, the grace period does not wait for the reader, which can then
+ * read the record after it is freed.
+ *
+ * Error injection into RCU-txn+sync+free: everything else is as there.
+ *)
+
+{
+int junk = 9;
+int sel = 0;
+int o = 1;
+int n = 1;
+int *rg = &sel;
+int *ro = &o;
+int *rn = &n;
+int *a = &rg;
+}
+
+P0(int **a, int **rg, int **ro, int **rn, int *sel, int *n, int *junk)
+{
+	smp_store_release(sel, 1);	// flip
+	rcu_assign_pointer(*a, n);	// settle
+	synchronize_rcu();		// kfree_rcu() of the descriptor
+	WRITE_ONCE(*rg, junk);
+	WRITE_ONCE(*ro, junk);
+	WRITE_ONCE(*rn, junk);
+}
+
+P1(int **a, int **rg, int **ro, int **rn)
+{
+	int *r0;
+	int *r1;
+	int r2;
+	int *t;
+
+	r0 = rcu_dereference(*a);
+	if (r0 == rg) {
+		r1 = READ_ONCE(*r0);
+		r2 = smp_load_acquire(r1);
+		if (r2) {
+			t = READ_ONCE(*rn);
+		} else {
+			t = READ_ONCE(*ro);
+		}
+	} else {
+		t = r0;
+	}
+}
+
+exists (1:r0=rg /\ (1:r1=junk \/ 1:t=junk))

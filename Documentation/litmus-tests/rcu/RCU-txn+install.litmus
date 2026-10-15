@@ -1,0 +1,66 @@
+C RCU-txn+install
+
+(*
+ * Result: Never
+ *
+ * The install of a proxy publishes its record: a reader that finds the proxy
+ * in the slot reads the record's group, the selector's initial 0 and the
+ * record's old target, never what was there before.
+ *
+ * The record is modeled by three variables: rg holds its group (the address
+ * of the selector), ro and rn its old and new targets.  The slot holds the
+ * address of rg when it holds the proxy; the reader's tag test is the
+ * comparison with that address.  Before the writer runs, every one of them
+ * holds garbage: junk, or 2 for the selector.
+ *
+ * The code resolves a proxy by indexing the record's targets with the
+ * selector, an address dependency.  herd7 has no arrays, so the reader here
+ * branches on the selector instead, and a branch orders no later load: the
+ * model orders less than the code, and an outcome that it forbids, the code
+ * forbids as well.
+ *)
+
+{
+int junk = 9;
+int sel = 2;
+int *rg = &junk;
+int *ro = &junk;
+int *rn = &junk;
+int o = 1;
+int n = 1;
+int *a = &o;
+}
+
+P0(int **a, int **rg, int **ro, int **rn, int *sel, int *o, int *n)
+{
+	WRITE_ONCE(*sel, 0);		// __rcu_txn_group_init()
+	WRITE_ONCE(*ro, o);		// __rcu_txn_record_set()
+	WRITE_ONCE(*rn, n);
+	WRITE_ONCE(*rg, sel);		// __rcu_txn_record_install(): r->group,
+	rcu_assign_pointer(*a, rg);	// then the proxy
+}
+
+P1(int **a, int **rg, int **ro, int **rn)
+{
+	int *r0;
+	int *r1;
+	int r2;
+	int *t;
+
+	rcu_read_lock();
+	r0 = rcu_dereference(*a);
+	if (r0 == rg) {			// a proxy: resolve it
+		r1 = READ_ONCE(*r0);		// proxy->group
+		r2 = smp_load_acquire(r1);	// group->selector
+		if (r2) {
+			t = READ_ONCE(*rn);	// proxy->ptr[1]
+		} else {
+			t = READ_ONCE(*ro);	// proxy->ptr[0]
+		}
+	} else {
+		t = r0;
+	}
+	rcu_read_unlock();
+}
+
+exists (1:r0=rg /\ (1:r1=junk \/ 1:r2=2 \/ 1:t=junk))

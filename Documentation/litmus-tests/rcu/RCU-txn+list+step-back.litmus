@@ -1,0 +1,85 @@
+C RCU-txn+list+step-back
+
+(*
+ * Result: Never
+ *
+ * An insertion of X between P and N into an rcu_txn_list switches P->next and
+ * N->prev in one transaction.  A reader standing on P that steps forward onto
+ * X, forward again onto N, then back, comes back to X: it never finds the new
+ * forward edge and then the old backward one, which would take it back to P
+ * past X.
+ *
+ * A node is modeled by the address of the link a reader follows from it: X by
+ * its next link xnext, built pointing at N before the insertion, and N by its
+ * prev link nprev.  P, which the reader only stands on, is nodep.  P's next
+ * link is pnext.  The records of the two slots are rp* and rn* (see
+ * RCU-txn+install).
+ *)
+
+{
+int sel = 0;
+int nodep = 0;
+int *nprev = &nodep;
+int *pnext = &nprev;
+int *xnext = &nprev;
+int *rpg = &sel;
+int *rpo = &nprev;
+int *rpn = &xnext;
+int *rng = &sel;
+int *rno = &nodep;
+int *rnn = &xnext;
+}
+
+P0(int **pnext, int **nprev, int **xnext, int **rpg, int **rng, int *sel)
+{
+	rcu_assign_pointer(*pnext, rpg);	// install
+	rcu_assign_pointer(*nprev, rng);
+	smp_store_release(sel, 1);		// flip
+	rcu_assign_pointer(*pnext, xnext);	// settle
+	rcu_assign_pointer(*nprev, xnext);
+}
+
+P1(int **pnext, int **xnext, int **rpg, int **rpo, int **rpn, int **rng, int **rno, int **rnn)
+{
+	int *r0;
+	int *r1;
+	int r2;
+	int *t;
+	int *u;
+	int *s0;
+	int *s1;
+	int s2;
+	int *back;
+
+	rcu_read_lock();
+	r0 = rcu_dereference(*pnext);		// forward from P
+	if (r0 == rpg) {
+		r1 = READ_ONCE(*r0);
+		r2 = smp_load_acquire(r1);
+		if (r2) {
+			t = READ_ONCE(*rpn);
+		} else {
+			t = READ_ONCE(*rpo);
+		}
+	} else {
+		t = r0;
+	}
+	if (t == xnext) {
+		u = rcu_dereference(*t);	// forward from X, onto N
+		s0 = rcu_dereference(*u);	// back from N
+		if (s0 == rng) {
+			s1 = READ_ONCE(*s0);
+			s2 = smp_load_acquire(s1);
+			if (s2) {
+				back = READ_ONCE(*rnn);
+			} else {
+				back = READ_ONCE(*rno);
+			}
+		} else {
+			back = s0;
+		}
+	}
+	rcu_read_unlock();
+}
+
+exists (1:t=xnext /\ 1:back=nodep)

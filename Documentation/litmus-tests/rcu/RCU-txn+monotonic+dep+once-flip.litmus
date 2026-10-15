@@ -1,0 +1,77 @@
+C RCU-txn+monotonic+dep+once-flip
+
+(*
+ * Result: Sometimes
+ *
+ * Without the store-release of the flip, a reader can resolve slot a to its
+ * new target, then find slot b still holding its old one.
+ *
+ * Error injection into RCU-txn+monotonic+dep: everything else is as there.
+ *)
+
+{
+int sel = 0;
+int aold = 0;
+int bold = 0;
+int bnew = 0;
+int *b = &bold;
+int *a = &aold;
+int *rag = &sel;
+int *rao = &aold;
+int *ran = &b;
+int *rbg = &sel;
+int *rbo = &bold;
+int *rbn = &bnew;
+}
+
+P0(int **a, int **b, int **rag, int **rbg, int *sel, int *bnew)
+{
+	rcu_assign_pointer(*a, rag);	// install
+	rcu_assign_pointer(*b, rbg);
+	WRITE_ONCE(*sel, 1);		// flip, unordered
+	rcu_assign_pointer(*a, b);	// settle: a now points to b's node
+	rcu_assign_pointer(*b, bnew);
+}
+
+P1(int **a, int **b, int **rag, int **rao, int **ran, int **rbg, int **rbo, int **rbn)
+{
+	int *r0;
+	int *r1;
+	int r2;
+	int *ta;
+	int *s0;
+	int *s1;
+	int s2;
+	int *tb;
+
+	rcu_read_lock();
+	r0 = rcu_dereference(*a);
+	if (r0 == rag) {
+		r1 = READ_ONCE(*r0);
+		r2 = smp_load_acquire(r1);
+		if (r2) {
+			ta = READ_ONCE(*ran);
+		} else {
+			ta = READ_ONCE(*rao);
+		}
+	} else {
+		ta = r0;
+	}
+	if (ta == b) {
+		s0 = rcu_dereference(*ta);
+		if (s0 == rbg) {
+			s1 = READ_ONCE(*s0);
+			s2 = smp_load_acquire(s1);
+			if (s2) {
+				tb = READ_ONCE(*rbn);
+			} else {
+				tb = READ_ONCE(*rbo);
+			}
+		} else {
+			tb = s0;
+		}
+	}
+	rcu_read_unlock();
+}
+
+exists (1:ta=b /\ 1:tb=bold)

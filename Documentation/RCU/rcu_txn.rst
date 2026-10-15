@@ -220,6 +220,18 @@ the engine, both data structures and the debug checks::
 		--kconfig_add CONFIG_DEBUG_RCU_TXN=y \
 		'rcu_txn*'
 
+The litmus tests ``Documentation/litmus-tests/rcu/RCU-txn+*.litmus`` model the
+memory ordering of the engine and of ``rcu_txn_list`` with the Linux kernel
+memory model.  Each test checks an outcome that the code forbids, and herd7
+finds that it never happens.  Error-injection variants validate that the model
+catches a missing ordering: each drops one ordering that its test relies on, and
+herd7 then finds the outcome possible.  With herd7 installed as
+``tools/memory-model/README`` says::
+
+	cd tools/memory-model
+	scripts/checktheselitmus.sh --timeout 1h -- \
+		../../Documentation/litmus-tests/rcu/RCU-txn+*.litmus
+
 API
 ===
 

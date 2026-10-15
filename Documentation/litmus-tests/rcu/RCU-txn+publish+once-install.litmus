@@ -1,0 +1,60 @@
+C RCU-txn+publish+once-install
+
+(*
+ * Result: Sometimes
+ *
+ * Without the store-release of the install, a reader can find the proxy
+ * before the record it points at is written.
+ *
+ * Error injection into RCU-txn+publish: everything else is as there.
+ *)
+
+{
+int junk = 9;
+int sel = 2;
+int *rg = &junk;
+int *ro = &junk;
+int *rn = &junk;
+int n = 0;
+int *a = 0;
+}
+
+P0(int **a, int **rg, int **ro, int **rn, int *sel, int *n)
+{
+	WRITE_ONCE(*n, 1);		// build the new object
+	WRITE_ONCE(*sel, 0);		// __rcu_txn_group_init()
+	WRITE_ONCE(*ro, NULL);		// __rcu_txn_record_set()
+	WRITE_ONCE(*rn, n);
+	WRITE_ONCE(*rg, sel);		// __rcu_txn_record_install(): r->group,
+	WRITE_ONCE(*a, rg);		// then the proxy
+	smp_store_release(sel, 1);	// __rcu_txn_group_commit()
+	rcu_assign_pointer(*a, n);	// __rcu_txn_record_settle()
+}
+
+P1(int **a, int **rg, int **ro, int **rn)
+{
+	int *r0;
+	int *r1;
+	int r2;
+	int *t;
+	int d;
+
+	rcu_read_lock();
+	r0 = rcu_dereference(*a);
+	if (r0 == rg) {
+		r1 = READ_ONCE(*r0);
+		r2 = smp_load_acquire(r1);
+		if (r2) {
+			t = READ_ONCE(*rn);
+		} else {
+			t = READ_ONCE(*ro);
+		}
+	} else {
+		t = r0;
+	}
+	if (t)
+		d = READ_ONCE(*t);
+	rcu_read_unlock();
+}
+
+exists ((1:r0=rg /\ (1:r1=junk \/ 1:r2=2 \/ 1:t=junk)) \/ (1:t=n /\ 1:d=0))

@@ -78,3 +78,40 @@ RCU+sync+read.litmus
 RCU+sync+free.litmus
     Both the above litmus tests demonstrate the RCU grace period guarantee
     that an RCU read-side critical section can never span a grace period.
+
+RCU-txn+install.litmus
+    Demonstrates that the install of an RCU pseudo-transaction
+    (include/linux/rcu_txn.h) publishes its record: a reader that finds a
+    proxy reads the record initialized.
+
+RCU-txn+monotonic+dep.litmus
+RCU-txn+monotonic+acquire.litmus
+    Demonstrate that the slots of one RCU pseudo-transaction resolve old,
+    then new, never new then old, along a chain of dependent loads or with
+    a load-acquire between the loads.
+
+RCU-txn+list+step-back.litmus
+    Demonstrates that a reader of an rcu_txn_list that steps forward onto
+    a node being inserted, then back, never skips it.
+    NOTE: herd7 takes about half an hour on it, and on its variants.
+
+RCU-txn+sync+free.litmus
+    Demonstrates that a reader never reads the record of an RCU
+    pseudo-transaction once it is freed after a grace period.
+
+RCU-txn+publish.litmus
+RCU-txn+remove.litmus
+    Demonstrate RCU pseudo-transactions end to end, the writer doing every
+    step: a reader sees the record initialized and a published object
+    built, and never reads a removed object, nor the record, once they are
+    freed after a grace period.
+
+RCU-txn+*+once-*.litmus
+RCU-txn+monotonic+unordered.litmus
+RCU-txn+remove+nolock.litmus
+RCU-txn+remove+nosync.litmus
+RCU-txn+sync+free+nolock.litmus
+RCU-txn+sync+free+nosync.litmus
+    Error injection into the above RCU-txn tests.  Each variant drops one
+    ordering that its test relies on, and herd7 then finds the outcome
+    possible, which validates that the model catches the missing ordering.
