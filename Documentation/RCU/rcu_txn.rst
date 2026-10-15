@@ -228,6 +228,16 @@ the engine, both data structures and the debug checks::
 		--kconfig_add CONFIG_DEBUG_RCU_TXN=y \
 		'rcu_txn*'
 
+The litmus tests ``Documentation/litmus-tests/rcu/RCU-txn+*.litmus`` model the
+memory ordering of the engine and of ``rcu_txn_list`` with the Linux kernel
+memory model.  ``Documentation/litmus-tests/README`` describes them and their
+error-injection variants.  Install herd7 as ``tools/memory-model/README``
+says, then run::
+
+	cd tools/memory-model
+	scripts/checktheselitmus.sh --timeout 1h -- \
+		../../Documentation/litmus-tests/rcu/RCU-txn+*.litmus
+
 API
 ===
 
