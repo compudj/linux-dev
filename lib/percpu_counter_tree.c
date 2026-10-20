@@ -148,6 +148,7 @@
 #define pr_fmt(fmt) "percpu_counter_tree: " fmt
 
 #include <linux/percpu_counter_tree.h>
+#include <linux/moduleparam.h>
 #include <linux/align.h>
 #include <linux/cache.h>
 #include <linux/cpumask.h>
@@ -159,6 +160,7 @@
 #include <linux/math.h>
 #include <linux/log2.h>
 #include <linux/args.h>
+#include <linux/string.h>
 #include <kunit/visibility.h>
 
 #define MAX_NR_LEVELS 7
@@ -244,6 +246,10 @@ static_assert(ARRAY_SIZE(per_nr_cpu_order_config) == MAX_NR_CPUS_ORDER + 1);
 
 /* Hierarchical counter configuration for the hardware topology. */
 static const struct counter_config *counter_config __ro_after_init;
+/* Tree shape selected with the "arity" boot parameter. */
+static struct counter_config boot_config __ro_after_init;
+/* Value of the "arity" boot parameter, parsed at subsystem initialization. */
+static const char *arity_param;
 /* Order of nr_cpu_ids. */
 static unsigned int nr_cpus_order __ro_after_init;
 /* Calculate the "over" accuracy for a given batch size (multiplication factor). */
@@ -1223,8 +1229,73 @@ static int format_shape(char *buf, size_t size, const struct counter_config *con
 	return len;
 }
 
+static int arity_param_set(const char *val, const struct kernel_param *kp)
+{
+	/* Applied once by percpu_counter_tree_subsystem_init(). */
+	if (counter_config)
+		return -EBUSY;
+	arity_param = val;
+	return 0;
+}
+
+static int arity_param_get(char *buffer, const struct kernel_param *kp)
+{
+	int len;
+
+	if (!counter_config)
+		return sprintf(buffer, "%s\n", arity_param ? : "");
+	len = format_shape(buffer, PAGE_SIZE - 1, counter_config);
+	buffer[len++] = '\n';
+	return len;
+}
+
+static const struct kernel_param_ops arity_param_ops = {
+	.set = arity_param_set,
+	.get = arity_param_get,
+};
+
+/*
+ * percpu_counter_tree.arity=<fan-out>[,<fan-out>...] overrides the tree
+ * shape chosen for the number of possible CPUs, to compare shapes on a
+ * given machine. Reading the parameter shows the shape in use.
+ */
+module_param_cb(arity, &arity_param_ops, NULL, 0444);
+MODULE_PARM_DESC(arity, "Fan-out of each tree level from level 0 to the root, e.g. 8,2,8");
+
+/*
+ * Parse a list of fan-outs, from level 0 to the root, into @config. Each
+ * fan-out is a power of 2 of at least 2, and their product is the number
+ * of possible CPUs rounded up to a power of 2.
+ *
+ * Return: 0 on success, -EINVAL if the list does not describe a tree
+ * covering the possible CPUs.
+ */
+static int __init parse_arity(const char *str, struct counter_config *config)
+{
+	int ints[MAX_NR_LEVELS + 2];	/* Count, levels, and one extra to detect overflow. */
+	unsigned int level, order = 0;
+
+	if (*get_options(str, ARRAY_SIZE(ints), ints) || ints[0] > MAX_NR_LEVELS)
+		return -EINVAL;
+	config->nr_levels = ints[0];
+	for (level = 0; level < config->nr_levels; level++) {
+		int fan_out = ints[level + 1];
+
+		if (fan_out < 2 || !is_power_of_2(fan_out))
+			return -EINVAL;
+		config->n_arity_order[level] = ilog2(fan_out);
+		order += config->n_arity_order[level];
+		if (order > nr_cpus_order)
+			return -EINVAL;
+	}
+	if (order != nr_cpus_order)
+		return -EINVAL;
+	return 0;
+}
+
 int __init percpu_counter_tree_subsystem_init(void)
 {
+	const char *origin = "default";
 	char shape[8 * MAX_NR_LEVELS + 1] = "";
 
 	nr_cpus_order = get_count_order(nr_cpu_ids);
@@ -1233,13 +1304,22 @@ int __init percpu_counter_tree_subsystem_init(void)
 		return -EINVAL;
 	}
 	counter_config = &per_nr_cpu_order_config[nr_cpus_order];
+	if (arity_param && *arity_param) {
+		if (parse_arity(arity_param, &boot_config)) {
+			pr_warn("Invalid arity \"%s\" for %u CPUs, using the default\n",
+				arity_param, nr_cpu_ids);
+		} else {
+			counter_config = &boot_config;
+			origin = "boot parameter";
+		}
+	}
 	calculate_topology();
 	nodes_cachep = kmem_cache_create("percpu_counter_tree_nodes",
 					 nr_nodes * SMP_CACHE_BYTES, SMP_CACHE_BYTES,
 					 SLAB_PANIC, NULL);
 	format_shape(shape, sizeof(shape), counter_config);
-	pr_info("%u CPUs, fan-out %s, %u tree nodes\n",
-		nr_cpu_ids, nr_cpus_order ? shape : "none",
+	pr_info("%u CPUs, fan-out %s (%s), %u tree nodes\n",
+		nr_cpu_ids, nr_cpus_order ? shape : "none", origin,
 		nr_nodes);
 	return 0;
 }

@@ -33,7 +33,13 @@
 #define abs(x) ({ typeof(x) __x = (x); __x < 0 ? -__x : __x; })
 
 #define pr_err(...)		fprintf(stderr, __VA_ARGS__)
+#define pr_warn(...)		fprintf(stderr, __VA_ARGS__)
 #define pr_info(...)		do { if (0) printf(__VA_ARGS__); } while (0)
+
+#define PAGE_SIZE		4096
+
+/* Implemented in main.c. */
+char *get_options(const char *str, int nints, int *ints);
 
 extern unsigned long hpcc_nr_warnings;
 
