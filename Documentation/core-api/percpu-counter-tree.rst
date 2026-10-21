@@ -69,6 +69,41 @@ The bounded accuracy is a property of the settled tree. While updates are
 in flight the transient error can exceed it, bounded by the number of
 updaters and their increment size.
 
+Lazy Tree Activation
+====================
+
+Counters initialized with percpu_counter_tree_init_many_lazy() start
+without their per-cpu counters and tree nodes, for counters which may
+never need the scalability of the tree. Until
+percpu_counter_tree_activate_many() allocates and publishes the tree,
+the counters are exact:
+
+ * percpu_counter_tree_add_owner() adds to the bias of the counter,
+   written only by its owner, a single context chosen by the user of the
+   counters, such as a task, without atomic instruction.
+
+ * percpu_counter_tree_add() adds to the atomic bias of the counter, for
+   any other updater.
+
+The precise and approximate sums read both, in O(1). The activation does
+not move these values: the sums keep reading them along with the tree,
+so updates racing with the activation are not lost, whichever side of
+it they land on. The bias only has the owner as writer, and the atomic
+bias only receives atomic additions, before and after the activation.
+After activation, both update functions add to the tree, and the
+approximation has the accuracy of the tree.
+
+The activations of the same counters must be serialized by the caller:
+a concurrent activation would publish a second tree and lose the
+updates made to the first.
+
+The RSS counters of an mm use this: the task owning the mm updates the
+plain counter, and other tasks, such as reclaim, update the atomic
+counter. The tree is activated when a second thread shares the mm,
+under a mutex of the mm which serializes the activations.
+A single-threaded process therefore has exact RSS counters, cheap
+precise sums, and neither per-cpu memory nor tree nodes for them.
+
 Use Cases
 =========
 
