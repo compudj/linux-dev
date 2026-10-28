@@ -1,0 +1,72 @@
+C RCU-txn+steal+noreload
+
+(*
+ * Result: Sometimes
+ *
+ * A reader that resolves the proxy it loaded before its resolve section, rather
+ * than loading the slot again within it, can read the stolen record: the steal
+ * may find the reader's count even after the reader loaded the proxy.
+ *
+ * Error injection into RCU-txn+steal: everything else is as there.
+ *)
+
+{
+int junk = 9;
+int sel = 0;
+int o = 1;
+int n = 1;
+int *rg = &sel;
+int *ro = &o;
+int *rn = &n;
+int *a = &rg;
+int seq = 0;
+}
+
+P0(int **a, int **rg, int **ro, int **rn, int *sel, int *n, int *junk,
+   int *seq)
+{
+	int r0;
+	int r1;
+
+	smp_store_release(sel, 1);	// flip
+	rcu_assign_pointer(*a, n);	// settle, then retire to the pool
+	smp_mb();			// __rcu_txn_synchronize_resolve()
+	r0 = smp_load_acquire(seq);
+	r1 = smp_load_acquire(seq);
+	WRITE_ONCE(*rg, junk);		// reuse
+	WRITE_ONCE(*ro, junk);
+	WRITE_ONCE(*rn, junk);
+}
+
+P1(int **a, int **rg, int **ro, int **rn, int *seq)
+{
+	int *v;
+	int *r0;
+	int *r1;
+	int r2;
+	int *t;
+
+	rcu_read_lock();
+	v = rcu_dereference(*a);
+	if (v == rg) {
+		WRITE_ONCE(*seq, 1);		// enter the resolve section
+		smp_mb();
+		r0 = v;				// no second load of the slot
+		if (r0 == rg) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				t = READ_ONCE(*rn);
+			} else {
+				t = READ_ONCE(*ro);
+			}
+		} else {
+			t = r0;
+		}
+		smp_store_release(seq, 2);	// leave it
+	}
+	rcu_read_unlock();
+}
+
+exists (1:r0=rg /\ (1:r1=junk \/ 1:t=junk) /\
+	(0:r0=0 \/ 0:r0=2 \/ (0:r0=1 /\ 0:r1=2)))

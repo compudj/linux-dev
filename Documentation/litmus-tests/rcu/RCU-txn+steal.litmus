@@ -1,0 +1,88 @@
+C RCU-txn+steal
+
+(*
+ * Result: Never
+ *
+ * A descriptor may be stolen back before its grace period ends, when its
+ * CPU's pool runs out: see the local transactions of lib/rcu_txn.c.  A reader
+ * that finds a proxy resolves it within a resolve section, as
+ * __rcu_txn_resolve_slow() does: interrupts off, its CPU's sequence count made
+ * odd, a full barrier, then it loads the slot again and resolves what the slot
+ * now holds, and it makes the count even with a store-release.  The steal, in
+ * __rcu_txn_synchronize_resolve(), issues a full barrier after the settle, then
+ * waits, for each CPU whose count it finds odd, until that count changes.  Such
+ * a reader never reads the stolen record, which a new transaction may then
+ * reuse.
+ *
+ * The record is rg, ro and rn (see RCU-txn+install), and seq is the reader's
+ * count.  The writer commits the descriptor and steals it on one CPU: it takes
+ * a descriptor and commits it with preemption off, and steals back only the
+ * descriptors of its own CPU's pool.  After the steal, it stores junk into the
+ * record, as a new transaction may.
+ *
+ * herd7 has no loops: the steal reads seq twice, and the outcome is restricted
+ * to the executions where it would stop waiting, seq found even (0 or 2), or
+ * found odd and then changed.  Nor does it have interrupts: seq stands for the
+ * count of the context the reader runs in.
+ *)
+
+{
+int junk = 9;
+int sel = 0;
+int o = 1;
+int n = 1;
+int *rg = &sel;
+int *ro = &o;
+int *rn = &n;
+int *a = &rg;
+int seq = 0;
+}
+
+P0(int **a, int **rg, int **ro, int **rn, int *sel, int *n, int *junk,
+   int *seq)
+{
+	int r0;
+	int r1;
+
+	smp_store_release(sel, 1);	// flip
+	rcu_assign_pointer(*a, n);	// settle, then retire to the pool
+	smp_mb();			// __rcu_txn_synchronize_resolve()
+	r0 = smp_load_acquire(seq);
+	r1 = smp_load_acquire(seq);
+	WRITE_ONCE(*rg, junk);		// reuse
+	WRITE_ONCE(*ro, junk);
+	WRITE_ONCE(*rn, junk);
+}
+
+P1(int **a, int **rg, int **ro, int **rn, int *seq)
+{
+	int *v;
+	int *r0;
+	int *r1;
+	int r2;
+	int *t;
+
+	rcu_read_lock();
+	v = rcu_dereference(*a);
+	if (v == rg) {
+		WRITE_ONCE(*seq, 1);		// enter the resolve section
+		smp_mb();
+		r0 = rcu_dereference(*a);	// load the slot again
+		if (r0 == rg) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				t = READ_ONCE(*rn);
+			} else {
+				t = READ_ONCE(*ro);
+			}
+		} else {
+			t = r0;
+		}
+		smp_store_release(seq, 2);	// leave it
+	}
+	rcu_read_unlock();
+}
+
+exists (1:r0=rg /\ (1:r1=junk \/ 1:t=junk) /\
+	(0:r0=0 \/ 0:r0=2 \/ (0:r0=1 /\ 0:r1=2)))
