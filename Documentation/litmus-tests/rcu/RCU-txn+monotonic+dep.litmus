@@ -5,14 +5,25 @@ C RCU-txn+monotonic+dep
  *
  * A reader resolves slot a to its new target, then follows that target to
  * slot b.  It resolves slot b to its new target as well.  Along a chain of
- * dependent loads, the slots of one transaction resolve old, then new.  They
- * never resolve new, then old.
+ * dependent loads, the slots of one transaction resolve old, then new.
+ * They never resolve new, then old.
  *
  * One transaction switches slot a from aold to b, and slot b from bold to
  * bnew.  The writer installs both proxies, flips the selector, then settles
- * both slots.  ra* and rb* are the two records (see RCU-txn+install).  A node
- * is modeled by the address of the link that a reader follows from it.  So
- * b, the new target of slot a, is the node whose link is slot b.
+ * both slots.  ra* and rb* are the two records (see RCU-txn+install).  A
+ * node is modeled by the address of the link that a reader follows from it.
+ * So b, the new target of slot a, is the node whose link is slot b.
+ *
+ * The reader resolves slot a as rcu_txn_dereference() does: for a proxy, it
+ * loads the slot again with a load-acquire.  Two things are left out, to
+ * keep herd7 fast:
+ *
+ *  - The resolve section itself.  Nothing waits for it in this test.  See
+ *    RCU-txn+steal for the section.
+ *  - The second load of slot b.  The reader resolves the proxy that its
+ *    first load of slot b finds.  A second load can only find the same
+ *    proxy or the new target.  So this reader finds the old target at
+ *    least as often as the reader of the code.
  *)
 
 {
@@ -39,8 +50,10 @@ P0(int **a, int **b, int **rag, int **rbg, int *sel, int *bnew)
 	rcu_assign_pointer(*b, bnew);
 }
 
-P1(int **a, int **b, int **rag, int **rao, int **ran, int **rbg, int **rbo, int **rbn)
+P1(int **a, int **b, int **rag, int **rao, int **ran,
+   int **rbg, int **rbo, int **rbn)
 {
+	int *v;
 	int *r0;
 	int *r1;
 	int r2;
@@ -51,17 +64,22 @@ P1(int **a, int **b, int **rag, int **rao, int **ran, int **rbg, int **rbo, int 
 	int *tb;
 
 	rcu_read_lock();
-	r0 = rcu_dereference(*a);
-	if (r0 == rag) {
-		r1 = READ_ONCE(*r0);
-		r2 = smp_load_acquire(r1);
-		if (r2) {
-			ta = READ_ONCE(*ran);
+	v = rcu_dereference(*a);
+	if (v == rag) {
+		r0 = smp_load_acquire(a);
+		if (r0 == rag) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				ta = READ_ONCE(*ran);
+			} else {
+				ta = READ_ONCE(*rao);
+			}
 		} else {
-			ta = READ_ONCE(*rao);
+			ta = r0;
 		}
 	} else {
-		ta = r0;
+		ta = v;
 	}
 	if (ta == b) {
 		s0 = rcu_dereference(*ta);

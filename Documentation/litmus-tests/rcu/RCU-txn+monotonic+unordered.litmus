@@ -3,17 +3,16 @@ C RCU-txn+monotonic+unordered
 (*
  * Result: Sometimes
  *
- * Without a dependency or a load-acquire between its two loads, a reader can
- * resolve slot a to its new target, then find slot b still holding its old one.
+ * The reader loads slot b independently of slot a, and orders nothing.  It
+ * can find slot a's new target settled, then slot b still holding its old
+ * one.
  *
- * Error injection into RCU-txn+monotonic+dep and RCU-txn+monotonic+acquire.
- * The reader loads slot b independently of slot a.
+ * Error injection into RCU-txn+monotonic+dep, RCU-txn+monotonic+acquire and
+ * RCU-txn+monotonic+rmb.  The reader has no dependency between its two
+ * loads and no smp_rmb().  Its first load of slot a is not a load-acquire.
  *
- * One transaction switches slot a from aold to b, and slot b from bold to
- * bnew.  The writer installs both proxies, flips the selector, then settles
- * both slots.  ra* and rb* are the two records (see RCU-txn+install).  A node
- * is modeled by the address of the link that a reader follows from it.  So
- * b, the new target of slot a, is the node whose link is slot b.
+ * The transaction, the records and what the reader leaves out are those of
+ * RCU-txn+monotonic+dep.
  *)
 
 {
@@ -40,8 +39,10 @@ P0(int **a, int **b, int **rag, int **rbg, int *sel, int *bnew)
 	rcu_assign_pointer(*b, bnew);
 }
 
-P1(int **a, int **b, int **rag, int **rao, int **ran, int **rbg, int **rbo, int **rbn)
+P1(int **a, int **b, int **rag, int **rao, int **ran,
+   int **rbg, int **rbo, int **rbn)
 {
+	int *v;
 	int *r0;
 	int *r1;
 	int r2;
@@ -52,17 +53,22 @@ P1(int **a, int **b, int **rag, int **rao, int **ran, int **rbg, int **rbo, int 
 	int *tb;
 
 	rcu_read_lock();
-	r0 = rcu_dereference(*a);
-	if (r0 == rag) {
-		r1 = READ_ONCE(*r0);
-		r2 = smp_load_acquire(r1);
-		if (r2) {
-			ta = READ_ONCE(*ran);
+	v = rcu_dereference(*a);
+	if (v == rag) {
+		r0 = smp_load_acquire(a);
+		if (r0 == rag) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				ta = READ_ONCE(*ran);
+			} else {
+				ta = READ_ONCE(*rao);
+			}
 		} else {
-			ta = READ_ONCE(*rao);
+			ta = r0;
 		}
 	} else {
-		ta = r0;
+		ta = v;
 	}
 	if (ta == b) {
 		s0 = rcu_dereference(*b);

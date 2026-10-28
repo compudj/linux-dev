@@ -3,8 +3,8 @@ C RCU-txn+sync+free+nosync
 (*
  * Result: Sometimes
  *
- * Without a grace period between the settle and the free, a reader that
- * loaded the proxy can read the record after it is freed.
+ * Without a grace period between the settle and the free, a reader within a
+ * resolve section can read the record after it is freed.
  *
  * Error injection into RCU-txn+sync+free.  The rest is the same.
  *)
@@ -29,25 +29,34 @@ P0(int **a, int **rg, int **ro, int **rn, int *sel, int *n, int *junk)
 	WRITE_ONCE(*rn, junk);
 }
 
-P1(int **a, int **rg, int **ro, int **rn)
+P1(int **a, int **rg, int **ro, int **rn, struct srcu_struct *s)
 {
+	int *v;
 	int *r0;
 	int *r1;
 	int r2;
 	int *t;
+	int idx;
 
 	rcu_read_lock();
-	r0 = rcu_dereference(*a);
-	if (r0 == rg) {
-		r1 = READ_ONCE(*r0);
-		r2 = smp_load_acquire(r1);
-		if (r2) {
-			t = READ_ONCE(*rn);
+	v = rcu_dereference(*a);
+	if (v == rg) {
+		idx = srcu_read_lock(s);	// enter the resolve section
+		r0 = smp_load_acquire(a);	// load the slot again
+		if (r0 == rg) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				t = READ_ONCE(*rn);
+			} else {
+				t = READ_ONCE(*ro);
+			}
 		} else {
-			t = READ_ONCE(*ro);
+			t = r0;
 		}
+		srcu_read_unlock(s, idx);	// leave it
 	} else {
-		t = r0;
+		t = v;
 	}
 	rcu_read_unlock();
 }

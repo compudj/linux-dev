@@ -1,0 +1,66 @@
+C RCU-txn+steal+nosync
+
+(*
+ * Result: Sometimes
+ *
+ * A steal that does not wait for the resolve sections in flight lets a
+ * reader read the stolen record once a new transaction reuses it.
+ *
+ * Error injection into RCU-txn+steal.  The rest is the same.
+ *)
+
+{
+int junk = 9;
+int sel = 0;
+int o = 1;
+int n = 1;
+int *rg = &sel;
+int *ro = &o;
+int *rn = &n;
+int *a = &rg;
+}
+
+P0(int **a, int **rg, int **ro, int **rn, int *sel, int *n, int *junk,
+   struct srcu_struct *s)
+{
+	smp_store_release(sel, 1);	// flip
+	rcu_assign_pointer(*a, n);	// settle, then retire to the pool
+					// no wait
+	WRITE_ONCE(*rg, junk);		// reuse
+	WRITE_ONCE(*ro, junk);
+	WRITE_ONCE(*rn, junk);
+}
+
+P1(int **a, int **rg, int **ro, int **rn, struct srcu_struct *s)
+{
+	int *v;
+	int *r0;
+	int *r1;
+	int r2;
+	int *t;
+	int idx;
+
+	rcu_read_lock();
+	v = rcu_dereference(*a);
+	if (v == rg) {
+		idx = srcu_read_lock(s);	// enter the resolve section
+		r0 = smp_load_acquire(a);	// load the slot again
+		if (r0 == rg) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				t = READ_ONCE(*rn);
+			} else {
+				t = READ_ONCE(*ro);
+			}
+		} else {
+			t = r0;
+		}
+		srcu_read_unlock(s, idx);	// leave it
+	} else {
+		t = v;
+	}
+	rcu_read_unlock();
+}
+
+exists (1:r0=rg /\ (1:r1=junk \/ 1:t=junk))

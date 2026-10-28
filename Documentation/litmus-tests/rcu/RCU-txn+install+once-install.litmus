@@ -29,25 +29,34 @@ P0(int **a, int **rg, int **ro, int **rn, int *sel, int *o, int *n)
 	WRITE_ONCE(*a, rg);		// then the proxy, unordered
 }
 
-P1(int **a, int **rg, int **ro, int **rn)
+P1(int **a, int **rg, int **ro, int **rn, struct srcu_struct *s)
 {
+	int *v;
 	int *r0;
 	int *r1;
 	int r2;
 	int *t;
+	int idx;
 
 	rcu_read_lock();
-	r0 = rcu_dereference(*a);
-	if (r0 == rg) {			// a proxy: resolve it
-		r1 = READ_ONCE(*r0);		// proxy->group
-		r2 = smp_load_acquire(r1);	// group->selector
-		if (r2) {
-			t = READ_ONCE(*rn);	// proxy->ptr[1]
+	v = rcu_dereference(*a);
+	if (v == rg) {			// a proxy
+		idx = srcu_read_lock(s);	// enter the resolve section
+		r0 = smp_load_acquire(a);	// load the slot again
+		if (r0 == rg) {
+			r1 = READ_ONCE(*r0);	// proxy->group
+			r2 = smp_load_acquire(r1);	// group->selector
+			if (r2) {
+				t = READ_ONCE(*rn);	// proxy->ptr[1]
+			} else {
+				t = READ_ONCE(*ro);	// proxy->ptr[0]
+			}
 		} else {
-			t = READ_ONCE(*ro);	// proxy->ptr[0]
+			t = r0;
 		}
+		srcu_read_unlock(s, idx);	// leave it
 	} else {
-		t = r0;
+		t = v;
 	}
 	rcu_read_unlock();
 }

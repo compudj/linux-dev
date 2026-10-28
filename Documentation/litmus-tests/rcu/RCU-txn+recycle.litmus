@@ -1,0 +1,95 @@
+C RCU-txn+recycle
+
+(*
+ * Result: Never
+ *
+ * A descriptor that is not stolen goes back to its CPU's pool a grace
+ * period after its settle.  The callback of call_rcu_hurry() may run on
+ * another CPU, as with rcu_nocbs.  It only marks the descriptor's batch
+ * done.  The owning CPU reuses the descriptor once it finds this mark.  A
+ * reader resolves the proxy within a resolve section, as in RCU-txn+steal.
+ * It never reads the record reused.
+ *
+ * call_rcu_hurry() is not in the model.  The writer waits for the grace
+ * period itself, then runs the callback.  P2 is the owning CPU.  If it
+ * finds the batch done, it stores junk into the record, as a new
+ * transaction may.
+ *
+ * What this outcome relies on is the grace period: see
+ * RCU-txn+recycle+nosync.  The callback marks the batch with a
+ * store-release, and the owning CPU loads the mark with a load-acquire.
+ * The model forbids the outcome without them as well.  The reuse is under
+ * a branch on the mark, and this control dependency already orders its
+ * stores.
+ *
+ * The record's accesses are marked here, as in RCU-txn+install.  With
+ * plain loads of the targets, herd7 flags a data race with the reuse in
+ * this test.  The flag goes away with smp_mb() before srcu_read_unlock().
+ * The unlock of Tree SRCU has such a barrier, and the model does not.
+ *)
+
+{
+int junk = 9;
+int sel = 0;
+int o = 1;
+int n = 1;
+int *rg = &sel;
+int *ro = &o;
+int *rn = &n;
+int *a = &rg;
+int done = 0;
+}
+
+P0(int **a, int *sel, int *n, int *done)
+{
+	smp_store_release(sel, 1);	// flip
+	rcu_assign_pointer(*a, n);	// settle, then call_rcu_hurry()
+	synchronize_rcu();		// the callback runs
+	smp_store_release(done, 1);	// the batch is done
+}
+
+P1(int **a, int **rg, int **ro, int **rn, struct srcu_struct *s)
+{
+	int *v;
+	int *r0;
+	int *r1;
+	int r2;
+	int *t;
+	int idx;
+
+	rcu_read_lock();
+	v = rcu_dereference(*a);
+	if (v == rg) {
+		idx = srcu_read_lock(s);	// enter the resolve section
+		r0 = smp_load_acquire(a);	// load the slot again
+		if (r0 == rg) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				t = READ_ONCE(*rn);
+			} else {
+				t = READ_ONCE(*ro);
+			}
+		} else {
+			t = r0;
+		}
+		srcu_read_unlock(s, idx);	// leave it
+	} else {
+		t = v;
+	}
+	rcu_read_unlock();
+}
+
+P2(int **rg, int **ro, int **rn, int *junk, int *done)
+{
+	int r0;
+
+	r0 = smp_load_acquire(done);	// rcu_txn_local_reap()
+	if (r0) {			// RCU_TXN_BATCH_DONE
+		WRITE_ONCE(*rg, junk);	// reuse
+		WRITE_ONCE(*ro, junk);
+		WRITE_ONCE(*rn, junk);
+	}
+}
+
+exists (1:r0=rg /\ (1:r1=junk \/ 1:t=junk))

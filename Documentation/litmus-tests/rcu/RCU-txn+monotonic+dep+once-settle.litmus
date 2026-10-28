@@ -3,8 +3,8 @@ C RCU-txn+monotonic+dep+once-settle
 (*
  * Result: Sometimes
  *
- * Without the store-release of the settle of slot a, a reader can find the
- * new target settled there, then slot b still holding its old one.
+ * The settle of slot a is a plain store.  A reader can find the new target
+ * settled there.  It can then find slot b still holding its old one.
  *
  * Error injection into RCU-txn+monotonic+dep.  The rest is the same.
  *)
@@ -29,12 +29,14 @@ P0(int **a, int **b, int **rag, int **rbg, int *sel, int *bnew)
 	rcu_assign_pointer(*a, rag);	// install
 	rcu_assign_pointer(*b, rbg);
 	smp_store_release(sel, 1);	// flip
-	WRITE_ONCE(*a, b);		// settle, unordered: a points to b's node
+	WRITE_ONCE(*a, b);		// settle, unordered
 	rcu_assign_pointer(*b, bnew);
 }
 
-P1(int **a, int **b, int **rag, int **rao, int **ran, int **rbg, int **rbo, int **rbn)
+P1(int **a, int **b, int **rag, int **rao, int **ran,
+   int **rbg, int **rbo, int **rbn)
 {
+	int *v;
 	int *r0;
 	int *r1;
 	int r2;
@@ -45,17 +47,22 @@ P1(int **a, int **b, int **rag, int **rao, int **ran, int **rbg, int **rbo, int 
 	int *tb;
 
 	rcu_read_lock();
-	r0 = rcu_dereference(*a);
-	if (r0 == rag) {
-		r1 = READ_ONCE(*r0);
-		r2 = smp_load_acquire(r1);
-		if (r2) {
-			ta = READ_ONCE(*ran);
+	v = rcu_dereference(*a);
+	if (v == rag) {
+		r0 = smp_load_acquire(a);
+		if (r0 == rag) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				ta = READ_ONCE(*ran);
+			} else {
+				ta = READ_ONCE(*rao);
+			}
 		} else {
-			ta = READ_ONCE(*rao);
+			ta = r0;
 		}
 	} else {
-		ta = r0;
+		ta = v;
 	}
 	if (ta == b) {
 		s0 = rcu_dereference(*ta);

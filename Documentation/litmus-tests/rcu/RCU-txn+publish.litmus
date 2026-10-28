@@ -4,21 +4,21 @@ C RCU-txn+publish
  * Result: Never
  *
  * A transaction publishes a new object, end to end.  The writer builds the
- * object, initializes the record, installs the proxy, flips the selector and
- * settles the slot.  A reader that finds the proxy reads the record
- * initialized.  A reader that reaches the object reads it built.  It may
- * reach the object through the proxy, or in the slot once settled.
+ * object, initializes the record and installs the proxy.  Then it flips the
+ * selector and settles the slot.  A reader that finds the proxy reads the
+ * record initialized.  A reader that reaches the object reads it built.  It
+ * may reach the object through the proxy, or in the slot once settled.
  *
  * Slot a switches from NULL to the new object n.  The writer builds n by
- * storing 1 to it.  The record is rg, ro and rn (see RCU-txn+install).
- * Before the writer runs, they hold garbage: junk, or 2 for the selector.
+ * storing 1 to it.  The record is rg, ro and rn.  Its initial garbage and
+ * the reader are those of RCU-txn+install.
  *
- * The object is built before the install.  The install's store-release orders
- * the object for a reader that finds the proxy.  So this outcome stays
- * forbidden even without the flip's store-release.  The flip's store-release
- * orders the installs of a transaction before its selector.  This matters for
- * a reader that resolves several slots of the transaction: see
- * RCU-txn+monotonic+dep+once-flip.
+ * The object is built before the install.  The install's store-release
+ * orders the object for a reader that finds the proxy.  So this outcome
+ * stays forbidden even without the flip's store-release.  The flip's
+ * store-release orders the installs of a transaction before its selector.
+ * This matters for a reader that resolves several slots of the transaction:
+ * see RCU-txn+monotonic+dep+once-flip.
  *)
 
 {
@@ -43,26 +43,35 @@ P0(int **a, int **rg, int **ro, int **rn, int *sel, int *n)
 	rcu_assign_pointer(*a, n);	// __rcu_txn_record_settle()
 }
 
-P1(int **a, int **rg, int **ro, int **rn)
+P1(int **a, int **rg, int **ro, int **rn, struct srcu_struct *s)
 {
+	int *v;
 	int *r0;
 	int *r1;
 	int r2;
 	int *t;
 	int d;
+	int idx;
 
 	rcu_read_lock();
-	r0 = rcu_dereference(*a);
-	if (r0 == rg) {
-		r1 = READ_ONCE(*r0);
-		r2 = smp_load_acquire(r1);
-		if (r2) {
-			t = READ_ONCE(*rn);
+	v = rcu_dereference(*a);
+	if (v == rg) {
+		idx = srcu_read_lock(s);	// enter the resolve section
+		r0 = smp_load_acquire(a);	// load the slot again
+		if (r0 == rg) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				t = READ_ONCE(*rn);
+			} else {
+				t = READ_ONCE(*ro);
+			}
 		} else {
-			t = READ_ONCE(*ro);
+			t = r0;
 		}
+		srcu_read_unlock(s, idx);	// leave it
 	} else {
-		t = r0;
+		t = v;
 	}
 	if (t)
 		d = READ_ONCE(*t);

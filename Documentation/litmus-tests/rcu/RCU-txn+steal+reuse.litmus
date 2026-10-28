@@ -1,0 +1,99 @@
+C RCU-txn+steal+reuse
+
+(*
+ * Result: Never
+ *
+ * As RCU-txn+steal, where the reuse is a whole transaction.  Slot a holds
+ * the proxy of a first transaction (x1 -> aold) when the writer starts.  The
+ * writer flips and settles it.  It steals the descriptor back: it waits for
+ * the resolve sections in flight.  Then a second transaction reuses the
+ * same records and the same selector.  It switches slot a again
+ * (aold -> b), and slot b (bold -> bnew).  Slot a holds the same proxy
+ * value twice.  The selector goes 0, 1, 0, 1.
+ *
+ * A reader within a resolve section on the first proxy never resolves
+ * through the records of the second transaction.  If it did, it could read
+ * the first transaction's 1 in the selector and the second one's new
+ * target, before slot b holds its proxy.
+ *
+ * When the reader gets slot a's new target, it follows it to slot b and
+ * loads that slot without resolving it.  It must find the proxy or the new
+ * target there.  The old target means that slot a resolved to new before
+ * the install of slot b.  This keeps the test small.
+ *)
+
+{
+int sel = 0;
+int x1 = 0;
+int aold = 0;
+int bold = 0;
+int bnew = 0;
+int *b = &bold;
+int *rag = &sel;
+int *rao = &x1;
+int *ran = &aold;
+int *rbg = &sel;
+int *rbo = &x1;
+int *rbn = &x1;
+int *a = &rag;
+}
+
+P0(int **a, int **b, int **rag, int **rao, int **ran, int **rbg,
+   int **rbo, int **rbn, int *sel, int *aold, int *bold, int *bnew,
+   struct srcu_struct *s)
+{
+	smp_store_release(sel, 1);	// first transaction: flip
+	rcu_assign_pointer(*a, aold);	// settle, then retire to the pool
+	synchronize_srcu(s);		// __rcu_txn_synchronize_resolve()
+	WRITE_ONCE(*sel, 0);		// __rcu_txn_group_init()
+	WRITE_ONCE(*rao, aold);		// __rcu_txn_record_set()
+	WRITE_ONCE(*ran, b);
+	WRITE_ONCE(*rbo, bold);
+	WRITE_ONCE(*rbn, bnew);
+	WRITE_ONCE(*rag, sel);		// install
+	rcu_assign_pointer(*a, rag);
+	WRITE_ONCE(*rbg, sel);
+	rcu_assign_pointer(*b, rbg);
+	smp_store_release(sel, 1);	// flip
+	rcu_assign_pointer(*a, b);	// settle: a now points to b's node
+	rcu_assign_pointer(*b, bnew);
+}
+
+P1(int **a, int **b, int **rag, int **rao, int **ran,
+   struct srcu_struct *s)
+{
+	int *v;
+	int *r0;
+	int *r1;
+	int r2;
+	int *ta;
+	int *s0;
+	int idx;
+
+	rcu_read_lock();
+	v = rcu_dereference(*a);
+	if (v == rag) {
+		idx = srcu_read_lock(s);	// enter the resolve section
+		r0 = smp_load_acquire(a);	// load the slot again
+		if (r0 == rag) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				ta = READ_ONCE(*ran);
+			} else {
+				ta = READ_ONCE(*rao);
+			}
+		} else {
+			ta = r0;
+		}
+		srcu_read_unlock(s, idx);	// leave it
+	} else {
+		ta = v;
+	}
+	if (ta == b) {
+		s0 = rcu_dereference(*ta);	// slot b, not resolved
+	}
+	rcu_read_unlock();
+}
+
+exists (1:ta=b /\ 1:s0=bold)

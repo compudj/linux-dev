@@ -3,70 +3,87 @@ C RCU-txn+list+step-back
 (*
  * Result: Never
  *
- * An insertion of X between P and N into an rcu_txn_list switches P->next and
- * N->prev in one transaction.  A reader stands on P.  It steps forward onto
- * X, forward again onto N, then back.  It comes back to X.  It never finds
- * the new forward edge, then the old backward one.  That would take it back
- * to P, past X.
+ * An insertion of X between P and N into an rcu_txn_list switches P->next
+ * and N->prev in one transaction.  A reader stands on P.  It steps forward
+ * onto X, forward again onto N, then back.  It comes back to X.  It never
+ * finds the new forward edge, then the old backward one.  That would take
+ * it back to P, past X.
  *
  * A node is modeled by the address of the link that a reader follows from
- * it.  X is modeled by its next link xnext, built pointing at N before the
- * insertion.  N is modeled by its prev link nprev.  The reader only stands
- * on P, so P is modeled by nodep.  P's next link is pnext.  The records of
- * the two slots are rp* and rn* (see RCU-txn+install).
+ * it.  P's next link is pnext, and N's prev link is nprev.  The reader only
+ * stands on P, so P is modeled by nodep.  The old target of pnext is N,
+ * which the reader does not follow here: it is noden.  The records of the
+ * two slots are rp* and rn* (see RCU-txn+install).
+ *
+ * X->next is built pointing at N before the insertion, and never changes.
+ * The reader's load of it only carries the address dependency from P->next
+ * to N->prev.  So this load is folded.  X is modeled by the address of
+ * nprev.  This is the link that the reader loads once it stepped from X
+ * onto N.  With the load of X->next in the model, herd7 ran for more than
+ * an hour on this test.  Folded, the test has the shape of
+ * RCU-txn+monotonic+dep, with the names of a list.
+ *
+ * The reader resolves P->next as rcu_txn_dereference() does: for a proxy,
+ * it loads the slot again with a load-acquire.  The resolve section and
+ * the second load of N->prev are left out, as in RCU-txn+monotonic+dep.
  *)
 
 {
 int sel = 0;
 int nodep = 0;
+int noden = 0;
 int *nprev = &nodep;
-int *pnext = &nprev;
-int *xnext = &nprev;
+int *pnext = &noden;
 int *rpg = &sel;
-int *rpo = &nprev;
-int *rpn = &xnext;
+int *rpo = &noden;
+int *rpn = &nprev;
 int *rng = &sel;
 int *rno = &nodep;
-int *rnn = &xnext;
+int *rnn = &nprev;
 }
 
-P0(int **pnext, int **nprev, int **xnext, int **rpg, int **rng, int *sel)
+P0(int **pnext, int **nprev, int **rpg, int **rng, int *sel)
 {
 	rcu_assign_pointer(*pnext, rpg);	// install
 	rcu_assign_pointer(*nprev, rng);
 	smp_store_release(sel, 1);		// flip
-	rcu_assign_pointer(*pnext, xnext);	// settle
-	rcu_assign_pointer(*nprev, xnext);
+	rcu_assign_pointer(*pnext, nprev);	// settle: P->next = X
+	rcu_assign_pointer(*nprev, nprev);	// N->prev = X
 }
 
-P1(int **pnext, int **xnext, int **rpg, int **rpo, int **rpn, int **rng, int **rno, int **rnn)
+P1(int **pnext, int **nprev, int **rpg, int **rpo, int **rpn,
+   int **rng, int **rno, int **rnn)
 {
+	int *v;
 	int *r0;
 	int *r1;
 	int r2;
 	int *t;
-	int *u;
 	int *s0;
 	int *s1;
 	int s2;
 	int *back;
 
 	rcu_read_lock();
-	r0 = rcu_dereference(*pnext);		// forward from P
-	if (r0 == rpg) {
-		r1 = READ_ONCE(*r0);
-		r2 = smp_load_acquire(r1);
-		if (r2) {
-			t = READ_ONCE(*rpn);
+	v = rcu_dereference(*pnext);	// forward from P
+	if (v == rpg) {
+		r0 = smp_load_acquire(pnext);
+		if (r0 == rpg) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				t = READ_ONCE(*rpn);
+			} else {
+				t = READ_ONCE(*rpo);
+			}
 		} else {
-			t = READ_ONCE(*rpo);
+			t = r0;
 		}
 	} else {
-		t = r0;
+		t = v;
 	}
-	if (t == xnext) {
-		u = rcu_dereference(*t);	// forward from X, onto N
-		s0 = rcu_dereference(*u);	// back from N
+	if (t == nprev) {	// onto X, then onto N
+		s0 = rcu_dereference(*t);	// back from N
 		if (s0 == rng) {
 			s1 = READ_ONCE(*s0);
 			s2 = smp_load_acquire(s1);
@@ -82,4 +99,4 @@ P1(int **pnext, int **xnext, int **rpg, int **rpo, int **rpn, int **rng, int **r
 	rcu_read_unlock();
 }
 
-exists (1:t=xnext /\ 1:back=nodep)
+exists (1:t=nprev /\ 1:back=nodep)

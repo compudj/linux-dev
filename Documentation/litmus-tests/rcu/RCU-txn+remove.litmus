@@ -5,15 +5,16 @@ C RCU-txn+remove
  *
  * A transaction removes an object, end to end.  The writer initializes the
  * record, installs the proxy, flips the selector and settles the slot to
- * NULL.  Then it frees the descriptor and the object after a grace period, as
- * their kfree_rcu() does.  A reader that finds the proxy reads the record
+ * NULL.  Then it frees the descriptor and the object after a grace period,
+ * as their kfree_rcu() does.  A reader that finds the proxy reads the record
  * initialized and not yet freed.  A reader may reach the object in the slot
- * before the install, or through the proxy.  It never reads the object freed.
+ * before the install, or through the proxy.  It never reads the object
+ * freed.
  *
- * Slot a switches from the object o to NULL.  The record is rg, ro and rn (see
- * RCU-txn+install).  Before the writer runs, they hold garbage: junk, or 2 for
- * the selector.  Freeing stores 0 into the object and garbage into the
- * descriptor, as the allocator may.
+ * Slot a switches from the object o to NULL.  The record is rg, ro and rn.
+ * Its initial garbage and the reader are those of RCU-txn+install.  Freeing
+ * stores 0 into the object and garbage into the descriptor, as the
+ * allocator may.
  *)
 
 {
@@ -43,26 +44,35 @@ P0(int **a, int **rg, int **ro, int **rn, int *sel, int *o, int *junk)
 	WRITE_ONCE(*rn, junk);
 }
 
-P1(int **a, int **rg, int **ro, int **rn)
+P1(int **a, int **rg, int **ro, int **rn, struct srcu_struct *s)
 {
+	int *v;
 	int *r0;
 	int *r1;
 	int r2;
 	int *t;
 	int d;
+	int idx;
 
 	rcu_read_lock();
-	r0 = rcu_dereference(*a);
-	if (r0 == rg) {
-		r1 = READ_ONCE(*r0);
-		r2 = smp_load_acquire(r1);
-		if (r2) {
-			t = READ_ONCE(*rn);
+	v = rcu_dereference(*a);
+	if (v == rg) {
+		idx = srcu_read_lock(s);	// enter the resolve section
+		r0 = smp_load_acquire(a);	// load the slot again
+		if (r0 == rg) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				t = READ_ONCE(*rn);
+			} else {
+				t = READ_ONCE(*ro);
+			}
 		} else {
-			t = READ_ONCE(*ro);
+			t = r0;
 		}
+		srcu_read_unlock(s, idx);	// leave it
 	} else {
-		t = r0;
+		t = v;
 	}
 	if (t)
 		d = READ_ONCE(*t);

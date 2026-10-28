@@ -83,25 +83,43 @@ RCU-txn+install.litmus
     Demonstrates that the install of an RCU pseudo-transaction
     (include/linux/rcu_txn.h) publishes its record: a reader that finds a
     proxy reads the record initialized.
+    NOTE: In all RCU-txn tests, the readers resolve a proxy as
+    rcu_txn_dereference() does: they load the slot again, with a
+    load-acquire.  The tests of two slots leave the resolve section out,
+    to keep herd7 fast.  Their headers say so.
 
 RCU-txn+monotonic+dep.litmus
 RCU-txn+monotonic+acquire.litmus
+RCU-txn+monotonic+rmb.litmus
     Demonstrate that the slots of one RCU pseudo-transaction resolve old,
     then new.  They never resolve new, then old.  The reader orders its
-    loads with a chain of dependent loads (+dep), or with a load-acquire
-    between them (+acquire).
+    two loads in one of three ways:
+     - the second load depends on the first (+dep);
+     - the reader loads the first slot with a load-acquire, then calls
+       rcu_txn_resolve() (+acquire);
+     - the reader calls smp_rmb() between its two rcu_txn_dereference()
+       (+rmb).
+
+RCU-txn+monotonic+dep+rev.litmus
+    As RCU-txn+monotonic+dep, but the writer records the two slots in
+    the other order.
 
 RCU-txn+list+step-back.litmus
     Demonstrates that a reader of an rcu_txn_list never skips a node that
     is being inserted.  The reader steps forward onto the node, forward
     again onto its successor, then back.  It comes back to the inserted
-    node, not to its predecessor.
-    NOTE: herd7 took about half an hour on it, and on its variants, in
-    testing.
+    node, not to its predecessor.  The test has the shape of
+    RCU-txn+monotonic+dep, with the names of a list.
+    NOTE: herd7 took 5 to 7 minutes on each of the +monotonic+dep and
+    +list+step-back tests, in testing.  It took about an hour on the 34
+    RCU-txn tests.
 
 RCU-txn+sync+free.litmus
-    Demonstrates that a reader never reads the record of an RCU
-    pseudo-transaction once it is freed after a grace period.
+RCU-txn+sync+free+section.litmus
+    Demonstrate that a reader never reads the record of an RCU
+    pseudo-transaction once it is freed after a grace period.  The reader
+    reads the record within a resolve section only.  This section
+    protects the record by itself (+section).
 
 RCU-txn+publish.litmus
 RCU-txn+remove.litmus
@@ -110,12 +128,36 @@ RCU-txn+remove.litmus
     object built.  It never reads a removed object or the record once they
     are freed after a grace period.
 
+RCU-txn+steal.litmus
+RCU-txn+steal+reuse.litmus
+    Demonstrate that a reader never reads the record of a local
+    transaction's descriptor once it is stolen and reused.  In a steal,
+    a pool takes its descriptors back without waiting for a grace period,
+    after waiting for the resolve sections in flight.  In +reuse, a whole
+    second transaction reuses the descriptor, on the same slot.
+
+RCU-txn+recycle.litmus
+    Demonstrates that a reader never reads the record of a local
+    transaction's descriptor once its CPU reused it, after a grace
+    period.
+
+RCU-txn+reuse+monotonic.litmus
+    Demonstrates that a transaction on a reused descriptor still resolves
+    old, then new.  The selector of the descriptor holds 1 from its
+    earlier transaction.  The writer stores 0 to it again before the
+    install.
+
 RCU-txn+*+once-*.litmus
 RCU-txn+monotonic+unordered.litmus
 RCU-txn+remove+nolock.litmus
 RCU-txn+remove+nosync.litmus
-RCU-txn+sync+free+nolock.litmus
 RCU-txn+sync+free+nosync.litmus
+RCU-txn+sync+free+section+noreload.litmus
+RCU-txn+steal+noreload.litmus
+RCU-txn+steal+nosync.litmus
+RCU-txn+steal+reuse+nosync.litmus
+RCU-txn+recycle+nosync.litmus
     Error injection into the above RCU-txn tests.  Each variant drops one
-    ordering that its test relies on.  herd7 then finds the outcome
-    possible.  This shows that the model catches the missing ordering.
+    ordering, or one step, that its test relies on.  herd7 then finds the
+    outcome possible.  This shows that the model catches the missing
+    ordering.

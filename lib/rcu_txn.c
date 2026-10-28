@@ -38,6 +38,8 @@
  * interrupts, so the wait may run with interrupts disabled, as under a raw
  * spinlock.  The wait also disables interrupts itself: see
  * __rcu_txn_synchronize_resolve().
+ *
+ * See Documentation/litmus-tests/rcu/RCU-txn+steal.litmus.
  */
 DEFINE_STATIC_SRCU_ATOMIC(rcu_txn_resolve_srcu);
 
@@ -147,7 +149,10 @@ EXPORT_SYMBOL_IF_KUNIT(__rcu_txn_synchronize_resolve);
  * nothing is past that bound: it warns, and its commit fails.
  *
  * A burst of more commits than the pool holds within a grace period pays one
- * such wait per pool's worth.
+ * steal per pool's worth.
+ *
+ * See Documentation/litmus-tests/rcu/RCU-txn+steal.litmus and
+ * RCU-txn+recycle.litmus.
  */
 
 /* A descriptor of a pool, with room for RCU_TXN_LOCAL_CAP records. */

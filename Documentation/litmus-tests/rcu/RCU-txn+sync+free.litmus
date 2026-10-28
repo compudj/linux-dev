@@ -3,15 +3,15 @@ C RCU-txn+sync+free
 (*
  * Result: Never
  *
- * A record outlives every reader that may hold its proxy.  commit() frees the
+ * A record outlives every reader that may read it.  commit() frees the
  * descriptor with kfree_rcu() after the settle.  A reader loads a slot and
- * resolves what it loaded within one RCU read-side critical section.  Such a
- * reader never reads the freed record.
+ * resolves it within one RCU read-side critical section.  Such a reader
+ * never reads the freed record.
  *
- * The record is rg, ro and rn (see RCU-txn+install).  It is installed when
- * the writer starts.  After the flip, the settle and a grace period, the
- * writer stores junk into the record.  The allocator may do this once
- * kfree_rcu() has run.
+ * The record is rg, ro and rn, and the reader is the one of the code (see
+ * RCU-txn+install).  The record is installed when the writer starts.  After
+ * the flip, the settle and a grace period, the writer stores junk into the
+ * record.  The allocator may do this once kfree_rcu() has run.
  *)
 
 {
@@ -35,25 +35,34 @@ P0(int **a, int **rg, int **ro, int **rn, int *sel, int *n, int *junk)
 	WRITE_ONCE(*rn, junk);
 }
 
-P1(int **a, int **rg, int **ro, int **rn)
+P1(int **a, int **rg, int **ro, int **rn, struct srcu_struct *s)
 {
+	int *v;
 	int *r0;
 	int *r1;
 	int r2;
 	int *t;
+	int idx;
 
 	rcu_read_lock();
-	r0 = rcu_dereference(*a);
-	if (r0 == rg) {
-		r1 = READ_ONCE(*r0);
-		r2 = smp_load_acquire(r1);
-		if (r2) {
-			t = READ_ONCE(*rn);
+	v = rcu_dereference(*a);
+	if (v == rg) {
+		idx = srcu_read_lock(s);	// enter the resolve section
+		r0 = smp_load_acquire(a);	// load the slot again
+		if (r0 == rg) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				t = READ_ONCE(*rn);
+			} else {
+				t = READ_ONCE(*ro);
+			}
 		} else {
-			t = READ_ONCE(*ro);
+			t = r0;
 		}
+		srcu_read_unlock(s, idx);	// leave it
 	} else {
-		t = r0;
+		t = v;
 	}
 	rcu_read_unlock();
 }

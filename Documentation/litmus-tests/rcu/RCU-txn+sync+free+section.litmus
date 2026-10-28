@@ -1,0 +1,71 @@
+C RCU-txn+sync+free+section
+
+(*
+ * Result: Never
+ *
+ * As RCU-txn+sync+free, but the reader has no RCU read-side critical
+ * section of its own.  It still never reads the freed record.  It reads the
+ * record only within a resolve section.  This section disables interrupts,
+ * so it is an RCU read-side critical section.  rcu_read_lock() stands for it
+ * here, because herd7 has no interrupts.  Within the section, the reader
+ * loads the slot again.  It resolves a proxy only if the slot still holds
+ * it.
+ *
+ * A reader must still use the target it resolves within an RCU read-side
+ * critical section of its own: see RCU-txn+remove+nolock.
+ *)
+
+{
+int junk = 9;
+int sel = 0;
+int o = 1;
+int n = 1;
+int *rg = &sel;
+int *ro = &o;
+int *rn = &n;
+int *a = &rg;
+}
+
+P0(int **a, int **rg, int **ro, int **rn, int *sel, int *n, int *junk)
+{
+	smp_store_release(sel, 1);	// flip
+	rcu_assign_pointer(*a, n);	// settle
+	synchronize_rcu();		// kfree_rcu() of the descriptor
+	WRITE_ONCE(*rg, junk);
+	WRITE_ONCE(*ro, junk);
+	WRITE_ONCE(*rn, junk);
+}
+
+P1(int **a, int **rg, int **ro, int **rn, struct srcu_struct *s)
+{
+	int *v;
+	int *r0;
+	int *r1;
+	int r2;
+	int *t;
+	int idx;
+
+	v = rcu_dereference(*a);
+	if (v == rg) {
+		rcu_read_lock();	// interrupts off
+		idx = srcu_read_lock(s);	// enter the resolve section
+		r0 = smp_load_acquire(a);	// load the slot again
+		if (r0 == rg) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				t = READ_ONCE(*rn);
+			} else {
+				t = READ_ONCE(*ro);
+			}
+		} else {
+			t = r0;
+		}
+		srcu_read_unlock(s, idx);	// leave it
+		rcu_read_unlock();
+	} else {
+		t = v;
+	}
+}
+
+exists (1:r0=rg /\ (1:r1=junk \/ 1:t=junk))

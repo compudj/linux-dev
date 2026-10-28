@@ -33,8 +33,10 @@ P0(int **a, int **b, int **rag, int **rbg, int *sel, int *bnew)
 	rcu_assign_pointer(*b, bnew);
 }
 
-P1(int **a, int **b, int **rag, int **rao, int **ran, int **rbg, int **rbo, int **rbn)
+P1(int **a, int **b, int **rag, int **rao, int **ran,
+   int **rbg, int **rbo, int **rbn)
 {
+	int *v;
 	int *r0;
 	int *r1;
 	int r2;
@@ -45,17 +47,22 @@ P1(int **a, int **b, int **rag, int **rao, int **ran, int **rbg, int **rbo, int 
 	int *tb;
 
 	rcu_read_lock();
-	r0 = rcu_dereference(*a);
-	if (r0 == rag) {
-		r1 = READ_ONCE(*r0);
-		r2 = smp_load_acquire(r1);
-		if (r2) {
-			ta = READ_ONCE(*ran);
+	v = rcu_dereference(*a);
+	if (v == rag) {
+		r0 = smp_load_acquire(a);
+		if (r0 == rag) {
+			r1 = READ_ONCE(*r0);
+			r2 = smp_load_acquire(r1);
+			if (r2) {
+				ta = READ_ONCE(*ran);
+			} else {
+				ta = READ_ONCE(*rao);
+			}
 		} else {
-			ta = READ_ONCE(*rao);
+			ta = r0;
 		}
 	} else {
-		ta = r0;
+		ta = v;
 	}
 	if (ta == b) {
 		s0 = rcu_dereference(*ta);
