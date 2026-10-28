@@ -10,6 +10,7 @@
 #include <linux/cpumask.h>
 #include <linux/debug_locks.h>
 #include <linux/delay.h>
+#include <linux/hrtimer.h>
 #include <linux/irqflags.h>
 #include <linux/kthread.h>
 #include <linux/list_bl.h>
@@ -23,8 +24,14 @@
 #include <linux/sched.h>
 #include <linux/sched/clock.h>
 #include <linux/sched/task.h>
+#include <linux/smp.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+
+#ifdef CONFIG_X86_LOCAL_APIC
+#include <asm/apic.h>
+#include <asm/nmi.h>	/* register_nmi_handler() */
+#endif
 
 #include "../rcu_txn_internal.h"	/* the steps of a commit */
 
@@ -2136,6 +2143,17 @@ static void rcu_txn_test_resolve_nest(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, read_slot(&slot), T(1));
 }
 
+/* Sleep until kthread_stop(), once a test's kthread is done. */
+static void park_until_stopped(void)
+{
+	set_current_state(TASK_INTERRUPTIBLE);
+	while (!kthread_should_stop()) {
+		schedule();
+		set_current_state(TASK_INTERRUPTIBLE);
+	}
+	__set_current_state(TASK_RUNNING);
+}
+
 /*
  * A kthread holds @levels nested resolve sections open on another CPU, as an
  * NMI would nest them.  It leaves them innermost first, each after spinning
@@ -2172,12 +2190,7 @@ static int park_fn(void *arg)
 	}
 	local_irq_restore(flags);
 
-	set_current_state(TASK_INTERRUPTIBLE);
-	while (!kthread_should_stop()) {
-		schedule();
-		set_current_state(TASK_INTERRUPTIBLE);
-	}
-	__set_current_state(TASK_RUNNING);
+	park_until_stopped();
 	return 0;
 }
 
@@ -2258,41 +2271,48 @@ struct reuse {
 	struct rcu_txn_group poison_group;	/* selector 1: reads ptr[1] */
 };
 
+struct local_conc;
+
 struct reuse_reader {
 	struct reuse *reuse;
+	struct local_conc *conc;	/* rcu_txn_test_local_concurrent()'s */
 	struct task_struct *task;
 	long reads;
 	long proxies;		/* loads that found a proxy */
 	long violations;
 };
 
+/* Resolve slot @i of @ru as a reader does, and check the target. */
+static void reuse_read(struct reuse_reader *r, struct reuse *ru, int i,
+		       unsigned long *last)
+{
+	unsigned long n;
+	void *v, *t;
+
+	rcu_read_lock();
+	v = rcu_dereference(ru->slot[i]);
+	if (rcu_txn_is_proxy(v, TAG))
+		r->proxies++;
+	t = rcu_txn_resolve(&ru->slot[i], v, TAG);
+	rcu_read_unlock();
+
+	n = ((unsigned long)t >> 8) - 1;	/* T(n) */
+	if (t == REUSE_POISON || (n & 1) != i || n / 2 < *last)
+		r->violations++;
+	else
+		*last = n / 2;
+	r->reads++;
+}
+
 static int reuse_reader_fn(void *arg)
 {
 	struct reuse_reader *r = arg;
-	struct reuse *ru = r->reuse;
 	unsigned long last[2] = { 0, 0 };
 	int i;
 
 	while (!kthread_should_stop()) {
-		for (i = 0; i < 2; i++) {
-			unsigned long n;
-			void *v, *t;
-
-			rcu_read_lock();
-			v = rcu_dereference(ru->slot[i]);
-			if (rcu_txn_is_proxy(v, TAG))
-				r->proxies++;
-			t = rcu_txn_resolve(&ru->slot[i], v, TAG);
-			rcu_read_unlock();
-
-			n = ((unsigned long)t >> 8) - 1;	/* T(n) */
-			if (t == REUSE_POISON || (n & 1) != i ||
-			    n / 2 < last[i])
-				r->violations++;
-			else
-				last[i] = n / 2;
-			r->reads++;
-		}
+		for (i = 0; i < 2; i++)
+			reuse_read(r, r->reuse, i, &last[i]);
 		if (!(r->reads & 1023))
 			cond_resched();
 	}
@@ -2566,6 +2586,7 @@ static void rcu_txn_test_local_recycle(struct kunit *test)
 static void rcu_txn_test_local_steal(struct kunit *test)
 {
 	unsigned long k, steals;
+	unsigned int count;
 	void __rcu *s[2];
 
 	RCU_INIT_POINTER(s[0], REUSE_V(0, 0));
@@ -2576,10 +2597,13 @@ static void rcu_txn_test_local_steal(struct kunit *test)
 	for (k = 1; k <= 8 * RCU_TXN_LOCAL_POOL; k++)
 		local_commit(s, k);
 	steals = __rcu_txn_local_steals() - steals;
+	count = __rcu_txn_local_count();
 	migrate_enable();
 
 	kunit_info(test, "%lu steals\n", steals);
 	KUNIT_EXPECT_GT(test, steals, 0);
+	/* Every descriptor is back, in one place. */
+	KUNIT_EXPECT_EQ(test, count, RCU_TXN_LOCAL_POOL);
 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[0]),
 			    REUSE_V(0, 8 * RCU_TXN_LOCAL_POOL));
 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[1]),
@@ -2652,12 +2676,7 @@ static int steal_park_fn(void *arg)
 	__rcu_txn_resolve_exit(idx);
 	local_irq_restore(flags);
 
-	set_current_state(TASK_INTERRUPTIBLE);
-	while (!kthread_should_stop()) {
-		schedule();
-		set_current_state(TASK_INTERRUPTIBLE);
-	}
-	__set_current_state(TASK_RUNNING);
+	park_until_stopped();
 	return 0;
 }
 
@@ -2788,6 +2807,7 @@ static void rcu_txn_test_local_atomic(struct kunit *test)
 	unsigned long k = 0, steals;
 	struct hlist_bl_head bucket;
 	int locks = debug_locks;
+	unsigned int count[2];
 	unsigned long flags;
 	void __rcu *s[2];
 	int i;
@@ -2800,19 +2820,1015 @@ static void rcu_txn_test_local_atomic(struct kunit *test)
 	raw_spin_lock_irqsave(&raw_lock, flags);
 	for (i = 0; i < 4 * RCU_TXN_LOCAL_POOL; i++)
 		local_commit(s, ++k);
+	count[0] = __rcu_txn_local_count();
 	raw_spin_unlock_irqrestore(&raw_lock, flags);
 	expect_no_report(test, tainted, locks);
 
 	hlist_bl_lock(&bucket);
 	for (i = 0; i < 4 * RCU_TXN_LOCAL_POOL; i++)
 		local_commit(s, ++k);
+	count[1] = __rcu_txn_local_count();
 	hlist_bl_unlock(&bucket);
 	expect_no_report(test, tainted, locks);
 
 	KUNIT_EXPECT_GT(test, __rcu_txn_local_steals() - steals, 0);
+	/* Every descriptor is back, in one place, after each burst. */
+	KUNIT_EXPECT_EQ(test, count[0], RCU_TXN_LOCAL_POOL);
+	KUNIT_EXPECT_EQ(test, count[1], RCU_TXN_LOCAL_POOL);
 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[0]), REUSE_V(0, k));
 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[1]), REUSE_V(1, k));
 }
+
+/*
+ * Concurrent steals
+ * -----------------
+ *
+ * As rcu_txn_test_local_steal_waits(), with a writer W bound to every CPU but
+ * one.  A reader R runs on the remaining CPU.  The column W shows one writer.
+ * All the writers run it at the same time, each on its own pool and slots.
+ *
+ *   W (each writer)                               R
+ *   rcu_txn_init_local()
+ *   __rcu_txn_record_install()
+ *     s[0] = the proxy of round 1
+ *                                                 __rcu_txn_resolve_enter()
+ *                                                 load s[0] of each W: a proxy
+ *   __rcu_txn_group_commit()
+ *   __rcu_txn_record_settle()
+ *   __rcu_txn_local_retire()
+ *   local_commit(), 2 * RCU_TXN_LOCAL_POOL times
+ *     rcu_txn_local_steal()
+ *       __rcu_txn_synchronize_resolve()
+ *         spins
+ *                                                 __rcu_txn_proxy_resolve()
+ *                                                   of each proxy
+ *                                                 __rcu_txn_resolve_exit()
+ *         returns
+ *
+ * The steals of the writers overlap.  Each one must wait for the one section
+ * of R.  Each proxy must then resolve to the round 1 target of its writer.
+ */
+struct stealer {
+	struct steal_all *all;
+	struct task_struct *task;
+	void __rcu *s[2];
+	void *proxy;		/* round 1's, in s[0] */
+	void *loaded;		/* what the reader loaded from s[0] */
+	void *resolved;		/* and resolved it to */
+	unsigned int count;	/* of its pool, once done */
+	int drained;
+	int installed;		/* round 1's proxies are */
+	int done;
+};
+
+struct steal_all {
+	struct stealer *w;
+	int nr;
+	int go;			/* every pool is drained */
+	int holding;		/* the reader holds every proxy */
+};
+
+static int stealer_fn(void *arg)
+{
+	struct stealer *w = arg;
+	struct rcu_txn txn;
+	unsigned long k;
+	int i;
+
+	/*
+	 * Drain before any writer disables preemption.  local_drain() waits
+	 * for grace periods in rcu_barrier(), and those wait for every CPU.
+	 */
+	local_drain();
+	/* Pairs with the test's load-acquire. */
+	smp_store_release(&w->drained, 1);
+	/* Pairs with the test's store-release. */
+	while (!smp_load_acquire(&w->all->go))
+		cond_resched();
+
+	rcu_txn_init_local(&txn);
+	rcu_txn_record(&txn, &w->s[0], REUSE_V(0, 0), REUSE_V(0, 1), TAG);
+	rcu_txn_record(&txn, &w->s[1], REUSE_V(1, 0), REUSE_V(1, 1), TAG);
+	for (i = 0; i < 2; i++)
+		__rcu_txn_record_install(&txn.desc->group, &txn.records[i]);
+	w->proxy = rcu_access_pointer(w->s[0]);
+	/* Pairs with the load-acquire of steal_all_park_fn(). */
+	smp_store_release(&w->installed, 1);
+	/* Pairs with the store-release of steal_all_park_fn(). */
+	while (!smp_load_acquire(&w->all->holding))
+		cpu_relax();
+	__rcu_txn_group_commit(&txn.desc->group);
+	for (i = 0; i < 2; i++)
+		__rcu_txn_record_settle(&txn.records[i]);
+	__rcu_txn_local_retire(txn.desc);
+	__rcu_txn_done(&txn);
+
+	for (k = 2; k < 2 + 2 * RCU_TXN_LOCAL_POOL; k++)
+		local_commit(w->s, k);
+	w->count = __rcu_txn_local_count();
+	/* Pairs with the test's load-acquire. */
+	smp_store_release(&w->done, 1);
+	park_until_stopped();
+	return 0;
+}
+
+static int steal_all_park_fn(void *arg)
+{
+	struct steal_all *all = arg;
+	unsigned long flags;
+	int idx;
+	u64 start;
+	int i;
+
+	for (i = 0; i < all->nr; i++) {
+		/* Pairs with the store-release of stealer_fn(). */
+		while (!smp_load_acquire(&all->w[i].installed))
+			cpu_relax();
+	}
+
+	local_irq_save(flags);
+	idx = __rcu_txn_resolve_enter();
+	for (i = 0; i < all->nr; i++)
+		all->w[i].loaded = rcu_dereference_raw(all->w[i].s[0]);
+	/* Pairs with the load-acquire of stealer_fn(). */
+	smp_store_release(&all->holding, 1);
+	start = local_clock();
+	while (local_clock() - start < PARK_HOLD_NS)
+		cpu_relax();
+	for (i = 0; i < all->nr; i++) {
+		void *v = all->w[i].loaded;
+
+		if (rcu_txn_is_proxy(v, TAG))
+			v = __rcu_txn_proxy_resolve(__rcu_txn_untag(v, TAG));
+		all->w[i].resolved = v;
+	}
+	__rcu_txn_resolve_exit(idx);
+	local_irq_restore(flags);
+
+	park_until_stopped();
+	return 0;
+}
+
+static void rcu_txn_test_local_steal_waits_all(struct kunit *test)
+{
+	struct steal_all all = { };
+	struct task_struct *parker;
+	unsigned int cpu, park_cpu;
+	unsigned long steals;
+	int i;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs online");
+	all.w = kunit_kcalloc(test, nr_cpu_ids, sizeof(*all.w), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, all.w);
+
+	park_cpu = cpumask_first(cpu_online_mask);
+	parker = kthread_create(steal_all_park_fn, &all, "rcu_txn_park");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(parker));
+	kthread_bind(parker, park_cpu);
+	for_each_online_cpu(cpu) {
+		struct stealer *w;
+
+		if (cpu == park_cpu)
+			continue;
+		w = &all.w[all.nr];
+		w->all = &all;
+		RCU_INIT_POINTER(w->s[0], REUSE_V(0, 0));
+		RCU_INIT_POINTER(w->s[1], REUSE_V(1, 0));
+		w->task = kthread_create(stealer_fn, w, "rcu_txn_steal/%u", cpu);
+		if (IS_ERR(w->task))
+			break;
+		kthread_bind(w->task, cpu);
+		all.nr++;
+	}
+
+	steals = __rcu_txn_local_steals();
+	for (i = 0; i < all.nr; i++)
+		wake_up_process(all.w[i].task);
+	for (i = 0; i < all.nr; i++) {
+		/* Pairs with the store-release of stealer_fn(). */
+		while (!smp_load_acquire(&all.w[i].drained))
+			schedule_timeout_uninterruptible(1);
+	}
+	/* Pairs with the load-acquire of stealer_fn(). */
+	smp_store_release(&all.go, 1);
+	wake_up_process(parker);
+	for (i = 0; i < all.nr; i++) {
+		/* Pairs with the store-release of stealer_fn(). */
+		while (!smp_load_acquire(&all.w[i].done))
+			schedule_timeout_uninterruptible(1);
+	}
+	kthread_stop(parker);
+	for (i = 0; i < all.nr; i++)
+		kthread_stop(all.w[i].task);
+	steals = __rcu_txn_local_steals() - steals;
+
+	kunit_info(test, "%d writers, %lu steals\n", all.nr, steals);
+	KUNIT_EXPECT_GT(test, all.nr, 0);
+	/* The grace periods wait for the section too: each writer stole. */
+	KUNIT_EXPECT_GE(test, steals, all.nr);
+	for (i = 0; i < all.nr; i++) {
+		struct stealer *w = &all.w[i];
+
+		KUNIT_EXPECT_PTR_EQ(test, w->loaded, w->proxy);
+		/* Round 1's new target, not a later round's. */
+		KUNIT_EXPECT_PTR_EQ_MSG(test, w->resolved, REUSE_V(0, 1),
+					"writer %d", i);
+		KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(w->s[0]),
+				    REUSE_V(0, 1 + 2 * RCU_TXN_LOCAL_POOL));
+		KUNIT_EXPECT_EQ(test, w->count, RCU_TXN_LOCAL_POOL);
+	}
+}
+
+/*
+ * Bursts on every CPU at once, against concurrent readers.  This is
+ * rcu_txn_test_local_reuse() with a writer bound to each CPU, up to
+ * LOCAL_CONC_WRITERS.  Steals run concurrently, their waits included.
+ * Meanwhile, the readers resolve the proxies of every writer.
+ */
+#define LOCAL_CONC_WRITERS	8
+
+struct local_writer {
+	struct reuse *ru;
+	struct task_struct *task;
+	unsigned int count;	/* of its pool, once done */
+	int done;
+};
+
+struct local_conc {
+	struct local_writer w[LOCAL_CONC_WRITERS];
+	int nr;
+};
+
+static int local_writer_fn(void *arg)
+{
+	struct local_writer *w = arg;
+	unsigned long k;
+
+	for (k = 1; k <= REUSE_ROUNDS; k++) {
+		local_round(w->ru, k);
+		if (!(k & 255))
+			cond_resched();
+	}
+	w->count = __rcu_txn_local_count();
+	/* Pairs with the test's load-acquire. */
+	smp_store_release(&w->done, 1);
+	park_until_stopped();
+	return 0;
+}
+
+/*
+ * Each reader reads the slots of every writer.  A writer keeps preemption
+ * disabled for a whole round.  So a reader runs on a writer's CPU only
+ * between two rounds of that writer, when it has no proxy installed.  If it
+ * read only that writer's slots, it would never see a proxy.
+ */
+static int local_conc_reader_fn(void *arg)
+{
+	unsigned long last[LOCAL_CONC_WRITERS][2] = { };
+	struct reuse_reader *r = arg;
+	struct local_conc *c = r->conc;
+	int i, j;
+
+	while (!kthread_should_stop()) {
+		for (j = 0; j < c->nr; j++)
+			for (i = 0; i < 2; i++)
+				reuse_read(r, c->w[j].ru, i, &last[j][i]);
+		if (!(r->reads & 1023))
+			cond_resched();
+	}
+	return 0;
+}
+
+static void rcu_txn_test_local_concurrent(struct kunit *test)
+{
+	long reads = 0, proxies = 0, violations = 0;
+	struct reuse_reader *readers;
+	struct local_conc *c;
+	unsigned long steals;
+	unsigned int cpu;
+	int i;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs online");
+	c = kunit_kzalloc(test, sizeof(*c), GFP_KERNEL);
+	readers = kunit_kcalloc(test, REUSE_READERS, sizeof(*readers),
+				GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, c);
+	KUNIT_ASSERT_NOT_NULL(test, readers);
+
+	for_each_online_cpu(cpu) {
+		struct local_writer *w = &c->w[c->nr];
+
+		if (c->nr == LOCAL_CONC_WRITERS)
+			break;
+		/* kmalloc() aligns the records as a descriptor's. */
+		w->ru = kunit_kzalloc(test, sizeof(*w->ru), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, w->ru);
+		RCU_INIT_POINTER(w->ru->slot[0], REUSE_V(0, 0));
+		RCU_INIT_POINTER(w->ru->slot[1], REUSE_V(1, 0));
+		w->task = kthread_create(local_writer_fn, w,
+					 "rcu_txn_writer/%u", cpu);
+		if (IS_ERR(w->task))
+			break;
+		kthread_bind(w->task, cpu);
+		c->nr++;
+	}
+	KUNIT_ASSERT_GT(test, c->nr, 1);
+
+	for (i = 0; i < REUSE_READERS; i++) {
+		readers[i].conc = c;
+		readers[i].task = kthread_run(local_conc_reader_fn, &readers[i],
+					      "rcu_txn_reuse/%d", i);
+		if (IS_ERR(readers[i].task))
+			readers[i].task = NULL;
+	}
+	steals = __rcu_txn_local_steals();
+	for (i = 0; i < c->nr; i++)
+		wake_up_process(c->w[i].task);
+	for (i = 0; i < c->nr; i++) {
+		/* Pairs with the store-release of local_writer_fn(). */
+		while (!smp_load_acquire(&c->w[i].done))
+			schedule_timeout_uninterruptible(1);
+	}
+	steals = __rcu_txn_local_steals() - steals;
+
+	for (i = 0; i < REUSE_READERS; i++) {
+		if (readers[i].task)
+			kthread_stop(readers[i].task);
+		reads += readers[i].reads;
+		proxies += readers[i].proxies;
+		violations += readers[i].violations;
+	}
+	for (i = 0; i < c->nr; i++)
+		kthread_stop(c->w[i].task);
+
+	kunit_info(test, "%d writers, %ld reads, %ld through a proxy, %lu steals\n",
+		   c->nr, reads, proxies, steals);
+	for (i = 0; i < c->nr; i++) {
+		struct reuse *ru = c->w[i].ru;
+
+		KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(ru->slot[0]),
+				    REUSE_V(0, REUSE_ROUNDS));
+		KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(ru->slot[1]),
+				    REUSE_V(1, REUSE_ROUNDS));
+		KUNIT_EXPECT_EQ(test, c->w[i].count, RCU_TXN_LOCAL_POOL);
+	}
+	KUNIT_EXPECT_GT(test, proxies, 0);
+	KUNIT_EXPECT_GE(test, steals, c->nr);
+	KUNIT_EXPECT_EQ(test, violations, 0);
+}
+
+/*
+ * Nested contexts
+ * ---------------
+ *
+ * A task holds a local handle, so its descriptor is out of the pool.  An
+ * hrtimer then fires in hardirq context on the same CPU.  It commits twice
+ * what the pool holds, so it steals the rest of the pool back.  The task's
+ * commit then completes.  A pool stays whole however its contexts
+ * interleave: a held descriptor is in no list.
+ */
+struct local_irq {
+	struct hrtimer timer;
+	void __rcu *u[2];
+	int cpu;		/* where the hrtimer ran */
+	bool in_hardirq;
+	int fired;
+};
+
+static enum hrtimer_restart local_irq_fn(struct hrtimer *timer)
+{
+	struct local_irq *li = container_of(timer, struct local_irq, timer);
+	unsigned long k;
+
+	li->cpu = smp_processor_id();
+	li->in_hardirq = in_hardirq();
+	for (k = 1; k <= 2 * RCU_TXN_LOCAL_POOL; k++)
+		local_commit(li->u, k);
+	/* Pairs with the load-acquires of rcu_txn_test_local_irq(). */
+	smp_store_release(&li->fired, 1);
+	return HRTIMER_NORESTART;
+}
+
+static void rcu_txn_test_local_irq(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	int locks = debug_locks;
+	struct local_irq li = { };
+	unsigned long steals;
+	struct rcu_txn txn;
+	unsigned int count;
+	void __rcu *s[2];
+	int cpu, err, fired;
+	u64 start;
+
+	RCU_INIT_POINTER(s[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(s[1], REUSE_V(1, 0));
+	RCU_INIT_POINTER(li.u[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(li.u[1], REUSE_V(1, 0));
+	/* _HARD: in hardirq context, PREEMPT_RT included. */
+	hrtimer_setup_on_stack(&li.timer, local_irq_fn, CLOCK_MONOTONIC,
+			       HRTIMER_MODE_REL_PINNED_HARD);
+
+	migrate_disable();
+	steals = __rcu_txn_local_steals();
+	cpu = smp_processor_id();
+	rcu_txn_init_local(&txn);
+	rcu_txn_record(&txn, &s[0], REUSE_V(0, 0), REUSE_V(0, 1), TAG);
+	rcu_txn_record(&txn, &s[1], REUSE_V(1, 0), REUSE_V(1, 1), TAG);
+	hrtimer_start(&li.timer, ns_to_ktime(100 * NSEC_PER_USEC),
+		      HRTIMER_MODE_REL_PINNED_HARD);
+	start = local_clock();
+	/* Pairs with the store-release of local_irq_fn(). */
+	while (!smp_load_acquire(&li.fired) &&
+	       local_clock() - start < NSEC_PER_SEC)
+		cpu_relax();
+	err = rcu_txn_commit(&txn);
+	/* Pairs with the store-release of local_irq_fn(). */
+	fired = smp_load_acquire(&li.fired);
+	hrtimer_cancel(&li.timer);
+	steals = __rcu_txn_local_steals() - steals;
+	count = __rcu_txn_local_count();
+	migrate_enable();
+	destroy_hrtimer_on_stack(&li.timer);
+
+	KUNIT_ASSERT_EQ_MSG(test, fired, 1, "the hrtimer did not fire");
+	KUNIT_EXPECT_EQ(test, li.cpu, cpu);
+	KUNIT_EXPECT_TRUE(test, li.in_hardirq);
+	KUNIT_EXPECT_EQ(test, err, 0);
+	KUNIT_EXPECT_GT(test, steals, 0);
+	KUNIT_EXPECT_EQ(test, count, RCU_TXN_LOCAL_POOL);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[0]), REUSE_V(0, 1));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[1]), REUSE_V(1, 1));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(li.u[0]),
+			    REUSE_V(0, 2 * RCU_TXN_LOCAL_POOL));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(li.u[1]),
+			    REUSE_V(1, 2 * RCU_TXN_LOCAL_POOL));
+	expect_no_report(test, tainted, locks);
+}
+
+/*
+ * A task commits in a burst.  Meanwhile, a kthread on another CPU sends it
+ * IPIs back to back.  Each IPI commits a transaction of its own, in hardirq
+ * context.  Interrupts land between and around the task's changes to the
+ * pool, tens of thousands of times.  The pool must be whole at the end, and
+ * each slot at its last round.  The burst lasts at least IPI_ROUNDS commits,
+ * and until IPI_RUNS IPIs ran.
+ *
+ * The storm uses IPIs, not hrtimers.  When KUnit runs at boot, high
+ * resolution timers may not be active yet.  An hrtimer storm would then fire
+ * only once per tick.
+ */
+#define IPI_ROUNDS		20000
+#define IPI_RUNS		50000
+#define IPI_TIMEOUT_NS		(5 * NSEC_PER_SEC)
+
+struct local_ipi {
+	call_single_data_t csd;
+	struct task_struct *task;
+	void __rcu *u[2];
+	unsigned long k;	/* rounds the IPIs committed */
+	unsigned long sent;
+	unsigned long runs;
+	int target;		/* the task's CPU */
+	int cpu;		/* where the IPIs ran, -1 if elsewhere */
+	bool in_hardirq;
+	int stop;
+};
+
+static void local_ipi_fn(void *arg)
+{
+	struct local_ipi *li = arg;
+
+	if (smp_processor_id() != li->target)
+		li->cpu = -1;
+	if (!in_hardirq())
+		li->in_hardirq = false;
+	local_commit(li->u, ++li->k);
+	/* Pairs with the load-acquire of local_ipi_sender_fn(). */
+	smp_store_release(&li->runs, li->runs + 1);
+}
+
+static int local_ipi_sender_fn(void *arg)
+{
+	struct local_ipi *li = arg;
+
+	while (!READ_ONCE(li->stop)) {
+		/* -EBUSY while the previous one is in flight. */
+		if (!smp_call_function_single_async(li->target, &li->csd))
+			li->sent++;
+		cpu_relax();
+	}
+	/* Pairs with the store-release of local_ipi_fn(). */
+	while (smp_load_acquire(&li->runs) != li->sent)
+		cpu_relax();
+	park_until_stopped();
+	return 0;
+}
+
+static void rcu_txn_test_local_irq_storm(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	int locks = debug_locks;
+	struct local_ipi li = { .in_hardirq = true };
+	unsigned long k = 0, steals;
+	unsigned int cpu, count;
+	void __rcu *s[2];
+	u64 start;
+
+	RCU_INIT_POINTER(s[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(s[1], REUSE_V(1, 0));
+	RCU_INIT_POINTER(li.u[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(li.u[1], REUSE_V(1, 0));
+	INIT_CSD(&li.csd, local_ipi_fn, &li);
+
+	/* The task commits on its CPU, the kthread sends from another. */
+	migrate_disable();
+	li.target = smp_processor_id();
+	li.cpu = li.target;
+	cpu = cpumask_any_but(cpu_online_mask, li.target);
+	if (cpu >= nr_cpu_ids) {
+		migrate_enable();
+		kunit_skip(test, "needs two CPUs online");
+	}
+	li.task = kthread_create(local_ipi_sender_fn, &li, "rcu_txn_ipi");
+	if (IS_ERR(li.task)) {
+		migrate_enable();
+		KUNIT_FAIL(test, "cannot create the kthread");
+		return;
+	}
+	kthread_bind(li.task, cpu);
+
+	steals = __rcu_txn_local_steals();
+	wake_up_process(li.task);
+	start = local_clock();
+	while (k < IPI_ROUNDS ||
+	       (READ_ONCE(li.runs) < IPI_RUNS &&
+		local_clock() - start < IPI_TIMEOUT_NS))
+		local_commit(s, ++k);
+	WRITE_ONCE(li.stop, 1);
+	kthread_stop(li.task);		/* once the last IPI ran */
+	steals = __rcu_txn_local_steals() - steals;
+	count = __rcu_txn_local_count();
+	migrate_enable();
+
+	kunit_info(test, "%lu commits, %lu IPIs, %lu steals\n", k, li.runs,
+		   steals);
+	KUNIT_EXPECT_GE(test, li.runs, IPI_RUNS);
+	KUNIT_EXPECT_NE(test, li.cpu, -1);
+	KUNIT_EXPECT_TRUE(test, li.in_hardirq);
+	KUNIT_EXPECT_GT(test, steals, 0);
+	/* Every descriptor is back, in one place. */
+	KUNIT_EXPECT_EQ(test, count, RCU_TXN_LOCAL_POOL);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[0]), REUSE_V(0, k));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[1]), REUSE_V(1, k));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(li.u[0]), REUSE_V(0, li.k));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(li.u[1]), REUSE_V(1, li.k));
+	expect_no_report(test, tainted, locks);
+}
+
+/*
+ * Open one more local handle than the pool holds.  The last one warns, and
+ * its commit fails.  The others commit, and the pool gets every descriptor
+ * back.
+ */
+static void rcu_txn_test_local_exhaust(struct kunit *test)
+{
+	static struct rcu_txn txns[RCU_TXN_LOCAL_POOL + 1];
+	static void __rcu *s[RCU_TXN_LOCAL_POOL + 1][2];
+	int count = preempt_count(), within, err[RCU_TXN_LOCAL_POOL + 1];
+	unsigned int in_flight, after;
+	int i;
+
+	for (i = 0; i <= RCU_TXN_LOCAL_POOL; i++) {
+		RCU_INIT_POINTER(s[i][0], T(0));
+		RCU_INIT_POINTER(s[i][1], T(1));
+	}
+	migrate_disable();
+	kunit_warning_suppress(test) {
+		for (i = 0; i <= RCU_TXN_LOCAL_POOL; i++) {
+			rcu_txn_init_local(&txns[i]);
+			rcu_txn_record(&txns[i], &s[i][0], T(0), T(10), TAG);
+			rcu_txn_record(&txns[i], &s[i][1], T(1), T(11), TAG);
+		}
+		within = preempt_count();
+		in_flight = __rcu_txn_local_count();
+		for (i = RCU_TXN_LOCAL_POOL; i >= 0; i--)
+			err[i] = rcu_txn_commit(&txns[i]);
+		EXPECT_ONE_WARNING(test);
+	}
+	after = __rcu_txn_local_count();
+	migrate_enable();
+
+	KUNIT_EXPECT_EQ(test, preempt_count(), count);
+	if (IS_ENABLED(CONFIG_PREEMPT_COUNT))
+		KUNIT_EXPECT_EQ(test, within, count + RCU_TXN_LOCAL_POOL + 1);
+	KUNIT_EXPECT_EQ(test, in_flight, 0);
+	KUNIT_EXPECT_EQ(test, after, RCU_TXN_LOCAL_POOL);
+	for (i = 0; i < RCU_TXN_LOCAL_POOL; i++) {
+		KUNIT_EXPECT_EQ(test, err[i], 0);
+		KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[i][0]), T(10));
+	}
+	KUNIT_EXPECT_EQ(test, err[RCU_TXN_LOCAL_POOL], -ENOMEM);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[RCU_TXN_LOCAL_POOL][0]),
+			    T(0));
+}
+
+/*
+ * Task, softirq and hardirq each hold a local handle on one CPU.  The task
+ * installed its proxies.  The hardirq reads those slots, before and after it
+ * steals.
+ */
+struct local_nest {
+	struct hrtimer soft, hard;
+	void __rcu *s[2];	/* the task's, proxies installed */
+	void __rcu *u[2];	/* the softirq's */
+	void __rcu *h[2];	/* the hardirq's */
+	void *read[4];
+	bool proxy_seen;
+	bool soft_ctx, hard_ctx;
+	unsigned int hard_count;	/* pool count seen in hardirq */
+	int soft_fired, hard_fired;
+};
+
+static enum hrtimer_restart local_nest_hard_fn(struct hrtimer *timer)
+{
+	struct local_nest *n = container_of(timer, struct local_nest, hard);
+	unsigned long k;
+
+	n->hard_ctx = in_hardirq();
+	n->proxy_seen = rcu_txn_is_proxy(rcu_access_pointer(n->s[0]), TAG);
+	n->read[0] = read_slot(&n->s[0]);
+	n->read[1] = read_slot(&n->s[1]);
+	for (k = 1; k <= 2 * RCU_TXN_LOCAL_POOL; k++)
+		local_commit(n->h, k);
+	n->hard_count = __rcu_txn_local_count();
+	n->read[2] = read_slot(&n->s[0]);
+	n->read[3] = read_slot(&n->s[1]);
+	/* Pairs with the load-acquire of local_nest_soft_fn(). */
+	smp_store_release(&n->hard_fired, 1);
+	return HRTIMER_NORESTART;
+}
+
+static enum hrtimer_restart local_nest_soft_fn(struct hrtimer *timer)
+{
+	struct local_nest *n = container_of(timer, struct local_nest, soft);
+	struct rcu_txn txn;
+	u64 start;
+
+	n->soft_ctx = in_serving_softirq() && !in_hardirq();
+	rcu_txn_init_local(&txn);
+	rcu_txn_record(&txn, &n->u[0], REUSE_V(0, 0), REUSE_V(0, 1), TAG);
+	rcu_txn_record(&txn, &n->u[1], REUSE_V(1, 0), REUSE_V(1, 1), TAG);
+	hrtimer_start(&n->hard, ns_to_ktime(100 * NSEC_PER_USEC),
+		      HRTIMER_MODE_REL_PINNED_HARD);
+	start = local_clock();
+	/* Pairs with the store-release of local_nest_hard_fn(). */
+	while (!smp_load_acquire(&n->hard_fired) &&
+	       local_clock() - start < NSEC_PER_SEC)
+		cpu_relax();
+	rcu_txn_commit(&txn);
+	/* Pairs with the load-acquire of rcu_txn_test_local_nest(). */
+	smp_store_release(&n->soft_fired, 1);
+	return HRTIMER_NORESTART;
+}
+
+static void rcu_txn_test_local_nest(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	int locks = debug_locks;
+	static struct local_nest n;
+	struct rcu_txn txn;
+	unsigned int count;
+	u64 start;
+	int i;
+
+	if (IS_ENABLED(CONFIG_PREEMPT_RT))
+		kunit_skip(test, "softirq hrtimers run in a thread on PREEMPT_RT");
+	memset(&n, 0, sizeof(n));
+	RCU_INIT_POINTER(n.s[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(n.s[1], REUSE_V(1, 0));
+	RCU_INIT_POINTER(n.u[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(n.u[1], REUSE_V(1, 0));
+	RCU_INIT_POINTER(n.h[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(n.h[1], REUSE_V(1, 0));
+	hrtimer_setup(&n.soft, local_nest_soft_fn, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_PINNED_SOFT);
+	hrtimer_setup(&n.hard, local_nest_hard_fn, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_PINNED_HARD);
+
+	migrate_disable();
+	rcu_txn_init_local(&txn);
+	rcu_txn_record(&txn, &n.s[0], REUSE_V(0, 0), REUSE_V(0, 1), TAG);
+	rcu_txn_record(&txn, &n.s[1], REUSE_V(1, 0), REUSE_V(1, 1), TAG);
+	for (i = 0; i < 2; i++)
+		__rcu_txn_record_install(&txn.desc->group, &txn.records[i]);
+	hrtimer_start(&n.soft, ns_to_ktime(100 * NSEC_PER_USEC),
+		      HRTIMER_MODE_REL_PINNED_SOFT);
+	start = local_clock();
+	/* Pairs with the store-release of local_nest_soft_fn(). */
+	while (!smp_load_acquire(&n.soft_fired) &&
+	       local_clock() - start < 2 * NSEC_PER_SEC)
+		cpu_relax();
+	__rcu_txn_group_commit(&txn.desc->group);
+	for (i = 0; i < 2; i++)
+		__rcu_txn_record_settle(&txn.records[i]);
+	__rcu_txn_local_retire(txn.desc);
+	__rcu_txn_done(&txn);
+	hrtimer_cancel(&n.soft);
+	hrtimer_cancel(&n.hard);
+	count = __rcu_txn_local_count();
+	migrate_enable();
+
+	KUNIT_ASSERT_EQ(test, n.soft_fired, 1);
+	KUNIT_ASSERT_EQ(test, n.hard_fired, 1);
+	KUNIT_EXPECT_TRUE(test, n.soft_ctx);
+	KUNIT_EXPECT_TRUE(test, n.hard_ctx);
+	KUNIT_EXPECT_TRUE(test, n.proxy_seen);
+	/* Task and softirq each hold one: the hardirq saw the 14 others. */
+	KUNIT_EXPECT_EQ(test, n.hard_count, RCU_TXN_LOCAL_POOL - 2);
+	KUNIT_EXPECT_PTR_EQ(test, n.read[0], REUSE_V(0, 0));
+	KUNIT_EXPECT_PTR_EQ(test, n.read[1], REUSE_V(1, 0));
+	KUNIT_EXPECT_PTR_EQ(test, n.read[2], REUSE_V(0, 0));
+	KUNIT_EXPECT_PTR_EQ(test, n.read[3], REUSE_V(1, 0));
+	KUNIT_EXPECT_EQ(test, count, RCU_TXN_LOCAL_POOL);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(n.s[0]), REUSE_V(0, 1));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(n.u[1]), REUSE_V(1, 1));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(n.h[0]),
+			    REUSE_V(0, 2 * RCU_TXN_LOCAL_POOL));
+	expect_no_report(test, tainted, locks);
+}
+
+/*
+ * A task waits for the resolve sections, again and again.  Meanwhile, IPIs on
+ * its CPU commit more than a pool's worth each, so that each one steals.  The
+ * steal waits too, in hardirq context, on the same CPU.  Both waits disable
+ * interrupts.  So the IPI lands between two waits of the task, never within
+ * one.
+ */
+static void local_steal_ipi_fn(void *arg)
+{
+	struct local_ipi *li = arg;
+	int i;
+
+	for (i = 0; i < RCU_TXN_LOCAL_POOL + 1; i++)
+		local_commit(li->u, ++li->k);
+	/* Pairs with the load-acquire of local_ipi_sender_fn(). */
+	smp_store_release(&li->runs, li->runs + 1);
+}
+
+static void rcu_txn_test_local_wait_irq(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	int locks = debug_locks;
+	static struct local_ipi li;
+	unsigned long steals, syncs = 0;
+	unsigned int cpu;
+	u64 start;
+
+	memset(&li, 0, sizeof(li));
+	RCU_INIT_POINTER(li.u[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(li.u[1], REUSE_V(1, 0));
+	INIT_CSD(&li.csd, local_steal_ipi_fn, &li);
+
+	migrate_disable();
+	li.target = smp_processor_id();
+	cpu = cpumask_any_but(cpu_online_mask, li.target);
+	if (cpu >= nr_cpu_ids) {
+		migrate_enable();
+		kunit_skip(test, "needs two CPUs online");
+	}
+	li.task = kthread_create(local_ipi_sender_fn, &li, "rcu_txn_ipi");
+	if (IS_ERR(li.task)) {
+		migrate_enable();
+		KUNIT_FAIL(test, "cannot create the kthread");
+		return;
+	}
+	kthread_bind(li.task, cpu);
+	steals = __rcu_txn_local_steals();
+	wake_up_process(li.task);
+	start = local_clock();
+	while (READ_ONCE(li.runs) < 20000 &&
+	       local_clock() - start < IPI_TIMEOUT_NS) {
+		__rcu_txn_synchronize_resolve();
+		syncs++;
+	}
+	WRITE_ONCE(li.stop, 1);
+	kthread_stop(li.task);
+	steals = __rcu_txn_local_steals() - steals;
+	migrate_enable();
+
+	kunit_info(test, "%lu waits, %lu IPIs, %lu steals\n",
+		   syncs, li.runs, steals);
+	KUNIT_EXPECT_GT(test, syncs, 0);
+	KUNIT_EXPECT_GT(test, steals, 0);
+	expect_no_report(test, tainted, locks);
+}
+
+#ifdef CONFIG_X86_LOCAL_APIC
+/*
+ * Readers in NMI, in four phases:
+ *
+ * - Phase 1: every CPU reads from NMI two slots that hold installed proxies,
+ *   before the flip.  They resolve to the old values.
+ * - Phase 2: still before the flip, an NMI reader nests in a resolve section
+ *   of its CPU.  It resolves to the old values too.
+ * - Phase 3: as phase 1, after the flip.  They resolve to the new values.
+ * - Phase 4: NMIs read the slots that their own CPU commits, in a burst of
+ *   local transactions.  They land in commits and in the busy-wait of steals.
+ *   Each slot's values must never go backwards.
+ */
+struct nmi_read {
+	void __rcu *s[2];
+	void __rcu *u[2];
+	int armed;		/* 1: read s[] once per NMI; 2: read u[] */
+	atomic_t hits;
+	void *seen[NR_CPUS][2];
+	bool not_nmi;
+	unsigned long last[2];	/* phase 4: last round seen per slot */
+	unsigned long reads, proxies, violations;
+	int target, stop;
+};
+
+static struct nmi_read pn;
+
+static int nmi_read_handler(unsigned int cmd, struct pt_regs *regs)
+{
+	int armed = READ_ONCE(pn.armed);
+	int cpu = smp_processor_id();
+	int i;
+
+	if (!armed)
+		return NMI_DONE;
+	if (!in_nmi())
+		pn.not_nmi = true;
+	if (armed == 1) {
+		for (i = 0; i < 2; i++)
+			pn.seen[cpu][i] = read_slot(&pn.s[i]);
+		atomic_inc(&pn.hits);
+		return NMI_HANDLED;
+	}
+	if (cpu != pn.target)
+		return NMI_HANDLED;
+	for (i = 0; i < 2; i++) {
+		unsigned long n;
+		void *v, *t;
+
+		rcu_read_lock();
+		v = rcu_dereference(pn.u[i]);
+		if (rcu_txn_is_proxy(v, TAG))
+			pn.proxies++;
+		t = rcu_txn_resolve(&pn.u[i], v, TAG);
+		rcu_read_unlock();
+		n = ((unsigned long)t >> 8) - 1;
+		if ((n & 1) != i || n / 2 < pn.last[i])
+			pn.violations++;
+		else
+			pn.last[i] = n / 2;
+		pn.reads++;
+	}
+	atomic_inc(&pn.hits);
+	return NMI_HANDLED;
+}
+
+static bool nmi_read_all(int want)
+{
+	u64 start = local_clock();
+
+	atomic_set(&pn.hits, 0);
+	__apic_send_IPI_mask(cpu_online_mask, NMI_VECTOR);
+	while (atomic_read(&pn.hits) < want &&
+	       local_clock() - start < NSEC_PER_SEC)
+		cpu_relax();
+	return atomic_read(&pn.hits) >= want;
+}
+
+static int nmi_read_sender_fn(void *arg)
+{
+	while (!READ_ONCE(pn.stop)) {
+		__apic_send_IPI_mask(cpumask_of(pn.target), NMI_VECTOR);
+		udelay(2);
+	}
+	park_until_stopped();
+	return 0;
+}
+
+static void rcu_txn_test_nmi_reader(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	int locks = debug_locks;
+	struct task_struct *task;
+	unsigned long flags, k = 0, steals;
+	bool ok[3], old_ok = true, new_ok = true;
+	void *nested[2];
+	struct rcu_txn txn;
+	unsigned int cpu, other, count;
+	int i, idx, online;
+
+	memset(&pn, 0, sizeof(pn));
+	RCU_INIT_POINTER(pn.s[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(pn.s[1], REUSE_V(1, 0));
+	RCU_INIT_POINTER(pn.u[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(pn.u[1], REUSE_V(1, 0));
+	KUNIT_ASSERT_EQ(test, 0, register_nmi_handler(NMI_LOCAL,
+			nmi_read_handler, NMI_FLAG_FIRST, "rcu_txn_kunit"));
+
+	cpus_read_lock();
+	migrate_disable();
+	online = num_online_cpus();
+	pn.target = smp_processor_id();
+	other = cpumask_any_but(cpu_online_mask, pn.target);
+
+	rcu_txn_init_local(&txn);
+	rcu_txn_record(&txn, &pn.s[0], REUSE_V(0, 0), REUSE_V(0, 1), TAG);
+	rcu_txn_record(&txn, &pn.s[1], REUSE_V(1, 0), REUSE_V(1, 1), TAG);
+	for (i = 0; i < 2; i++)
+		__rcu_txn_record_install(&txn.desc->group, &txn.records[i]);
+	WRITE_ONCE(pn.armed, 1);
+	/* Phase 1: old everywhere. */
+	ok[0] = nmi_read_all(online);
+	for_each_online_cpu(cpu)
+		if (pn.seen[cpu][0] != REUSE_V(0, 0) ||
+		    pn.seen[cpu][1] != REUSE_V(1, 0))
+			old_ok = false;
+	/* Phase 2: nest an NMI reader in a section of this CPU. */
+	local_irq_save(flags);
+	idx = __rcu_txn_resolve_enter();
+	atomic_set(&pn.hits, 0);
+	__apic_send_IPI_mask(cpumask_of(pn.target), NMI_VECTOR);
+	for (i = 0; i < 1000000 && !atomic_read(&pn.hits); i++)
+		cpu_relax();
+	ok[2] = atomic_read(&pn.hits) > 0;
+	nested[0] = pn.seen[pn.target][0];
+	nested[1] = pn.seen[pn.target][1];
+	__rcu_txn_resolve_exit(idx);
+	local_irq_restore(flags);
+	/* Phase 3: new everywhere. */
+	__rcu_txn_group_commit(&txn.desc->group);
+	ok[1] = nmi_read_all(online);
+	for_each_online_cpu(cpu)
+		if (pn.seen[cpu][0] != REUSE_V(0, 1) ||
+		    pn.seen[cpu][1] != REUSE_V(1, 1))
+			new_ok = false;
+	for (i = 0; i < 2; i++)
+		__rcu_txn_record_settle(&txn.records[i]);
+	__rcu_txn_local_retire(txn.desc);
+	__rcu_txn_done(&txn);
+
+	/* Phase 4: NMIs against a burst of local commits on this CPU. */
+	steals = __rcu_txn_local_steals();
+	if (other < nr_cpu_ids) {
+		task = kthread_create(nmi_read_sender_fn, NULL, "rcu_txn_nmi");
+		if (!IS_ERR(task)) {
+			kthread_bind(task, other);
+			WRITE_ONCE(pn.armed, 2);
+			wake_up_process(task);
+			while (k < 200000) {
+				struct rcu_txn t2;
+
+				/* Commit round k of both slots. */
+				k++;
+				rcu_txn_init_local(&t2);
+				for (i = 0; i < 2; i++)
+					rcu_txn_record(&t2, &pn.u[i],
+						       REUSE_V(i, k - 1),
+						       REUSE_V(i, k), TAG);
+				rcu_txn_commit(&t2);
+			}
+			WRITE_ONCE(pn.stop, 1);
+			kthread_stop(task);
+		}
+	}
+	steals = __rcu_txn_local_steals() - steals;
+	count = __rcu_txn_local_count();
+	WRITE_ONCE(pn.armed, 0);
+	migrate_enable();
+	cpus_read_unlock();
+	unregister_nmi_handler(NMI_LOCAL, "rcu_txn_kunit");
+
+	kunit_info(test, "phase 4: %lu commits, %lu NMI reads, %lu through a proxy, %lu steals\n",
+		   k, pn.reads, pn.proxies, steals);
+	KUNIT_EXPECT_TRUE(test, ok[0]);
+	KUNIT_EXPECT_TRUE(test, ok[1]);
+	KUNIT_EXPECT_TRUE(test, ok[2]);
+	KUNIT_EXPECT_FALSE(test, pn.not_nmi);
+	KUNIT_EXPECT_TRUE(test, old_ok);
+	KUNIT_EXPECT_TRUE(test, new_ok);
+	KUNIT_EXPECT_PTR_EQ(test, nested[0], REUSE_V(0, 0));
+	KUNIT_EXPECT_PTR_EQ(test, nested[1], REUSE_V(1, 0));
+	KUNIT_EXPECT_EQ(test, pn.violations, 0);
+	KUNIT_EXPECT_GT(test, pn.reads, 0);
+	KUNIT_EXPECT_GT(test, steals, 0);
+	KUNIT_EXPECT_EQ(test, count, RCU_TXN_LOCAL_POOL);
+	expect_no_report(test, tainted, locks);
+}
+#else
+static void rcu_txn_test_nmi_reader(struct kunit *test)
+{
+	kunit_skip(test, "needs x86 local APIC");
+}
+#endif
 
 static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_single_record),
@@ -2880,6 +3896,14 @@ static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_local_steal_waits),
 	KUNIT_CASE_SLOW(rcu_txn_test_local_reuse),
 	KUNIT_CASE(rcu_txn_test_local_atomic),
+	KUNIT_CASE(rcu_txn_test_local_steal_waits_all),
+	KUNIT_CASE_SLOW(rcu_txn_test_local_concurrent),
+	KUNIT_CASE(rcu_txn_test_local_irq),
+	KUNIT_CASE_SLOW(rcu_txn_test_local_irq_storm),
+	KUNIT_CASE(rcu_txn_test_local_exhaust),
+	KUNIT_CASE(rcu_txn_test_local_nest),
+	KUNIT_CASE(rcu_txn_test_local_wait_irq),
+	KUNIT_CASE(rcu_txn_test_nmi_reader),
 	{}
 };
 
