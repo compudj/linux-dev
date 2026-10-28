@@ -1222,8 +1222,8 @@ struct mm_struct {
 		 */
 		atomic_t mm_users;
 
-		/* MM CID related storage */
-		struct mm_mm_cid mm_cid;
+		/* MM CID related storage: the mm's cid domain */
+		struct cid_domain mm_cid;
 
 		/* sched_cache related statistics */
 		struct sched_cache_group *sched_cache_grp;
@@ -1590,7 +1590,7 @@ void mm_init_cid(struct mm_struct *mm, struct task_struct *p);
 
 static inline int mm_alloc_cid_noprof(struct mm_struct *mm, struct task_struct *p)
 {
-	mm->mm_cid.pcpu = alloc_percpu_noprof(struct mm_cid_pcpu);
+	mm->mm_cid.pcpu = alloc_percpu_noprof(struct cid_pcpu);
 	if (!mm->mm_cid.pcpu)
 		return -ENOMEM;
 	mm_init_cid(mm, p);
