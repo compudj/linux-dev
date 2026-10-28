@@ -9,11 +9,52 @@
 
 /*
  * The steps of a commit that installs proxies: see __rcu_txn_commit_desc() in
- * rcu_txn.c.  The KUnit tests include this as well, to stage a transaction
- * between two steps.
+ * rcu_txn.c, and the resolve sections a proxy is read in.  The KUnit tests
+ * include this as well, to stage a transaction between two steps, and to hold
+ * a resolve section open.
  */
 
 #include <linux/rcu_txn.h>
+
+/*
+ * Resolve a proxy to its current target.
+ *
+ * @proxy must come from a load of the slot that holds it, within the resolve
+ * section that this resolution is in.  What orders the loads below is described
+ * under "Store-release / load-acquire pairs" at the top of <linux/rcu_txn.h>.
+ *
+ * The selector indexes proxy->ptr[] directly, so resolution is a data
+ * dependency rather than a conditional branch.
+ */
+static inline void *__rcu_txn_proxy_resolve(const struct rcu_txn_record *proxy)
+{
+	/*
+	 * Load-acquire (A) pairs with the store-release (B) of
+	 * __rcu_txn_group_commit().
+	 */
+	return proxy->ptr[smp_load_acquire(&proxy->group->selector)];
+}
+
+/*
+ * Resolve sections: see lib/rcu_txn.c.  A CPU keeps a sequence count per
+ * nesting level of its sections.  With interrupts disabled, only an NMI, or an
+ * exception that acts as one, enters a section within another: NMI, then a
+ * machine check, leaves room for one more.
+ */
+#define RCU_TXN_RESOLVE_NEST	4
+
+/* Enter a resolve section, with interrupts disabled.  Returns its level. */
+unsigned int __rcu_txn_resolve_enter(void);
+
+/* Leave the section of @level, which __rcu_txn_resolve_enter() returned. */
+void __rcu_txn_resolve_exit(unsigned int level);
+
+/*
+ * Wait for the resolve sections in flight, without sleeping.  On return, no
+ * reader can still use a proxy that was settled away before the call.  Any
+ * context but NMI and a resolve section.
+ */
+void __rcu_txn_synchronize_resolve(void);
 
 static inline void __rcu_txn_group_init(struct rcu_txn_group *group)
 {

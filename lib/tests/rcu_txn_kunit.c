@@ -7,16 +7,21 @@
 
 #include <kunit/test.h>
 #include <linux/bug.h>
+#include <linux/cpumask.h>
 #include <linux/debug_locks.h>
+#include <linux/delay.h>
+#include <linux/irqflags.h>
 #include <linux/kthread.h>
 #include <linux/list_bl.h>
 #include <linux/minmax.h>
+#include <linux/module.h>
 #include <linux/panic.h>
 #include <linux/rcu_txn.h>
 #include <linux/rcu_txn_hlist.h>
 #include <linux/rcu_txn_list.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
+#include <linux/sched/clock.h>
 #include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -58,7 +63,7 @@ static void *read_slot(void __rcu **slot)
 	void *v;
 
 	rcu_read_lock();
-	v = rcu_txn_resolve(rcu_dereference(*slot), TAG);
+	v = rcu_txn_resolve(slot, rcu_dereference(*slot), TAG);
 	rcu_read_unlock();
 	return v;		/* a test value: never dereferenced */
 }
@@ -2076,6 +2081,295 @@ static void rcu_txn_test_commit_atomic(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s2), T(21));
 }
 
+/*
+ * Resolve sections
+ * ================
+ *
+ * A reader resolves a proxy within a resolve section, and
+ * __rcu_txn_synchronize_resolve() waits for the sections in flight, so that a
+ * descriptor can be reused once it returns.  See lib/rcu_txn.c.
+ */
+
+/*
+ * A section entered within another, as by an NMI, takes the next level, and a
+ * resolve within it takes the one after.
+ */
+static void rcu_txn_test_resolve_nest(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	unsigned int outer, inner;
+	struct rcu_txn_group group;
+	struct rcu_txn_record rec;
+	unsigned long flags;
+	void *v;
+
+	__rcu_txn_group_init(&group);
+	__rcu_txn_record_set(&rec, &slot, T(0), T(1), TAG);
+	__rcu_txn_record_install(&group, &rec);
+
+	local_irq_save(flags);
+	outer = __rcu_txn_resolve_enter();
+	inner = __rcu_txn_resolve_enter();
+	v = rcu_txn_resolve(&slot, rcu_dereference_raw(slot), TAG);
+	__rcu_txn_resolve_exit(inner);
+	__rcu_txn_resolve_exit(outer);
+	local_irq_restore(flags);
+
+	KUNIT_EXPECT_EQ(test, outer, 0);
+	KUNIT_EXPECT_EQ(test, inner, 1);
+	KUNIT_EXPECT_PTR_EQ(test, v, T(0));
+
+	__rcu_txn_group_commit(&group);
+	__rcu_txn_record_settle(&rec);
+	/* No section in flight here: the wait returns. */
+	__rcu_txn_synchronize_resolve();
+	KUNIT_EXPECT_PTR_EQ(test, read_slot(&slot), T(1));
+}
+
+/*
+ * A kthread holds resolve sections open on another CPU, @levels of them nested
+ * as by an NMI, each for PARK_HOLD_NS, innermost first.  Just before it leaves
+ * the outermost, it sets @done.
+ */
+#define PARK_HOLD_NS	(20 * NSEC_PER_MSEC)
+
+struct park {
+	int levels;
+	int entered;	/* every section is open */
+	int done;
+};
+
+static int park_fn(void *arg)
+{
+	struct park *p = arg;
+	unsigned int level[2];
+	unsigned long flags;
+	int i;
+
+	local_irq_save(flags);
+	for (i = 0; i < p->levels; i++)
+		level[i] = __rcu_txn_resolve_enter();
+	/* Pairs with the test's load-acquire. */
+	smp_store_release(&p->entered, 1);
+	for (i = p->levels - 1; i >= 0; i--) {
+		u64 start = local_clock();
+
+		while (local_clock() - start < PARK_HOLD_NS)
+			cpu_relax();
+		if (!i)
+			WRITE_ONCE(p->done, 1);
+		__rcu_txn_resolve_exit(level[i]);
+	}
+	local_irq_restore(flags);
+
+	set_current_state(TASK_INTERRUPTIBLE);
+	while (!kthread_should_stop()) {
+		schedule();
+		set_current_state(TASK_INTERRUPTIBLE);
+	}
+	__set_current_state(TASK_RUNNING);
+	return 0;
+}
+
+/*
+ * The wait outlasts a section in flight: once it returns, the store that the
+ * section makes last is visible.  With two nested sections, the wait outlasts
+ * the outer one, which is still in flight once the inner one is over: a single
+ * count per CPU would have looked idle then.
+ */
+static void rcu_txn_test_resolve_wait(struct kunit *test)
+{
+	struct task_struct *task;
+	struct park p;
+	int levels, done;
+	unsigned int cpu;
+
+	for (levels = 1; levels <= 2; levels++) {
+		p = (struct park){ .levels = levels };
+
+		/* The test spins on its CPU, the kthread on another. */
+		migrate_disable();
+		cpu = cpumask_any_but(cpu_online_mask, smp_processor_id());
+		if (cpu >= nr_cpu_ids) {
+			migrate_enable();
+			kunit_skip(test, "needs two CPUs online");
+		}
+		task = kthread_create(park_fn, &p, "rcu_txn_park");
+		if (IS_ERR(task)) {
+			migrate_enable();
+			KUNIT_FAIL(test, "cannot create the kthread");
+			return;
+		}
+		kthread_bind(task, cpu);
+		wake_up_process(task);
+		/* Pairs with the store-release of park_fn(). */
+		while (!smp_load_acquire(&p.entered))
+			cpu_relax();
+		__rcu_txn_synchronize_resolve();
+		done = READ_ONCE(p.done);
+		migrate_enable();
+		kthread_stop(task);
+
+		KUNIT_EXPECT_EQ_MSG(test, done, 1, "%d nested section(s)",
+				    levels);
+	}
+}
+
+/*
+ * Reuse of records once the wait returns, against concurrent readers.
+ *
+ * The writer commits two slots, round after round, with the same two records
+ * and the same flip group, as a descriptor reused at once would.  Once it has
+ * settled both slots, it waits for the resolve sections in flight, then
+ * poisons the records, as the next transaction to use the descriptor may.
+ * Each round gives the slots the records the other way round, so that a stale
+ * proxy, if one were resolved, would read the other slot's values.
+ *
+ * Slot i holds REUSE_V(i, k) after round k.  A reader checks every target it
+ * resolves: never the poison, always a value of its slot, and never of a round
+ * older than the last one it read there.  The writer holds each round's proxies
+ * installed for a while before and after the flip, so that the readers resolve
+ * many of them.
+ */
+#define REUSE_READERS	4
+#define REUSE_ROUNDS	20000
+#define REUSE_V(i, k)	T(2 * (k) + (i))
+#define REUSE_POISON	((void *)(0xdeadUL << 8))
+
+struct reuse_desc {
+	struct rcu_txn_group group;
+	struct rcu_txn_record rec[2];
+};
+
+struct reuse {
+	void __rcu *slot[2];
+	struct reuse_desc desc;
+	struct rcu_txn_group poison_group;	/* selector 1: reads ptr[1] */
+};
+
+struct reuse_reader {
+	struct reuse *reuse;
+	struct task_struct *task;
+	long reads;
+	long proxies;		/* loads that found a proxy */
+	long violations;
+};
+
+static int reuse_reader_fn(void *arg)
+{
+	struct reuse_reader *r = arg;
+	struct reuse *ru = r->reuse;
+	unsigned long last[2] = { 0, 0 };
+	int i;
+
+	while (!kthread_should_stop()) {
+		for (i = 0; i < 2; i++) {
+			unsigned long n;
+			void *v, *t;
+
+			rcu_read_lock();
+			v = rcu_dereference(ru->slot[i]);
+			if (rcu_txn_is_proxy(v, TAG))
+				r->proxies++;
+			t = rcu_txn_resolve(&ru->slot[i], v, TAG);
+			rcu_read_unlock();
+
+			n = ((unsigned long)t >> 8) - 1;	/* T(n) */
+			if (t == REUSE_POISON || (n & 1) != i ||
+			    n / 2 < last[i])
+				r->violations++;
+			else
+				last[i] = n / 2;
+			r->reads++;
+		}
+		if (!(r->reads & 1023))
+			cond_resched();
+	}
+	return 0;
+}
+
+static void reuse_round(struct reuse *ru, unsigned long k)
+{
+	struct reuse_desc *d = &ru->desc;
+	struct rcu_txn_record *r0 = &d->rec[k & 1];
+	struct rcu_txn_record *r1 = &d->rec[!(k & 1)];
+	int i;
+
+	__rcu_txn_group_init(&d->group);
+	__rcu_txn_record_set(r0, &ru->slot[0], REUSE_V(0, k - 1),
+			     REUSE_V(0, k), TAG);
+	__rcu_txn_record_set(r1, &ru->slot[1], REUSE_V(1, k - 1),
+			     REUSE_V(1, k), TAG);
+	__rcu_txn_record_install(&d->group, r0);
+	__rcu_txn_record_install(&d->group, r1);
+	udelay(1);
+	__rcu_txn_group_commit(&d->group);
+	udelay(1);
+	__rcu_txn_record_settle(r0);
+	__rcu_txn_record_settle(r1);
+
+	__rcu_txn_synchronize_resolve();
+	for (i = 0; i < 2; i++) {
+		d->rec[i].ptr[0] = REUSE_POISON;
+		d->rec[i].ptr[1] = REUSE_POISON;
+		d->rec[i].group = &ru->poison_group;
+	}
+}
+
+static void rcu_txn_test_resolve_reuse(struct kunit *test)
+{
+	struct reuse_reader *readers;
+	long reads = 0, proxies = 0, violations = 0;
+	struct reuse *ru;
+	unsigned long k;
+	int i;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs online");
+
+	/* kmalloc() aligns the records as a descriptor's: see rcu_txn.c. */
+	ru = kunit_kzalloc(test, sizeof(*ru), GFP_KERNEL);
+	readers = kunit_kcalloc(test, REUSE_READERS, sizeof(*readers),
+				GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ru);
+	KUNIT_ASSERT_NOT_NULL(test, readers);
+	RCU_INIT_POINTER(ru->slot[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(ru->slot[1], REUSE_V(1, 0));
+	ru->poison_group.selector = 1;
+
+	for (i = 0; i < REUSE_READERS; i++) {
+		readers[i].reuse = ru;
+		readers[i].task = kthread_run(reuse_reader_fn, &readers[i],
+					      "rcu_txn_reuse/%d", i);
+		if (IS_ERR(readers[i].task))
+			readers[i].task = NULL;
+	}
+
+	for (k = 1; k <= REUSE_ROUNDS; k++) {
+		reuse_round(ru, k);
+		if (!(k & 255))
+			cond_resched();
+	}
+
+	for (i = 0; i < REUSE_READERS; i++) {
+		if (readers[i].task)
+			kthread_stop(readers[i].task);
+		reads += readers[i].reads;
+		proxies += readers[i].proxies;
+		violations += readers[i].violations;
+	}
+
+	kunit_info(test, "%ld reads, %ld through a proxy\n", reads, proxies);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(ru->slot[0]),
+			    REUSE_V(0, REUSE_ROUNDS));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(ru->slot[1]),
+			    REUSE_V(1, REUSE_ROUNDS));
+	/* The readers raced the commits... */
+	KUNIT_EXPECT_GT(test, proxies, 0);
+	/* ...and never read a record once it was reused. */
+	KUNIT_EXPECT_EQ(test, violations, 0);
+}
+
 static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_single_record),
 	KUNIT_CASE(rcu_txn_test_multi_record),
@@ -2136,6 +2430,9 @@ static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_list_debug_disjoint_compose),
 	KUNIT_CASE_SLOW(rcu_txn_test_list_concurrent),
 	KUNIT_CASE(rcu_txn_test_commit_atomic),
+	KUNIT_CASE(rcu_txn_test_resolve_nest),
+	KUNIT_CASE(rcu_txn_test_resolve_wait),
+	KUNIT_CASE_SLOW(rcu_txn_test_resolve_reuse),
 	{}
 };
 
@@ -2148,3 +2445,4 @@ kunit_test_suite(rcu_txn_test_suite);
 
 MODULE_DESCRIPTION("KUnit tests of the single-writer RCU pseudo-transactions");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");

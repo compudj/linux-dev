@@ -37,7 +37,7 @@ be reading it: an allocation, which can fail, and a deferred free for every
 update, where ``rcu_assign_pointer()`` needs neither.  The reader pays a test of
 the low bits of every pointer it loads, which is nearly free: only while a
 commit is in flight on that pointer does the reader also read the descriptor,
-with three more loads, one of them an acquire.
+within a *resolve section*, with interrupts disabled and a full barrier.
 
 How it works
 ============
@@ -90,10 +90,20 @@ A reader loads a slot with ``rcu_txn_dereference()`` instead of
 ``rcu_txn_dereference()`` is ``rcu_dereference()`` followed by
 ``rcu_txn_resolve()``.  A reader that already has the loaded value, for
 instance because it tests other bits of it, calls ``rcu_txn_resolve()``
-itself.
+itself, with the slot it loaded the value from.
 
-The load and the resolution must happen in one RCU read-side critical section:
-the record a proxy points at is freed with ``kfree_rcu()``.
+When the value is a proxy, ``rcu_txn_resolve()`` resolves it within a resolve
+section.  With interrupts disabled, the section marks its CPU busy, loads the
+slot again and resolves what the slot holds then, and marks its CPU idle.  The
+engine can thus wait for every reader that may still read a descriptor without
+a grace period, and without sleeping: it waits, busy, for the resolve sections
+in flight, which are short.  A resolve section is also an RCU read-side
+critical section, and a reader may resolve a slot in any context, NMI
+included.
+
+The load and the resolution must happen in one RCU read-side critical section,
+as must every use of the target: a descriptor is freed with ``kfree_rcu()``,
+and the embedder frees its nodes after a grace period.
 
 Writers
 =======
