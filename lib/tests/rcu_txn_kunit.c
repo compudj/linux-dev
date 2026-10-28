@@ -1334,10 +1334,7 @@ static void list_build(struct kunit *test, struct rcu_txn_list_head *head,
 	int i;
 
 	for (i = 0; i < nr; i++)
-		KUNIT_ASSERT_EQ(test,
-				rcu_txn_list_add_tail_rcu(ln_new(test, keys[i]),
-							  head, GFP_KERNEL),
-				0);
+		rcu_txn_list_add_tail_rcu(ln_new(test, keys[i]), head);
 }
 
 /* The test is the list's only writer, and owns every node until it ends. */
@@ -1396,25 +1393,14 @@ static void rcu_txn_test_list_add(struct kunit *test)
 	list_expect(test, &head, NULL, 0);
 
 	for (i = 1; i <= 3; i++)
-		KUNIT_ASSERT_EQ(test,
-				rcu_txn_list_add_rcu(ln_new(test, i), &head,
-						     GFP_KERNEL),
-				0);
+		rcu_txn_list_add_rcu(ln_new(test, i), &head);
 	list_expect(test, &head, at_head, ARRAY_SIZE(at_head));
 
 	list_build(test, &tail, keys, ARRAY_SIZE(keys));
 	list_expect(test, &tail, keys, ARRAY_SIZE(keys));
 
-	KUNIT_EXPECT_EQ(test,
-			rcu_txn_list_add_after_rcu(ln_new(test, 9),
-						   list_find(&tail, 2),
-						   GFP_KERNEL),
-			0);
-	KUNIT_EXPECT_EQ(test,
-			rcu_txn_list_add_before_rcu(ln_new(test, 8),
-						    list_find(&tail, 2),
-						    GFP_KERNEL),
-			0);
+	rcu_txn_list_add_after_rcu(ln_new(test, 9), list_find(&tail, 2));
+	rcu_txn_list_add_before_rcu(ln_new(test, 8), list_find(&tail, 2));
 	list_expect(test, &tail, middle, ARRAY_SIZE(middle));
 }
 
@@ -1428,7 +1414,7 @@ static void rcu_txn_test_list_del(struct kunit *test)
 
 	list_build(test, &head, keys, ARRAY_SIZE(keys));
 	removed = list_find(&head, 3);
-	KUNIT_EXPECT_EQ(test, rcu_txn_list_del_rcu(removed, GFP_KERNEL), 0);
+	rcu_txn_list_del_rcu(removed);
 	list_expect(test, &head, middle, ARRAY_SIZE(middle));
 	/* A reader standing on the removed node leaves in either direction. */
 	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_check(removed, true),
@@ -1436,12 +1422,12 @@ static void rcu_txn_test_list_del(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(removed, true),
 			    list_find(&head, 2));
 
-	rcu_txn_list_del_rcu(list_find(&head, 1), GFP_KERNEL);	/* first */
-	rcu_txn_list_del_rcu(list_find(&head, 5), GFP_KERNEL);	/* last */
+	rcu_txn_list_del_rcu(list_find(&head, 1));	/* first */
+	rcu_txn_list_del_rcu(list_find(&head, 5));	/* last */
 	list_expect(test, &head, ends, ARRAY_SIZE(ends));
 
-	rcu_txn_list_del_rcu(list_find(&head, 2), GFP_KERNEL);
-	rcu_txn_list_del_rcu(list_find(&head, 4), GFP_KERNEL);
+	rcu_txn_list_del_rcu(list_find(&head, 2));
+	rcu_txn_list_del_rcu(list_find(&head, 4));
 	list_expect(test, &head, NULL, 0);
 }
 
@@ -1452,10 +1438,7 @@ static void rcu_txn_test_list_replace(struct kunit *test)
 	static const int want[] = { 1, 22, 3 };
 
 	list_build(test, &head, keys, ARRAY_SIZE(keys));
-	KUNIT_EXPECT_EQ(test,
-			rcu_txn_list_replace_rcu(list_find(&head, 2),
-						 ln_new(test, 22), GFP_KERNEL),
-			0);
+	rcu_txn_list_replace_rcu(list_find(&head, 2), ln_new(test, 22));
 	list_expect(test, &head, want, ARRAY_SIZE(want));
 }
 
@@ -1584,15 +1567,14 @@ static void rcu_txn_test_list_move(struct kunit *test)
 	e3 = list_find(&head, 3);
 	e4 = list_find(&head, 4);
 
-	KUNIT_EXPECT_EQ(test, rcu_txn_list_move_rcu(e4, &head, GFP_KERNEL), 0);
+	rcu_txn_list_move_rcu(e4, &head);
 	list_expect(test, &head, front, ARRAY_SIZE(front));
-	KUNIT_EXPECT_EQ(test,
-			rcu_txn_list_move_tail_rcu(e4, &head, GFP_KERNEL), 0);
+	rcu_txn_list_move_tail_rcu(e4, &head);
 	list_expect(test, &head, tail, ARRAY_SIZE(tail));
 	/* Past its next, then back before it: the neighbourhoods overlap. */
-	KUNIT_EXPECT_EQ(test, rcu_txn_list_move_after_rcu(e2, e3, GFP_KERNEL), 0);
+	rcu_txn_list_move_after_rcu(e2, e3);
 	list_expect(test, &head, past_next, ARRAY_SIZE(past_next));
-	KUNIT_EXPECT_EQ(test, rcu_txn_list_move_before_rcu(e2, e3, GFP_KERNEL), 0);
+	rcu_txn_list_move_before_rcu(e2, e3);
 	list_expect(test, &head, tail, ARRAY_SIZE(tail));
 
 	/* Where it already is: nothing is recorded. */
@@ -1852,23 +1834,18 @@ static bool conc_insert(struct conc *c, int key)
 			break;
 		}
 	}
-	if (rcu_txn_list_add_before_rcu(&n->node, succ, GFP_KERNEL)) {
-		kfree(n);
-		return false;
-	}
+	rcu_txn_list_add_before_rcu(&n->node, succ);
 	c->live[key] = n;
 	return true;
 }
 
-static bool conc_del(struct conc *c, int key)
+static void conc_del(struct conc *c, int key)
 {
 	struct cn *n = c->live[key];
 
-	if (rcu_txn_list_del_rcu(&n->node, GFP_KERNEL))
-		return false;
+	rcu_txn_list_del_rcu(&n->node);
 	c->live[key] = NULL;
 	kfree_rcu(n, rcu);
-	return true;
 }
 
 /* Replace the node of @key by a new one of the same key: order is kept. */
@@ -1880,10 +1857,7 @@ static bool conc_replace(struct conc *c, int key)
 	if (!n)
 		return false;
 	n->key = key;
-	if (rcu_txn_list_replace_rcu(&old->node, &n->node, GFP_KERNEL)) {
-		kfree(n);
-		return false;
-	}
+	rcu_txn_list_replace_rcu(&old->node, &n->node);
 	c->live[key] = n;
 	kfree_rcu(old, rcu);
 	return true;
@@ -1893,6 +1867,7 @@ static void rcu_txn_test_list_concurrent(struct kunit *test)
 {
 	struct conc_reader *readers;
 	long walks = 0, violations = 0, cross_checks = 0, cross_violations = 0;
+	unsigned long steals = __rcu_txn_local_steals();
 	u32 rng = 2463534242u;
 	bool ok = true;
 	struct conc *c;
@@ -1958,7 +1933,7 @@ static void rcu_txn_test_list_concurrent(struct kunit *test)
 
 		for (key = 1; ok && key <= CONC_KEY_MAX; key++) {
 			if (c->live[key])
-				ok = conc_del(c, key);
+				conc_del(c, key);
 			cond_resched();
 		}
 	}
@@ -1973,7 +1948,7 @@ static void rcu_txn_test_list_concurrent(struct kunit *test)
 		else if (!(rng & 0x300))
 			ok = conc_replace(c, key);
 		else
-			ok = conc_del(c, key);
+			conc_del(c, key);
 		cond_resched();
 	}
 
@@ -1989,8 +1964,12 @@ static void rcu_txn_test_list_concurrent(struct kunit *test)
 		if (c->live[key])
 			conc_del(c, key);
 
-	kunit_info(test, "%ld walks, %ld cross-direction checks\n", walks,
-		   cross_checks);
+	/*
+	 * The writer runs more operations within a grace period than a pool
+	 * holds, so that the readers also race descriptors stolen back.
+	 */
+	kunit_info(test, "%ld walks, %ld cross-direction checks, %lu steals\n",
+		   walks, cross_checks, __rcu_txn_local_steals() - steals);
 	KUNIT_EXPECT_TRUE(test, ok);
 	KUNIT_EXPECT_GT(test, walks, 0);
 	/* Forward and reverse walks stayed sorted. */

@@ -221,8 +221,9 @@ section, if it passes them a lockdep condition for that exclusion, such as
 	A circular doubly-linked list whose forward and backward chains are
 	mutually coherent at every instant, which allows readers to walk it in
 	both directions.  An insertion or a removal switches a forward and a
-	backward edge, and a move six, the moved node's own included: each
-	allocates a descriptor.
+	backward edge, and a move six, the moved node's own included.  An
+	``_rcu`` operation runs a local transaction: it allocates nothing and
+	cannot fail.
 
 Samples
 =======
