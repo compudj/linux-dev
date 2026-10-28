@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 
 CONTEXT_ANALYSIS_core.o := y
+CONTEXT_ANALYSIS_cid.o := y
 CONTEXT_ANALYSIS_fair.o := y
 
 # The compilers are complaining about unused variables inside an if(0) scope
@@ -40,3 +41,4 @@ obj-y += core.o
 obj-y += fair.o
 obj-y += build_policy.o
 obj-y += build_utility.o
+obj-$(CONFIG_SCHED_MM_CID) += cid.o
