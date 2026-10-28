@@ -34,7 +34,9 @@ allocates a descriptor for each transaction, with the ``gfp_t`` given to
 ``rcu_txn_init()``, and a transaction that switches two pointers or more frees
 it with ``kfree_rcu()``, a grace period after its commit, as readers may still
 be reading it: an allocation, which can fail, and a deferred free for every
-update, where ``rcu_assign_pointer()`` needs neither.  The reader pays a test of
+update, where ``rcu_assign_pointer()`` needs neither.  A small transaction
+that must not fail takes its descriptor from a pool of its CPU's instead: see
+`Local transactions`_ below.  The reader pays a test of
 the low bits of every pointer it loads, which is nearly free: only while a
 commit is in flight on that pointer does the reader also read the descriptor,
 within a *resolve section*, with interrupts disabled and a full barrier.
@@ -155,6 +157,25 @@ takes the lock, as above, or initializes the handle with a non-sleeping
 ``PREEMPT_RT`` does not allow the allocator there.  ``rcu_txn_commit()`` and
 ``rcu_txn_cancel()`` allocate nothing, do not sleep, and may be called under
 such a lock.
+
+Local transactions
+------------------
+
+A transaction of at most ``RCU_TXN_LOCAL_CAP`` records that must not fail for
+want of memory, such as a removal on a teardown path, is initialized with
+``rcu_txn_init_local()`` instead of ``rcu_txn_init()``.  Its descriptor comes
+from a pool of the CPU's, and preemption stays disabled until its commit or its
+cancel, which gives the descriptor back to that pool.  It allocates nothing,
+``rcu_txn_record()`` cannot fail, and ``rcu_txn_commit()`` returns 0.  Between
+the two, the writer must not sleep, nor take a lock, and each context of a CPU,
+task, softirq or hardirq, holds one such handle at a time.
+
+The descriptor of a commit that installed proxies goes back to the pool a grace
+period later, through ``call_rcu()``.  A pool that runs out of descriptors,
+with more commits within a grace period than it holds, takes back those that
+still wait for one at once: it waits for the resolve sections in flight, which
+it does busy, with interrupts disabled, through a scan of every CPU.  No writer
+waits for memory, and none waits for a grace period.
 
 An update that re-points a single slot needs no transaction.  Every
 transaction settles its slots before its commit returns, and the writers of the

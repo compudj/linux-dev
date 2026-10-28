@@ -92,13 +92,16 @@
  * Once a commit has settled every slot it installed a proxy in, its descriptor
  * can be reclaimed in either of two ways:
  *
- *   - After a grace period, as rcu_txn_commit() does with kfree_rcu().  A
+ *   - After a grace period, as rcu_txn_commit() does with kfree_rcu(), or with
+ *     call_rcu() back into its pool for the descriptor of a local handle.  A
  *     resolve section, interrupts disabled, is an RCU read-side critical
  *     section.
  *
  *   - Once __rcu_txn_synchronize_resolve() returns, without a grace period.
  *     It waits for the resolve sections in flight, busy-waiting since they are
- *     short, so that its caller need not sleep.  See lib/rcu_txn.c.
+ *     short, so that its caller need not sleep.  A pool that runs out of
+ *     descriptors takes back those still waiting for a grace period this way.
+ *     See lib/rcu_txn.c.
  *
  * A reader still loads a slot and uses the target it resolves within one RCU
  * read-side critical section: the embedder reclaims its nodes after a grace
@@ -113,6 +116,11 @@
  * Under a raw or a bit spinlock only the reserve will do: on PREEMPT_RT the
  * allocator cannot be called there.
  *
+ * A transaction of at most RCU_TXN_LOCAL_CAP records that must not fail is
+ * initialized with rcu_txn_init_local() instead.  Its descriptor comes from a
+ * pool of its CPU's, and preemption stays disabled until its commit or cancel:
+ * see lib/rcu_txn.c.
+ *
  * rcu_txn_commit() and rcu_txn_cancel() allocate nothing, do not sleep, and
  * may be called under a raw or a bit spinlock.
  */
@@ -122,6 +130,7 @@
 #include <linux/compiler.h>
 #include <linux/errno.h>
 #include <linux/gfp_types.h>
+#include <linux/preempt.h>
 #include <linux/rcupdate.h>
 #include <linux/rcu_txn_bloom.h>	/* read-your-own-writes filter */
 #include <linux/stddef.h>
@@ -262,6 +271,7 @@ struct rcu_txn {
 	enum rcu_txn_state state;
 	bool disjoint;			/* declared slot-disjoint */
 	bool bloom_live;		/* the descriptor's filter is armed */
+	bool local;			/* see rcu_txn_init_local() */
 #ifdef CONFIG_DEBUG_RCU_TXN
 	/* Task that initialized or adopted the handle, and drives it. */
 	struct task_struct *owner;
@@ -551,6 +561,15 @@ static inline void rcu_txn_init(struct rcu_txn *t, gfp_t gfp)
 }
 
 /*
+ * The records of a local transaction: enough for the largest operation of
+ * <linux/rcu_txn_list.h>, a move.
+ */
+#define RCU_TXN_LOCAL_CAP	6
+
+/* See lib/rcu_txn.c. */
+void rcu_txn_init_local(struct rcu_txn *t);
+
+/*
  * Move the handle's records to a new descriptor holding at least @cap of them.
  * PREPARE only: no proxy is installed yet, so the records may move.  Returns
  * false if it cannot allocate, leaving the handle in the RCU_TXN_OOM state.
@@ -604,11 +623,16 @@ static inline void rcu_txn_adopt(struct rcu_txn *t)
 {
 	/* A handle that changes hands with records in it is mid-flight. */
 	RCU_TXN_WARN_ON(t->nr);
+	/* A local handle belongs to the CPU it disabled preemption on. */
+	RCU_TXN_WARN_ON(t->local);
 	__rcu_txn_excl_claim(t);
 }
 
 /* Free a descriptor that installed no proxy: see lib/rcu_txn.c. */
 void __rcu_txn_free_desc(struct rcu_txn_desc *desc);
+
+/* Put a local descriptor that installed no proxy back in its pool. */
+void __rcu_txn_local_put(struct rcu_txn_desc *desc);
 
 /*
  * Release the handle's descriptor, if it has one.  No proxy of it was
@@ -616,13 +640,18 @@ void __rcu_txn_free_desc(struct rcu_txn_desc *desc);
  */
 static inline void __rcu_txn_release_desc(struct rcu_txn *t)
 {
-	if (t->desc)
+	if (!t->desc)
+		return;
+	if (t->local)
+		__rcu_txn_local_put(t->desc);
+	else
 		__rcu_txn_free_desc(t->desc);
 }
 
 /*
  * Mark the handle consumed, by commit() or by cancel(): it no longer owns a
- * descriptor, and must be initialized again before it is reused.
+ * descriptor, and must be initialized again before it is reused.  A local
+ * handle enables preemption again.
  */
 static inline void __rcu_txn_done(struct rcu_txn *t)
 {
@@ -630,6 +659,8 @@ static inline void __rcu_txn_done(struct rcu_txn *t)
 	t->records = NULL;
 	t->nr = 0;
 	t->state = RCU_TXN_DONE;
+	if (t->local)
+		preempt_enable();
 }
 
 /*
@@ -988,8 +1019,10 @@ static inline void rcu_txn_cancel(struct rcu_txn *t)
 /*
  * Install, flip, settle and retire the first @nr records of @desc: the commit
  * of a transaction that installs proxies, which takes two records or more.
+ * @local: @desc is a local handle's, and goes back to its pool.
  */
-void __rcu_txn_commit_desc(struct rcu_txn_desc *desc, unsigned int nr);
+void __rcu_txn_commit_desc(struct rcu_txn_desc *desc, unsigned int nr,
+			   bool local);
 
 /**
  * rcu_txn_commit() - commit a transaction
@@ -1007,7 +1040,8 @@ void __rcu_txn_commit_desc(struct rcu_txn_desc *desc, unsigned int nr);
  * transaction publishes nothing.
  *
  * With two or more records, the descriptor's reclaim is deferred with
- * kfree_rcu(): a reader may still hold a proxy.
+ * kfree_rcu(): a reader may still hold a proxy.  A local handle's goes back
+ * to its pool instead: see rcu_txn_init_local().
  *
  * Context: The caller excludes other writers of the recorded slots.  Does not
  * sleep, and may be called under a raw or a bit spinlock.
@@ -1038,10 +1072,10 @@ static inline int rcu_txn_commit(struct rcu_txn *t)
 		__rcu_txn_release_desc(t);	/* no proxy: free now */
 	} else {
 		/*
-		 * The proxies live in the descriptor, which is reclaimed after
-		 * a grace period.
+		 * The proxies live in the descriptor, which is reclaimed once
+		 * no reader can still read them.
 		 */
-		__rcu_txn_commit_desc(t->desc, nr);
+		__rcu_txn_commit_desc(t->desc, nr, t->local);
 	}
 	__rcu_txn_done(t);
 	return 0;

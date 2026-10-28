@@ -56,6 +56,22 @@ void __rcu_txn_resolve_exit(unsigned int level);
  */
 void __rcu_txn_synchronize_resolve(void);
 
+/*
+ * Local transactions: see lib/rcu_txn.c.  The descriptors of a CPU's pool, for
+ * its handles of every context, and the descriptors that wait for a grace
+ * period.
+ */
+#define RCU_TXN_LOCAL_POOL	16
+
+/*
+ * Give a local handle's descriptor, whose proxies are all settled, back to its
+ * pool, a grace period later or once stolen back.
+ */
+void __rcu_txn_local_retire(struct rcu_txn_desc *desc);
+
+/* The number of times a pool took its descriptors back, on every CPU. */
+unsigned long __rcu_txn_local_steals(void);
+
 static inline void __rcu_txn_group_init(struct rcu_txn_group *group)
 {
 	group->selector = 0;

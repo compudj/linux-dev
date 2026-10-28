@@ -2234,7 +2234,8 @@ static void rcu_txn_test_resolve_wait(struct kunit *test)
 #define REUSE_READERS	4
 #define REUSE_ROUNDS	20000
 #define REUSE_V(i, k)	T(2 * (k) + (i))
-#define REUSE_POISON	((void *)(0xdeadUL << 8))
+/* Bit 1: no T() value has it, and bit 0, the tag, stays clear. */
+#define REUSE_POISON	((void *)0xdead02UL)
 
 struct reuse_desc {
 	struct rcu_txn_group group;
@@ -2316,16 +2317,19 @@ static void reuse_round(struct reuse *ru, unsigned long k)
 	}
 }
 
-static void rcu_txn_test_resolve_reuse(struct kunit *test)
+/*
+ * Run the readers against @rounds rounds of @round, then check what they read.
+ * Returns how many of their loads found a proxy.
+ */
+static long reuse_test(struct kunit *test,
+		       void (*round)(struct reuse *ru, unsigned long k),
+		       unsigned long rounds)
 {
 	struct reuse_reader *readers;
 	long reads = 0, proxies = 0, violations = 0;
 	struct reuse *ru;
 	unsigned long k;
 	int i;
-
-	if (num_online_cpus() < 2)
-		kunit_skip(test, "needs two CPUs online");
 
 	/* kmalloc() aligns the records as a descriptor's: see rcu_txn.c. */
 	ru = kunit_kzalloc(test, sizeof(*ru), GFP_KERNEL);
@@ -2345,8 +2349,8 @@ static void rcu_txn_test_resolve_reuse(struct kunit *test)
 			readers[i].task = NULL;
 	}
 
-	for (k = 1; k <= REUSE_ROUNDS; k++) {
-		reuse_round(ru, k);
+	for (k = 1; k <= rounds; k++) {
+		round(ru, k);
 		if (!(k & 255))
 			cond_resched();
 	}
@@ -2361,13 +2365,410 @@ static void rcu_txn_test_resolve_reuse(struct kunit *test)
 
 	kunit_info(test, "%ld reads, %ld through a proxy\n", reads, proxies);
 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(ru->slot[0]),
-			    REUSE_V(0, REUSE_ROUNDS));
+			    REUSE_V(0, rounds));
 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(ru->slot[1]),
-			    REUSE_V(1, REUSE_ROUNDS));
-	/* The readers raced the commits... */
-	KUNIT_EXPECT_GT(test, proxies, 0);
-	/* ...and never read a record once it was reused. */
+			    REUSE_V(1, rounds));
+	/* No reader read a record once it was reused. */
 	KUNIT_EXPECT_EQ(test, violations, 0);
+	return proxies;
+}
+
+static void rcu_txn_test_resolve_reuse(struct kunit *test)
+{
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs online");
+	/* The readers raced the commits. */
+	KUNIT_EXPECT_GT(test, reuse_test(test, reuse_round, REUSE_ROUNDS), 0);
+}
+
+/*
+ * Local transactions
+ * ==================
+ *
+ * A local handle takes its descriptor from a pool of its CPU's, a grace period
+ * after its last use, or at once by stealing it back: see lib/rcu_txn.c.
+ */
+
+/* Commit slot i from REUSE_V(i, k - 1) to REUSE_V(i, k), in a local handle. */
+static void local_commit(void __rcu **slot, unsigned long k)
+{
+	struct rcu_txn txn;
+	int i;
+
+	rcu_txn_init_local(&txn);
+	/* Each round records the slots the other way round. */
+	for (i = 0; i < 2; i++) {
+		int j = (k & 1) ? 1 - i : i;
+
+		rcu_txn_record(&txn, &slot[j], REUSE_V(j, k - 1),
+			       REUSE_V(j, k), TAG);
+	}
+	rcu_txn_commit(&txn);
+}
+
+/*
+ * Leave this CPU's pool with each descriptor free, or in a batch whose callback
+ * ran.  Earlier tests may have left settled descriptors in no batch: a commit
+ * queues them, with its own.  The caller keeps to its CPU.
+ */
+static void local_drain(void)
+{
+	void __rcu *d[2];
+
+	RCU_INIT_POINTER(d[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(d[1], REUSE_V(1, 0));
+	rcu_barrier();
+	local_commit(d, 1);
+	rcu_barrier();
+}
+
+/*
+ * A local handle runs with preemption disabled, and its commit or cancel
+ * enables it again.  RCU_TXN_LOCAL_CAP records fit.
+ */
+static void rcu_txn_test_local_commit(struct kunit *test)
+{
+	void __rcu *slots[RCU_TXN_LOCAL_CAP];
+	void __rcu *s[2];
+	int count = preempt_count(), within[3];
+	struct rcu_txn txn;
+	bool all_recorded;
+	int err[3];
+
+	RCU_INIT_POINTER(s[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(s[1], REUSE_V(1, 0));
+
+	/* Two records: the descriptor waits for the readers of its proxies. */
+	rcu_txn_init_local(&txn);
+	within[0] = preempt_count();
+	rcu_txn_record(&txn, &s[0], REUSE_V(0, 0), REUSE_V(0, 1), TAG);
+	rcu_txn_record(&txn, &s[1], REUSE_V(1, 0), REUSE_V(1, 1), TAG);
+	err[0] = rcu_txn_commit(&txn);
+	KUNIT_EXPECT_EQ(test, preempt_count(), count);
+
+	/* One record, then a cancel: the descriptor goes back at once. */
+	rcu_txn_init_local(&txn);
+	within[1] = preempt_count();
+	rcu_txn_record(&txn, &s[0], REUSE_V(0, 1), REUSE_V(0, 2), TAG);
+	err[1] = rcu_txn_commit(&txn);
+	KUNIT_EXPECT_EQ(test, preempt_count(), count);
+	rcu_txn_init_local(&txn);
+	rcu_txn_record(&txn, &s[1], REUSE_V(1, 1), T(0), TAG);
+	rcu_txn_cancel(&txn);
+	KUNIT_EXPECT_EQ(test, preempt_count(), count);
+
+	/* As many records as a local handle holds. */
+	rcu_txn_init_local(&txn);
+	within[2] = preempt_count();
+	all_recorded = record_all(&txn, slots, RCU_TXN_LOCAL_CAP);
+	err[2] = rcu_txn_commit(&txn);
+	KUNIT_EXPECT_EQ(test, preempt_count(), count);
+
+	KUNIT_EXPECT_EQ(test, err[0], 0);
+	KUNIT_EXPECT_EQ(test, err[1], 0);
+	KUNIT_EXPECT_EQ(test, err[2], 0);
+	KUNIT_EXPECT_TRUE(test, all_recorded);
+	KUNIT_EXPECT_TRUE(test, all_settled(slots, RCU_TXN_LOCAL_CAP));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[0]), REUSE_V(0, 2));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[1]), REUSE_V(1, 1));
+	if (IS_ENABLED(CONFIG_PREEMPT_COUNT)) {
+		KUNIT_EXPECT_EQ(test, within[0], count + 1);
+		KUNIT_EXPECT_EQ(test, within[1], count + 1);
+		KUNIT_EXPECT_EQ(test, within[2], count + 1);
+	}
+}
+
+/*
+ * A local handle does not grow: a record past RCU_TXN_LOCAL_CAP, or a reserve,
+ * warns and makes it OOM, and its commit publishes nothing.
+ */
+static void rcu_txn_test_local_over_cap(struct kunit *test)
+{
+	void __rcu *slots[RCU_TXN_LOCAL_CAP + 1];
+	int count = preempt_count(), err[2];
+	struct rcu_txn txn;
+	bool recorded, reserved;
+	unsigned int i;
+
+	kunit_warning_suppress(test) {
+		rcu_txn_init_local(&txn);
+		recorded = record_all(&txn, slots, RCU_TXN_LOCAL_CAP + 1);
+		err[0] = rcu_txn_commit(&txn);
+		EXPECT_ONE_WARNING(test);
+	}
+	KUNIT_EXPECT_FALSE(test, recorded);
+	KUNIT_EXPECT_EQ(test, err[0], -ENOMEM);
+	for (i = 0; i <= RCU_TXN_LOCAL_CAP; i++)
+		KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(slots[i]), T(i));
+	KUNIT_EXPECT_EQ(test, preempt_count(), count);
+
+	kunit_warning_suppress(test) {
+		rcu_txn_init_local(&txn);
+		reserved = rcu_txn_reserve(&txn, RCU_TXN_LOCAL_CAP + 1);
+		err[1] = rcu_txn_commit(&txn);
+		EXPECT_ONE_WARNING(test);
+	}
+	KUNIT_EXPECT_FALSE(test, reserved);
+	KUNIT_EXPECT_EQ(test, err[1], -ENOMEM);
+	KUNIT_EXPECT_EQ(test, preempt_count(), count);
+}
+
+/*
+ * Commits spaced by grace periods find their descriptors back without a
+ * steal: each burst takes no more than its CPU's pool, after rcu_barrier() has
+ * run the callbacks of the previous one.
+ */
+static void rcu_txn_test_local_recycle(struct kunit *test)
+{
+	unsigned long k = 0, steals;
+	void __rcu *s[2];
+	int round, i;
+
+	RCU_INIT_POINTER(s[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(s[1], REUSE_V(1, 0));
+
+	migrate_disable();
+	local_drain();
+	steals = __rcu_txn_local_steals();
+	for (round = 0; round < 3; round++) {
+		for (i = 0; i < RCU_TXN_LOCAL_POOL; i++)
+			local_commit(s, ++k);
+		rcu_barrier();
+	}
+	steals = __rcu_txn_local_steals() - steals;
+	migrate_enable();
+
+	KUNIT_EXPECT_EQ(test, steals, 0);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[0]), REUSE_V(0, k));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[1]), REUSE_V(1, k));
+}
+
+/*
+ * A burst of commits on one CPU, faster than grace periods end, steals the
+ * descriptors back, about once per pool's worth.
+ */
+static void rcu_txn_test_local_steal(struct kunit *test)
+{
+	unsigned long k, steals;
+	void __rcu *s[2];
+
+	RCU_INIT_POINTER(s[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(s[1], REUSE_V(1, 0));
+
+	migrate_disable();
+	steals = __rcu_txn_local_steals();
+	for (k = 1; k <= 8 * RCU_TXN_LOCAL_POOL; k++)
+		local_commit(s, k);
+	steals = __rcu_txn_local_steals() - steals;
+	migrate_enable();
+
+	kunit_info(test, "%lu steals\n", steals);
+	KUNIT_EXPECT_GT(test, steals, 0);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[0]),
+			    REUSE_V(0, 8 * RCU_TXN_LOCAL_POOL));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[1]),
+			    REUSE_V(1, 8 * RCU_TXN_LOCAL_POOL));
+}
+
+/*
+ * A reader on another CPU holds a resolve section open, with the proxy of a
+ * local descriptor loaded, while the writer settles the descriptor's proxies,
+ * then commits more local transactions than its pool holds: a steal takes the
+ * descriptor back, and the next commits reuse it.  The section holds off the
+ * grace period of the descriptor's batch as well.  The steal waits for the
+ * section first, so that the reader still resolves the proxy to a target of
+ * its own transaction.  A pool that reused the descriptor without waiting, by
+ * a steal or before a grace period, would have it resolve to a later one.
+ */
+struct steal_park {
+	void __rcu **slot;
+	int holding;		/* the section is open, the proxy loaded */
+	void *loaded;
+	void *resolved;
+};
+
+static int steal_park_fn(void *arg)
+{
+	struct steal_park *sp = arg;
+	unsigned long flags;
+	unsigned int level;
+	u64 start;
+	void *v;
+
+	local_irq_save(flags);
+	level = __rcu_txn_resolve_enter();
+	v = rcu_dereference_raw(*sp->slot);
+	/* Pairs with the test's load-acquire. */
+	smp_store_release(&sp->holding, 1);
+	start = local_clock();
+	while (local_clock() - start < PARK_HOLD_NS)
+		cpu_relax();
+	sp->loaded = v;
+	if (rcu_txn_is_proxy(v, TAG))
+		v = __rcu_txn_proxy_resolve(__rcu_txn_untag(v, TAG));
+	sp->resolved = v;
+	__rcu_txn_resolve_exit(level);
+	local_irq_restore(flags);
+
+	set_current_state(TASK_INTERRUPTIBLE);
+	while (!kthread_should_stop()) {
+		schedule();
+		set_current_state(TASK_INTERRUPTIBLE);
+	}
+	__set_current_state(TASK_RUNNING);
+	return 0;
+}
+
+static void rcu_txn_test_local_steal_waits(struct kunit *test)
+{
+	struct steal_park sp = { };
+	struct task_struct *task;
+	unsigned long k, steals;
+	struct rcu_txn txn;
+	void __rcu *s[2];
+	void *proxy;
+	unsigned int cpu;
+	int i;
+
+	RCU_INIT_POINTER(s[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(s[1], REUSE_V(1, 0));
+	sp.slot = &s[0];
+
+	/* The test commits on its CPU, the reader holds its section on another. */
+	migrate_disable();
+	cpu = cpumask_any_but(cpu_online_mask, smp_processor_id());
+	if (cpu >= nr_cpu_ids) {
+		migrate_enable();
+		kunit_skip(test, "needs two CPUs online");
+	}
+	task = kthread_create(steal_park_fn, &sp, "rcu_txn_park");
+	if (IS_ERR(task)) {
+		migrate_enable();
+		KUNIT_FAIL(test, "cannot create the kthread");
+		return;
+	}
+	kthread_bind(task, cpu);
+	/* Round 1's descriptor then goes into a batch of its own. */
+	local_drain();
+
+	/* Round 1, by hand: the proxies stay installed until the reader holds one. */
+	rcu_txn_init_local(&txn);
+	rcu_txn_record(&txn, &s[0], REUSE_V(0, 0), REUSE_V(0, 1), TAG);
+	rcu_txn_record(&txn, &s[1], REUSE_V(1, 0), REUSE_V(1, 1), TAG);
+	for (i = 0; i < 2; i++)
+		__rcu_txn_record_install(&txn.desc->group, &txn.records[i]);
+	proxy = rcu_access_pointer(s[0]);
+	wake_up_process(task);
+	/* Pairs with the store-release of steal_park_fn(). */
+	while (!smp_load_acquire(&sp.holding))
+		cpu_relax();
+	__rcu_txn_group_commit(&txn.desc->group);
+	for (i = 0; i < 2; i++)
+		__rcu_txn_record_settle(&txn.records[i]);
+	__rcu_txn_local_retire(txn.desc);
+	__rcu_txn_done(&txn);
+
+	/* Then twice what the pool holds: a steal, and every descriptor reused. */
+	steals = __rcu_txn_local_steals();
+	for (k = 2; k < 2 + 2 * RCU_TXN_LOCAL_POOL; k++)
+		local_commit(s, k);
+	steals = __rcu_txn_local_steals() - steals;
+	migrate_enable();
+	kthread_stop(task);
+
+	KUNIT_EXPECT_GT(test, steals, 0);
+	KUNIT_EXPECT_PTR_EQ(test, sp.loaded, proxy);
+	/* Selector flipped: round 1's new target, not a later round's. */
+	KUNIT_EXPECT_PTR_EQ(test, sp.resolved, REUSE_V(0, 1));
+}
+
+/*
+ * The commit of local_commit(), by hand, holding each round's proxies installed
+ * for a while before and after the flip, as reuse_round() does, so that the
+ * readers resolve many of them.  The descriptor then goes back to its pool,
+ * as rcu_txn_commit() puts it there.
+ */
+static void local_round(struct reuse *ru, unsigned long k)
+{
+	struct rcu_txn txn;
+	int i;
+
+	rcu_txn_init_local(&txn);
+	for (i = 0; i < 2; i++) {
+		int j = (k & 1) ? 1 - i : i;
+
+		rcu_txn_record(&txn, &ru->slot[j], REUSE_V(j, k - 1),
+			       REUSE_V(j, k), TAG);
+	}
+	for (i = 0; i < 2; i++)
+		__rcu_txn_record_install(&txn.desc->group, &txn.records[i]);
+	udelay(1);
+	__rcu_txn_group_commit(&txn.desc->group);
+	udelay(1);
+	for (i = 0; i < 2; i++)
+		__rcu_txn_record_settle(&txn.records[i]);
+	__rcu_txn_local_retire(txn.desc);
+	__rcu_txn_done(&txn);
+}
+
+/*
+ * Reuse of descriptors stolen back, against concurrent readers: as
+ * rcu_txn_test_resolve_reuse(), through a pool, with more commits than it holds
+ * within a grace period.
+ */
+#define LOCAL_REUSE_ROUNDS	REUSE_ROUNDS
+
+static void rcu_txn_test_local_reuse(struct kunit *test)
+{
+	unsigned long steals = __rcu_txn_local_steals();
+	long proxies;
+
+	if (num_online_cpus() < 2)
+		kunit_skip(test, "needs two CPUs online");
+	proxies = reuse_test(test, local_round, LOCAL_REUSE_ROUNDS);
+	steals = __rcu_txn_local_steals() - steals;
+	kunit_info(test, "%lu steals\n", steals);
+	/* The readers raced the commits, and descriptors stolen back. */
+	KUNIT_EXPECT_GT(test, proxies, 0);
+	KUNIT_EXPECT_GT(test, steals, 0);
+}
+
+/*
+ * Local handles under a raw spinlock with interrupts off, and under a bit
+ * spinlock, steals included: neither call_rcu() nor the steal's busy-wait
+ * takes a sleeping lock, which PREEMPT_RT with lockdep would report.
+ */
+static void rcu_txn_test_local_atomic(struct kunit *test)
+{
+	static DEFINE_RAW_SPINLOCK(raw_lock);
+	bool tainted = test_taint(TAINT_WARN);
+	unsigned long k = 0, steals;
+	struct hlist_bl_head bucket;
+	int locks = debug_locks;
+	unsigned long flags;
+	void __rcu *s[2];
+	int i;
+
+	INIT_HLIST_BL_HEAD(&bucket);
+	RCU_INIT_POINTER(s[0], REUSE_V(0, 0));
+	RCU_INIT_POINTER(s[1], REUSE_V(1, 0));
+
+	steals = __rcu_txn_local_steals();
+	raw_spin_lock_irqsave(&raw_lock, flags);
+	for (i = 0; i < 4 * RCU_TXN_LOCAL_POOL; i++)
+		local_commit(s, ++k);
+	raw_spin_unlock_irqrestore(&raw_lock, flags);
+	expect_no_report(test, tainted, locks);
+
+	hlist_bl_lock(&bucket);
+	for (i = 0; i < 4 * RCU_TXN_LOCAL_POOL; i++)
+		local_commit(s, ++k);
+	hlist_bl_unlock(&bucket);
+	expect_no_report(test, tainted, locks);
+
+	KUNIT_EXPECT_GT(test, __rcu_txn_local_steals() - steals, 0);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[0]), REUSE_V(0, k));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(s[1]), REUSE_V(1, k));
 }
 
 static struct kunit_case rcu_txn_test_cases[] = {
@@ -2433,6 +2834,13 @@ static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_resolve_nest),
 	KUNIT_CASE(rcu_txn_test_resolve_wait),
 	KUNIT_CASE_SLOW(rcu_txn_test_resolve_reuse),
+	KUNIT_CASE(rcu_txn_test_local_commit),
+	KUNIT_CASE(rcu_txn_test_local_over_cap),
+	KUNIT_CASE(rcu_txn_test_local_recycle),
+	KUNIT_CASE(rcu_txn_test_local_steal),
+	KUNIT_CASE(rcu_txn_test_local_steal_waits),
+	KUNIT_CASE_SLOW(rcu_txn_test_local_reuse),
+	KUNIT_CASE(rcu_txn_test_local_atomic),
 	{}
 };
 
