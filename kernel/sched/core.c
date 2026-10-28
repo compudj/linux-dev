@@ -11048,10 +11048,22 @@ static bool sched_mm_cid_add_user(struct task_struct *t, struct mm_struct *mm)
 	return mm_update_max_cids(mm);
 }
 
+/*
+ * @t becomes a user of the CID domain of its mm: fork(2), and execve(2)
+ * for the new mm or, when the execve fails, for the old one again.
+ *
+ * In per CPU mode a new user takes no CID of its own: it borrows the one
+ * of the CPU it runs on at its schedule in. A task that joins while it is
+ * running reaches user space before any schedule in, so it takes its CID
+ * here instead, the way one would. That is the failure path of execve(2),
+ * which rejoins an mm whose other threads are users still; a fork(2)
+ * child does not run yet and a successful execve(2) joins the new mm as
+ * its first user.
+ */
 static void sched_mm_cid_fork(struct task_struct *t)
 {
 	struct mm_struct *mm = t->mm;
-	bool percpu;
+	bool percpu = false, flip = false;
 
 	if (!mm)
 		return;
@@ -11074,10 +11086,14 @@ static void sched_mm_cid_fork(struct task_struct *t)
 		if (!sched_mm_cid_add_user(t, mm)) {
 			if (!cid_on_cpu(mm->mm_cid.mode))
 				t->mm_cid.cid = mm_get_cid(mm);
-			return;
+			break;
 		}
 
-		/* Handle the mode change and transfer current's CID */
+		/*
+		 * Handle the mode change and transfer current's CID. A
+		 * running joiner has none to transfer: it takes one below.
+		 */
+		flip = true;
 		percpu = cid_on_cpu(mm->mm_cid.mode);
 		if (!percpu)
 			mm_cid_transit_to_task(current, pcp);
@@ -11085,11 +11101,26 @@ static void sched_mm_cid_fork(struct task_struct *t)
 			mm_cid_transit_to_cpu(current, pcp);
 	}
 
-	if (percpu) {
-		mm_cid_fixup_tasks_to_cpus();
-	} else {
-		mm_cid_fixup_cpus_to_tasks(mm);
-		t->mm_cid.cid = mm_get_cid(mm);
+	if (flip) {
+		if (percpu) {
+			mm_cid_fixup_tasks_to_cpus();
+		} else {
+			mm_cid_fixup_cpus_to_tasks(mm);
+			/*
+			 * A running joiner takes its CID below, under the
+			 * runqueue lock: a user already, it may have taken
+			 * one at a schedule in since.
+			 */
+			if (t != current)
+				t->mm_cid.cid = mm_get_cid(mm);
+		}
+	}
+
+	/* The running joiner with no CID, see above. */
+	if (t == current) {
+		guard(task_rq_lock)(t);
+		if (t->mm_cid.cid == MM_CID_UNSET)
+			mm_cid_schedin(t);
 	}
 }
 
