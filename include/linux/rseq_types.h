@@ -138,50 +138,53 @@ struct rseq_data { };
 #define MM_CID_TRANSIT	BIT(29)
 
 /**
- * struct sched_mm_cid - Storage for per task MM CID data
- * @active:	MM CID is active for the task
+ * struct cid_user - Storage for per task CID data
+ * @active:	The task is a user of the domain
  * @cid:	The CID associated to the task either permanently or
  *		borrowed from the CPU
- * @node:	Queued in the per MM MMCID list
+ * @node:	Queued in the domain's user list
  */
-struct sched_mm_cid {
+struct cid_user {
 	unsigned int		active;
 	unsigned int		cid;
 	struct hlist_node	node;
 };
 
 /**
- * struct mm_cid_pcpu - Storage for per CPU MM_CID data
+ * struct cid_pcpu - Storage for per CPU CID data
  * @cid:	The CID associated to the CPU either permanently or
  *		while a task with a CID is running
  */
-struct mm_cid_pcpu {
+struct cid_pcpu {
 	unsigned int	cid;
 }____cacheline_aligned_in_smp;
 
 /**
- * struct mm_mm_cid - Storage for per MM CID data
+ * struct cid_domain - Storage for per domain CID data
  * @pcpu:		Per CPU storage for CIDs associated to a CPU
  * @mode:		Indicates per CPU and transition mode
  * @max_cids:		The exclusive maximum CID value for allocation and convergence
+ * @cidmask:		The allocation bitmap, num_possible_cpus() bits
+ * @cpus_allowed:	Union of the users' allowed CPUs, growth only
  * @irq_work:		irq_work to handle the affinity mode change case
  * @work:		Regular work to handle the affinity mode change case
  * @lock:		Spinlock to protect against affinity setting which can't take @mutex
- * @mutex:		Mutex to serialize forks and exits related to this mm
- * @user_list:		List of the MM CID users of a MM
- * @nr_cpus_allowed:	The number of CPUs in the per MM allowed CPUs map. The map
- *			is growth only.
- * @users:		The number of tasks sharing this MM. Separate from mm::mm_users
- *			as that is modified by mmget()/mm_put() by other entities which
- *			do not actually share the MM.
+ * @mutex:		Mutex to serialize joins and leaves related to this domain
+ * @user_list:		List of the users of the domain
+ * @nr_cpus_allowed:	The number of CPUs in @cpus_allowed
+ * @users:		The number of tasks using the domain. For an mm, separate
+ *			from mm::mm_users as that is modified by mmget()/mm_put()
+ *			by other entities which do not actually share the MM.
  * @pcpu_thrs:		Threshold for switching back from per CPU mode
  * @update_deferred:	A deferred switch back to per task mode is pending.
  */
-struct mm_mm_cid {
+struct cid_domain {
 	/* Hotpath read mostly members */
-	struct mm_cid_pcpu	__percpu *pcpu;
+	struct cid_pcpu		__percpu *pcpu;
 	unsigned int		mode;
 	unsigned int		max_cids;
+	unsigned long		*cidmask;
+	struct cpumask		*cpus_allowed;
 
 	/* Rarely used. Moves @lock and @mutex into the second cacheline */
 	struct irq_work		irq_work;
@@ -198,8 +201,8 @@ struct mm_mm_cid {
 	unsigned int		update_deferred;
 } ____cacheline_aligned;
 #else /* CONFIG_SCHED_MM_CID */
-struct mm_mm_cid { };
-struct sched_mm_cid { };
+struct cid_domain { };
+struct cid_user { };
 #endif /* !CONFIG_SCHED_MM_CID */
 
 #endif

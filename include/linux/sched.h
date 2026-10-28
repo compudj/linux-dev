@@ -1440,7 +1440,7 @@ struct task_struct {
 #endif
 
 	struct rseq_data		rseq;
-	struct sched_mm_cid		mm_cid;
+	struct cid_user			mm_cid;
 
 	struct tlbflush_unmap_batch	tlb_ubc;
 
@@ -2380,6 +2380,8 @@ static __always_inline void alloc_tag_restore(struct alloc_tag *tag, struct allo
 void sched_mm_cid_before_execve(struct task_struct *t);
 void sched_mm_cid_after_execve(struct task_struct *t);
 void sched_mm_cid_exit(struct task_struct *t);
+void cid_domain_init(struct cid_domain *dom, struct cid_pcpu __percpu *pcpu,
+		     unsigned long *cidmask, struct cpumask *cpus_allowed, struct task_struct *p);
 static __always_inline int task_mm_cid(struct task_struct *t)
 {
 	return t->mm_cid.cid & ~(MM_CID_ONCPU | MM_CID_TRANSIT);
