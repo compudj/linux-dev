@@ -69,6 +69,14 @@ void __rcu_txn_synchronize_resolve(void);
  */
 void __rcu_txn_local_retire(struct rcu_txn_desc *desc);
 
+/*
+ * The descriptors of this CPU's pool that no handle holds, free, settled or in
+ * a batch: RCU_TXN_LOCAL_POOL, once no handle of this CPU's is in flight.  A
+ * descriptor lost, or in two lists, shows as another count.  The caller keeps
+ * to its CPU.
+ */
+unsigned int __rcu_txn_local_count(void);
+
 /* The number of times a pool took its descriptors back, on every CPU. */
 unsigned long __rcu_txn_local_steals(void);
 

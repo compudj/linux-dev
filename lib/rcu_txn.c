@@ -15,6 +15,7 @@
 #include <linux/export.h>
 #include <linux/hardirq.h>
 #include <linux/irqflags.h>
+#include <linux/lockdep.h>
 #include <linux/math.h>
 #include <linux/minmax.h>
 #include <linux/overflow.h>
@@ -267,9 +268,15 @@ struct rcu_txn_local_cpu {
 
 static DEFINE_PER_CPU(struct rcu_txn_local_cpu, rcu_txn_local_cpu);
 
+/*
+ * The lists of a pool change with interrupts disabled, on its CPU alone: an
+ * interrupt that changed them in the middle of a change would lose a
+ * descriptor, or give it twice.
+ */
 static void rcu_txn_local_push(struct rcu_txn_local_desc **list,
 			       struct rcu_txn_local_desc *ld)
 {
+	lockdep_assert_irqs_disabled();
 	ld->next = *list;
 	*list = ld;
 }
@@ -278,6 +285,7 @@ static void rcu_txn_local_push(struct rcu_txn_local_desc **list,
 static void rcu_txn_local_splice(struct rcu_txn_local_desc **to,
 				 struct rcu_txn_local_desc **from)
 {
+	lockdep_assert_irqs_disabled();
 	while (*from) {
 		struct rcu_txn_local_desc *ld = *from;
 
@@ -339,6 +347,7 @@ static void rcu_txn_local_queue(struct rcu_txn_local_cpu *lc)
 {
 	unsigned int i, n = lc->next_batch;
 
+	lockdep_assert_irqs_disabled();
 	for (i = 0; i < RCU_TXN_LOCAL_POOL; i++) {
 		struct rcu_txn_local_batch *b = &lc->batch[n];
 
@@ -384,6 +393,7 @@ rcu_txn_local_take(struct rcu_txn_local_cpu *lc)
 	struct rcu_txn_local_desc *ld;
 	unsigned int i;
 
+	lockdep_assert_irqs_disabled();
 	if (unlikely(!lc->ready))
 		rcu_txn_local_build(lc);
 	for (i = 0; !lc->free && i < RCU_TXN_LOCAL_POOL; i++)
@@ -486,6 +496,35 @@ void __rcu_txn_local_retire(struct rcu_txn_desc *desc)
 	local_irq_restore(flags);
 }
 EXPORT_SYMBOL_IF_KUNIT(__rcu_txn_local_retire);
+
+/* The length of @ld's list, or more than a pool holds if it is longer. */
+static unsigned int rcu_txn_local_len(struct rcu_txn_local_desc *ld)
+{
+	unsigned int n = 0;
+
+	for (; ld && n <= RCU_TXN_LOCAL_POOL; ld = ld->next)
+		n++;
+	return n;
+}
+
+/* See rcu_txn_internal.h. */
+unsigned int __rcu_txn_local_count(void)
+{
+	struct rcu_txn_local_cpu *lc;
+	unsigned long flags;
+	unsigned int n, i;
+
+	local_irq_save(flags);
+	lc = this_cpu_ptr(&rcu_txn_local_cpu);
+	if (unlikely(!lc->ready))
+		rcu_txn_local_build(lc);
+	n = rcu_txn_local_len(lc->free) + rcu_txn_local_len(lc->settled);
+	for (i = 0; i < RCU_TXN_LOCAL_POOL; i++)
+		n += rcu_txn_local_len(lc->batch[i].descs);
+	local_irq_restore(flags);
+	return n;
+}
+EXPORT_SYMBOL_IF_KUNIT(__rcu_txn_local_count);
 
 /* The steals of every pool so far. */
 unsigned long __rcu_txn_local_steals(void)
