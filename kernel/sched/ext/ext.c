@@ -2759,7 +2759,11 @@ static void move_remote_task_to_local_dsq(struct scx_sched *sch,
 	 */
 	p->scx.sticky_cpu = cpu_of(dst_rq);
 	deactivate_task(src_rq, p, 0);
-	/* sched_ext chose the CPU: the slot follows, or the task goes without one. */
+	/*
+	 * sched_ext chose the CPU. No concurrency limit is in force while a
+	 * BPF scheduler is loaded, see conc_scx_enable(). This only drops
+	 * accounting which a limit removed meanwhile left behind.
+	 */
 	conc_task_move(p, cpu_of(src_rq), cpu_of(dst_rq), true);
 	set_task_cpu(p, cpu_of(dst_rq));
 
@@ -7579,6 +7583,12 @@ static void scx_root_disable(struct scx_sched *sch)
 	set_cgroup_sched(sch_cgroup(sch), NULL);
 	scx_cgroup_unlock();
 
+	/*
+	 * Every task is back in its class. A concurrency limit may start
+	 * from here on, not before: the BPF scheduler placed the tasks.
+	 */
+	conc_scx_disable();
+
 	percpu_up_write(&scx_fork_rwsem);
 
 	/*
@@ -8853,6 +8863,13 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	 * never sees uninitialized tasks.
 	 */
 	scx_cgroup_lock();
+	/*
+	 * The BPF scheduler places the tasks itself. Refuse to load it while
+	 * the static key of the concurrency limit is on.
+	 */
+	ret = conc_scx_enable();
+	if (ret)
+		goto err_disable_unlock_all;
 	set_cgroup_sched(sch_cgroup(sch), sch);
 	ret = scx_cgroup_init(sch);
 	if (ret)

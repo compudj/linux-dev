@@ -9772,12 +9772,21 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 	struct task_group *parent = css_tg(css->parent);
 	int ret;
 
+	if (parent) {
+		ret = conc_tg_prepare(tg, parent);
+		if (ret)
+			return ret;
+	}
 	ret = scx_tg_online(tg);
-	if (ret)
+	if (ret) {
+		conc_tg_drop_ceiling(tg);
 		return ret;
+	}
 
 	if (parent)
 		sched_online_group(tg, parent);
+
+	conc_tg_online(tg);
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 	/* Propagate the effective uclamp value for the new group */
@@ -9793,6 +9802,7 @@ static void cpu_cgroup_css_offline(struct cgroup_subsys_state *css)
 {
 	struct task_group *tg = css_tg(css);
 
+	conc_tg_offline(tg);
 	scx_tg_offline(tg);
 }
 
@@ -9875,6 +9885,12 @@ static void cpu_cgroup_cancel_attach(struct cgroup_taskset *tset)
 	scx_cgroup_cancel_attach(tset);
 }
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+static void cpu_cgroup_release(struct task_struct *task)
+{
+	conc_task_released(task);
+}
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 static void cpu_util_update_eff(struct cgroup_subsys_state *css)
 {
@@ -10811,6 +10827,47 @@ static struct cftype cpu_files[] = {
 		.write_u64 = cpu_burst_write_u64,
 	},
 #endif /* CONFIG_CFS_BANDWIDTH */
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	{
+		.name = "concurrency.max",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = cpu_concurrency_max_show,
+		.write = cpu_concurrency_max_write,
+	},
+	{
+		.name = "concurrency.ceiling",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = cpu_concurrency_ceiling_show,
+	},
+	{
+		.name = "concurrency.effective",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.file_offset = offsetof(struct task_group, conc.effective_file),
+		.seq_show = cpu_concurrency_effective_show,
+	},
+	{
+		.name = "concurrency.stat",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = cpu_concurrency_stat_show,
+	},
+	{
+		.name = "concurrency.events",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.file_offset = offsetof(struct task_group, conc.events_file),
+		.seq_show = cpu_concurrency_events_show,
+	},
+	{
+		/*
+		 * This file exists on the root too, for the children of the
+		 * root. It is delegatable, so that a manager can distribute
+		 * the ceiling of its cgroup among the children.
+		 */
+		.name = "concurrency.child_ceiling",
+		.flags = CFTYPE_NS_DELEGATABLE,
+		.seq_show = cpu_concurrency_child_ceiling_show,
+		.write = cpu_concurrency_child_ceiling_write,
+	},
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 	{
 		.name = "uclamp.min",
@@ -10839,6 +10896,9 @@ struct cgroup_subsys cpu_cgrp_subsys = {
 	.can_attach	= cpu_cgroup_can_attach,
 	.attach		= cpu_cgroup_attach,
 	.cancel_attach	= cpu_cgroup_cancel_attach,
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	.release	= cpu_cgroup_release,
+#endif
 	.legacy_cftypes	= cpu_legacy_files,
 	.dfl_cftypes	= cpu_files,
 	.early_init	= true,

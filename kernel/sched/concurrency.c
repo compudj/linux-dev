@@ -112,6 +112,11 @@ struct conc_attach_src {
  * p->pi_lock and rq->lock, never the other way.
  */
 DEFINE_STATIC_KEY_FALSE(sched_conc_enabled);
+/*
+ * Serializes conc_key_put(). The put of the last reference waits until no
+ * task is held, then turns the key off.
+ */
+static DEFINE_MUTEX(conc_key_mutex);
 static DECLARE_SWAIT_QUEUE_HEAD(conc_held_wq);	/* woken from conc_held_wake_work */
 DEFINE_PER_CPU(const struct cpumask *, conc_select_cpus);
 static DEFINE_PER_CPU(cpumask_var_t, conc_select_mask);
@@ -274,6 +279,74 @@ static u64 conc_rotation_ns(void)
 	return (u64)max(READ_ONCE(conc_rotation_ms), 1U) * NSEC_PER_MSEC;
 }
 
+/*
+ * Take a reference on the static key. Each group with a limit or a ceiling
+ * holds one.
+ *
+ * The hot paths test the key before the per-task state (conc_task_held(),
+ * conc_task_release(), conc_select_done()). So the key is turned on with that
+ * state clean, and turned off only when no task is held.
+ *
+ * The first reference resets the per-CPU selection pointers. This is done
+ * outside conc_key_mutex. A get can find the key still on while the last put
+ * turns it off, and then skips the reset. A stale pointer can then narrow one
+ * CPU selection. select_task_rq() checks the selected CPU against the mask of
+ * the task.
+ */
+static void conc_key_get(void)
+{
+	int cpu;
+
+	if (!static_key_enabled(&sched_conc_enabled)) {
+		for_each_possible_cpu(cpu)
+			per_cpu(conc_select_cpus, cpu) = NULL;
+	}
+	static_branch_inc(&sched_conc_enabled);
+	/* A put which waits for the held tasks must not turn the key off now. */
+	swake_up_one(&conc_held_wq);
+}
+
+/*
+ * True while a BPF scheduler is loaded. It places the tasks, so no limit can
+ * start. Protected by conc_mutex.
+ */
+static bool conc_scx_active;
+
+int conc_scx_enable(void)
+{
+	guard(mutex)(&conc_mutex);
+	if (static_key_enabled(&sched_conc_enabled))
+		return -EBUSY;
+	conc_scx_active = true;
+	return 0;
+}
+
+void conc_scx_disable(void)
+{
+	guard(mutex)(&conc_mutex);
+	conc_scx_active = false;
+}
+
+static void conc_key_put(void)
+{
+	guard(mutex)(&conc_key_mutex);
+	if (static_key_count(&sched_conc_enabled.key) == 1) {
+		/*
+		 * The last reference goes. No group counts any more, so every
+		 * held task has a CPU to go to. Wait until no task is held.
+		 *
+		 * Stop waiting if conc_key_get() takes a reference meanwhile.
+		 * A limit which starts can hold tasks for as long as it
+		 * exists. The key then stays on, and this put drops one
+		 * reference of several.
+		 */
+		conc_hold_kick();
+		swait_event_exclusive(conc_held_wq, !atomic_read(&conc_nr_held) ||
+				      static_key_count(&sched_conc_enabled.key) > 1);
+	}
+	static_branch_dec(&sched_conc_enabled);
+}
+
 static void conc_hold_work_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(conc_hold_work, conc_hold_work_fn);
 
@@ -409,6 +482,92 @@ static void conc_wait_attach(void)
 #ifndef CONFIG_SCHED_MM_CID
 void sched_cid_resume(void) { }
 #endif /* !CONFIG_SCHED_MM_CID */
+
+/*
+ * Allocate the per-CPU counters and the masks of group @tg. Return 0 or
+ * -ENOMEM. Call under conc_mutex.
+ *
+ * The state is allocated when the group first counts (conc_tg_take_ceiling(),
+ * conc_tg_online(), conc_set_request()). Most groups never count, and the
+ * per-CPU allocation is costly.
+ *
+ * A group has its state from its first count on. Every reader of @present and
+ * @used relies on this. The per-task paths run for counting groups only. The
+ * walks over the groups below a counting group test for the state, see
+ * conc_tg_uses().
+ */
+static int conc_tg_state_alloc(struct task_group *tg)
+{
+	struct tg_concurrency *conc = &tg->conc;
+	atomic_t __percpu *present;
+	int cpu;
+
+	lockdep_assert_held(&conc_mutex);
+	if (conc->present)
+		return 0;
+	if (!zalloc_cpumask_var(&conc->used, GFP_KERNEL))
+		return -ENOMEM;
+	if (!alloc_cpumask_var(&conc->unused_cores, GFP_KERNEL)) {
+		free_cpumask_var(conc->used);
+		return -ENOMEM;
+	}
+	cpumask_setall(conc->unused_cores);
+	present = alloc_percpu(atomic_t);
+	if (!present) {
+		free_cpumask_var(conc->unused_cores);
+		free_cpumask_var(conc->used);
+		return -ENOMEM;
+	}
+	conc->since = alloc_percpu(u64);
+	if (!conc->since) {
+		free_percpu(present);
+		free_cpumask_var(conc->unused_cores);
+		free_cpumask_var(conc->used);
+		return -ENOMEM;
+	}
+	for_each_possible_cpu(cpu)
+		atomic_set(per_cpu_ptr(present, cpu), CONC_SLOT_UNUSED);
+	/*
+	 * Publish @present last. conc_core_online() tests it without
+	 * conc_mutex, and then uses the masks.
+	 */
+	smp_store_release(&conc->present, present);
+	return 0;
+}
+
+/*
+ * Return true if @tg uses @cpu. This serves the walks over the groups below a
+ * counting group. Such a walk can meet a group without state. css_create()
+ * links a group before cpu_cgroup_css_online() gives it any.
+ * conc_subtree_state_alloc() skips a dying group which never counted. The
+ * masks of such a group are NULL under CONFIG_CPUMASK_OFFSTACK. conc_mutex
+ * orders the test with conc_tg_state_alloc().
+ */
+static inline bool conc_tg_uses(struct task_group *tg, int cpu)
+{
+	lockdep_assert_held(&conc_mutex);
+	return tg->conc.present && cpumask_test_cpu(cpu, tg->conc.used);
+}
+
+/*
+ * Allocate the state of every group of the subtree of @top, for a limit which
+ * starts over it.
+ */
+static int conc_subtree_state_alloc(struct task_group *top)
+{
+	struct cgroup_subsys_state **csses;
+	int nr_css, k, ret = 0;
+
+	ret = conc_subtree_snapshot(top, &csses, &nr_css);
+	if (ret)
+		return ret;
+	for (k = 0; k < nr_css && !ret; k++) {
+		if (csses[k] && !css_is_dying(csses[k]))
+			ret = conc_tg_state_alloc(css_tg(csses[k]));
+	}
+	conc_subtree_release(csses, nr_css);
+	return ret;
+}
 
 int alloc_conc_sched_group(struct task_group *tg)
 {
@@ -1456,7 +1615,7 @@ static int __conc_drain_cpu(struct task_group *tg, int cpu, bool up)
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(child, &tg->children, siblings) {
-		if (!cpumask_test_cpu(cpu, child->conc.used))
+		if (!conc_tg_uses(child, cpu))
 			continue;
 		/*
 		 * A dying child is drained as any other: its slot is an entity
@@ -1530,7 +1689,7 @@ static void conc_drain_idle_children(struct task_group *tg, int cpu)
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(child, &tg->children, siblings) {
-		if (!cpumask_test_cpu(cpu, child->conc.used))
+		if (!conc_tg_uses(child, cpu))
 			continue;
 		/* A dying child is drained too, see __conc_drain_cpu(). */
 		if (!css_tryget(&child->css))
@@ -1855,6 +2014,15 @@ static int conc_update_tree(struct task_group *top, struct cpumask *scratch)
 			eff = ceiling;
 		should_active = eff || parent->conc.active;
 		new_prop = should_active && parent->conc.active;
+		/*
+		 * A group which was linked in after the caller allocated the
+		 * state of the subtree has none yet, see conc_tg_prepare().
+		 * Allocate it before the group counts.
+		 */
+		if (should_active && !conc->present && conc_tg_state_alloc(tg)) {
+			pr_warn_once("conc: no memory for css %d, which does not count\n", css->id);
+			continue;
+		}
 		if (!should_active && conc->active)
 			conc_detach_children(tg, scratch);
 
@@ -2831,7 +2999,7 @@ static int conc_set_move(struct task_group *top, int src, int dst,
 	nr = 0;
 	rcu_read_lock();
 	css_for_each_descendant_pre(css, &top->css)
-		if (cpumask_test_cpu(src, css_tg(css)->conc.used))
+		if (conc_tg_uses(css_tg(css), src))
 			nr++;
 	rcu_read_unlock();
 	if (!nr)
@@ -2843,7 +3011,7 @@ static int conc_set_move(struct task_group *top, int src, int dst,
 	css_for_each_descendant_pre(css, &top->css) {
 		struct task_group *tg = css_tg(css);
 
-		if (!cpumask_test_cpu(src, tg->conc.used))
+		if (!conc_tg_uses(tg, src))
 			continue;
 		if (arg.nr_groups == nr || !css_tryget_online(css))
 			break;
@@ -3713,7 +3881,7 @@ static const struct sched_class *conc_slot_class(struct task_group *lvl, int cpu
 		struct css_task_iter it;
 		struct task_struct *t;
 
-		if (!cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+		if (!conc_tg_uses(css_tg(css), cpu))
 			continue;
 		css_task_iter_start(css, 0, &it);
 		while ((t = css_task_iter_next(&it))) {
@@ -3982,7 +4150,7 @@ static int conc_hold_cpu(struct task_group *tg, int cpu)
 
 	rcu_read_lock();
 	css_for_each_descendant_pre(css, &tg->css)
-		if (cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+		if (conc_tg_uses(css_tg(css), cpu))
 			nr++;
 	rcu_read_unlock();
 	if (!nr)
@@ -3992,7 +4160,7 @@ static int conc_hold_cpu(struct task_group *tg, int cpu)
 		return -ENOMEM;
 	rcu_read_lock();
 	css_for_each_descendant_pre(css, &tg->css) {
-		if (!cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+		if (!conc_tg_uses(css_tg(css), cpu))
 			continue;
 		if (n == nr)
 			break;
@@ -4063,7 +4231,7 @@ static struct conc_evict_mark *conc_evict_marks_alloc(struct task_group *tg, int
 	*nr = 0;
 	rcu_read_lock();
 	css_for_each_descendant_pre(css, &tg->css)
-		if (css_tg(css) != tg && cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+		if (css_tg(css) != tg && conc_tg_uses(css_tg(css), cpu))
 			max++;
 	rcu_read_unlock();
 	if (!max)
@@ -4073,7 +4241,7 @@ static struct conc_evict_mark *conc_evict_marks_alloc(struct task_group *tg, int
 		return NULL;
 	rcu_read_lock();
 	css_for_each_descendant_pre(css, &tg->css) {
-		if (css_tg(css) == tg || !cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+		if (css_tg(css) == tg || !conc_tg_uses(css_tg(css), cpu))
 			continue;
 		if (n == max)
 			break;
@@ -4189,7 +4357,7 @@ static int conc_set_move_dest(struct task_group *top, int src, struct cpumask *s
 		struct css_task_iter it;
 		struct task_struct *t;
 
-		if (!cpumask_test_cpu(src, css_tg(css)->conc.used))
+		if (!conc_tg_uses(css_tg(css), src))
 			continue;
 		css_task_iter_start(css, 0, &it);
 		while ((t = css_task_iter_next(&it))) {
@@ -4309,7 +4477,7 @@ static int conc_evict_cpu(struct task_group *tg, int cpu, bool set_move, bool ho
 			struct css_task_iter it;
 			struct task_struct *t;
 
-			if (!cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+			if (!conc_tg_uses(css_tg(css), cpu))
 				continue;
 			if (!css_tryget_online(css))
 				continue;
@@ -4394,7 +4562,7 @@ static int conc_evict_cpu(struct task_group *tg, int cpu, bool set_move, bool ho
 
 		rcu_read_lock();
 		list_for_each_entry_rcu(child, &tg->children, siblings) {
-			if (!cpumask_test_cpu(cpu, child->conc.used) ||
+			if (!conc_tg_uses(child, cpu) ||
 			    !css_tryget_online(&child->css))
 				continue;
 			pinned = child;
@@ -4579,7 +4747,7 @@ static void conc_widen_pinned(struct task_group *tg, int cpu)
 		struct css_task_iter it;
 		struct task_struct *t;
 
-		if (!cpumask_test_cpu(cpu, css_tg(css)->conc.used) || !css_tryget_online(css))
+		if (!conc_tg_uses(css_tg(css), cpu) || !css_tryget_online(css))
 			continue;
 		rcu_read_unlock();
 		css_task_iter_start(css, 0, &it);
@@ -5040,6 +5208,24 @@ void conc_task_affinity_changed(struct task_struct *p, struct affinity_context *
 	css_put(&tg->css);
 }
 
+/*
+ * Handle the exit of task @p. Called from the release callback of the cpu
+ * controller.
+ */
+void conc_task_released(struct task_struct *p)
+{
+	struct task_group *tg;
+
+	conc_debug_hold_end(p, "exited");
+	tg = conc_pin_task_group(p);
+	if (!tg)
+		return;
+	/* A shrink is stalled. The excess may go away with the task. */
+	if (conc_needs_retry(tg))
+		conc_retry(tg);
+	css_put(&tg->css);
+}
+
 int conc_attach_record_srcs(struct cgroup_taskset *tset)
 {
 	struct cgroup_subsys_state *css;
@@ -5119,6 +5305,389 @@ void conc_attach_finish(struct cgroup_taskset *tset, bool retry)
 		conc_update_tset_mm_bounds(tset);
 	}
 	conc_attach_forget_mms();
+}
+
+/*
+ * Handle a write to cpu.concurrency.max. @limit is the value written, 0 for
+ * "max". Return 0 or a negative error code.
+ *
+ * A group with a ceiling has it since its creation (conc_tg_take_ceiling())
+ * and counts already. A write to such a group starts nothing.
+ *
+ * The static key holds one reference per group with a limit or a ceiling.
+ * Change it outside conc_mutex: a jump label update takes cpus_read_lock(),
+ * and CPU hotplug takes conc_mutex under the hotplug lock.
+ */
+static int conc_set_request(struct task_group *tg, unsigned int limit)
+{
+	unsigned int ceiling = tg->conc.ceiling, ceil_eff = ceiling;
+	struct cpumask *scratch;
+	bool was, now, start;
+	int ret = 0;
+
+	scratch = conc_alloc_scratch();
+	if (!scratch)
+		return -ENOMEM;
+
+	/*
+	 * Take a provisional reference, so that the key is on during the
+	 * checks. It is kept or dropped at the end of the function.
+	 */
+	conc_key_get();
+	/*
+	 * Turn the key on before the pending migrations are read. Pairs with
+	 * the barrier of conc_attach_check().
+	 */
+	smp_mb();
+
+	start = limit && !conc_active(&tg->conc);
+again:
+	mutex_lock(&conc_mutex);
+	if (start && conc_scx_active) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (limit && !tg->conc.active && !start) {
+		/*
+		 * The limits of its ancestors went away meanwhile. This write
+		 * starts a limit after all.
+		 */
+		mutex_unlock(&conc_mutex);
+		start = true;
+		goto again;
+	}
+	if (tg->parent->conc.ceiling_effective &&
+	    (!ceil_eff || ceil_eff > tg->parent->conc.ceiling_effective))
+		ceil_eff = tg->parent->conc.ceiling_effective;
+	if (limit && ceil_eff && limit > ceil_eff) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (limit || ceiling || tg->parent->conc.active) {
+		ret = conc_subtree_state_alloc(tg);
+		if (ret)
+			goto out;
+	}
+	was = tg->conc.request || ceiling;
+	now = limit || ceiling;
+	swap(tg->conc.request, limit);
+	ret = conc_update_tree(tg, scratch);
+	if (ret < 0) {
+		/* Nothing was changed. Keep the limit as it was. */
+		tg->conc.request = limit;
+		goto out;
+	}
+	ret = 0;
+	conc_shrink_tree(tg);
+	conc_bounds_apply(tg);
+	conc_notify_tree(tg);
+	conc_hold_kick();
+out:
+	mutex_unlock(&conc_mutex);
+
+	/*
+	 * Keep one reference per group with a limit or a ceiling. If the
+	 * group gained its first one, the provisional reference becomes the
+	 * reference of the group. Otherwise drop it. A group which lost its
+	 * limit and has no ceiling drops its own reference too.
+	 */
+	if (ret || now == was) {
+		conc_key_put();
+	} else if (!now) {
+		conc_key_put();
+		conc_key_put();
+	}
+
+	kfree(scratch);
+	return ret;
+}
+
+/*
+ * Give the new group @tg its ceiling, from the child_ceiling of @parent. The
+ * group keeps it for its whole life, because processes may size per-ID data
+ * by it. Return 0 or a negative error code.
+ *
+ * Call before sched_online_group(), which cannot be undone. If the group does
+ * not come online after all, the caller undoes this function with
+ * conc_tg_drop_ceiling().
+ */
+int conc_tg_take_ceiling(struct task_group *tg, struct task_group *parent)
+{
+	unsigned int ceiling = READ_ONCE(parent->conc.child_ceiling);
+	int ret;
+
+	if (!ceiling)
+		return 0;
+	/*
+	 * A group with a ceiling holds one reference until conc_tg_offline().
+	 */
+	conc_key_get();
+	scoped_guard(mutex, &conc_mutex)
+		ret = conc_scx_active ? -EBUSY : conc_tg_state_alloc(tg);
+	if (ret)
+		conc_key_put();
+	else
+		tg->conc.ceiling = ceiling;
+	return ret;
+}
+
+/*
+ * Prepare the new group @tg before it comes online. Take its ceiling. Under a
+ * counting parent the group counts from the start (conc_tg_online()). So
+ * allocate its state here, where an allocation failure can still fail the
+ * creation. The parent may start to count between here and conc_tg_online().
+ * conc_tg_online() then allocates the state itself, under conc_mutex.
+ */
+int conc_tg_prepare(struct task_group *tg, struct task_group *parent)
+{
+	int ret;
+
+	ret = conc_tg_take_ceiling(tg, parent);
+	if (ret || !conc_active(&parent->conc))
+		return ret;
+	scoped_guard(mutex, &conc_mutex)
+		ret = conc_tg_state_alloc(tg);
+	if (ret)
+		conc_tg_drop_ceiling(tg);
+	return ret;
+}
+
+void conc_tg_drop_ceiling(struct task_group *tg)
+{
+	if (!tg->conc.ceiling)
+		return;
+	tg->conc.ceiling = 0;
+	conc_key_put();
+}
+
+/*
+ * Make the new group @tg count from the start if its parent counts, or if it
+ * has a ceiling of its own. No task can join it before. Otherwise a group
+ * created under a limit would count nothing. Its tasks would escape the limit
+ * until the next write of a limit above it.
+ *
+ * This function cannot fail. It runs after sched_online_group() linked the
+ * group, which cpu_cgroup_css_online() cannot undo. So the scratch mask is
+ * static, protected by conc_mutex.
+ */
+void conc_tg_online(struct task_group *tg)
+{
+	static struct cpumask scratch;
+
+	if (!static_branch_unlikely(&sched_conc_enabled) || !tg->parent)
+		return;
+	mutex_lock(&conc_mutex);
+	if (tg->conc.ceiling || conc_active(&tg->parent->conc)) {
+		/*
+		 * The state was allocated in conc_tg_prepare(), unless the
+		 * parent started to count after it.
+		 */
+		if (WARN_ONCE(conc_tg_state_alloc(tg),
+			      "conc: no memory for css %d, which does not count\n", tg->css.id)) {
+			mutex_unlock(&conc_mutex);
+			return;
+		}
+		conc_update_tree(tg, &scratch);
+		/*
+		 * The group has no task yet, so there is no ID to wait for.
+		 * The file shows the values at once.
+		 */
+		conc_bounds_apply(tg);
+	}
+	mutex_unlock(&conc_mutex);
+}
+
+/*
+ * The slots which conc_tg_offline() gives back to the parent. Protected by
+ * conc_mutex. The mask is static because a removal cannot fail on an
+ * allocation.
+ */
+static struct cpumask conc_offline_held;
+
+/* Handle the removal of group @tg. It has no task and no child. */
+void conc_tg_offline(struct task_group *tg)
+{
+	struct tg_concurrency *conc = &tg->conc;
+	struct cpumask *held = &conc_offline_held;
+	unsigned long flags;
+	bool had_request;
+	int cpu;
+
+	mutex_lock(&conc_mutex);
+	had_request = conc->request || conc->ceiling;
+	conc->request = 0;
+	conc->ceiling = 0;
+	raw_spin_lock_irqsave(&conc->lock, flags);
+	if (conc->propagate)
+		cpumask_copy(held, conc->used);
+	else
+		cpumask_clear(held);
+	/* The group never counted. It has no slot to give back. */
+	if (!conc->present) {
+		raw_spin_unlock_irqrestore(&conc->lock, flags);
+		goto done;
+	}
+	conc->propagate = false;
+	WRITE_ONCE(conc->active, false);
+	conc->effective = 0;
+	conc->ceiling_effective = 0;
+	conc->shrink_pending = false;
+	for_each_cpu(cpu, conc->used)
+		atomic_set(per_cpu_ptr(conc->present, cpu), CONC_SLOT_UNUSED);
+	cpumask_clear(conc->used);
+	cpumask_setall(conc->unused_cores);
+	conc->nr_used = 0;
+	raw_spin_unlock_irqrestore(&conc->lock, flags);
+	/*
+	 * Release the entities of the parent after conc->lock is dropped, see
+	 * conc_claim_slow().
+	 */
+	for_each_cpu(cpu, held)
+		conc_release(tg->parent, cpu);
+done:
+	mutex_unlock(&conc_mutex);
+
+	irq_work_sync(&conc->irq_work);
+	cancel_work_sync(&conc->work);
+	if (had_request)
+		conc_key_put();
+}
+
+/* Print "limit ceiling". A value of 0 is printed as "max". */
+static void conc_show_pair(struct seq_file *sf, unsigned int limit, unsigned int ceiling)
+{
+	if (limit)
+		seq_printf(sf, "%u ", limit);
+	else
+		seq_puts(sf, "max ");
+	if (ceiling)
+		seq_printf(sf, "%u\n", ceiling);
+	else
+		seq_puts(sf, "max\n");
+}
+
+static void conc_show_value(struct seq_file *sf, unsigned int val)
+{
+	if (val)
+		seq_printf(sf, "%u\n", val);
+	else
+		seq_puts(sf, "max\n");
+}
+
+/* The limit requested: "max" or a positive integer. */
+int cpu_concurrency_max_show(struct seq_file *sf, void *v)
+{
+	conc_show_value(sf, READ_ONCE(css_tg(seq_css(sf))->conc.request));
+	return 0;
+}
+
+/*
+ * Show the ceiling which the cgroup took at its creation: "max" or a positive
+ * integer.
+ */
+int cpu_concurrency_ceiling_show(struct seq_file *sf, void *v)
+{
+	conc_show_value(sf, READ_ONCE(css_tg(seq_css(sf))->conc.ceiling));
+	return 0;
+}
+
+/* One value: "max" or a positive integer. */
+static int conc_parse_value(const char *tok, unsigned int *val)
+{
+	int ret;
+
+	if (!strcmp(tok, "max")) {
+		*val = 0;
+		return 0;
+	}
+	ret = kstrtouint(tok, 10, val);
+	if (ret)
+		return ret;
+	/*
+	 * The value is at most the number of possible CPUs, because processes
+	 * may size data by it.
+	 */
+	return *val && *val <= num_possible_cpus() ? 0 : -EINVAL;
+}
+
+ssize_t cpu_concurrency_max_write(struct kernfs_open_file *of,
+				  char *buf, size_t nbytes, loff_t off)
+{
+	struct task_group *tg = css_tg(of_css(of));
+	unsigned int limit;
+	char *tok;
+	int ret;
+
+	buf = strstrip(buf);
+	tok = strsep(&buf, " ");
+	if (!tok || !*tok || (buf && *strstrip(buf)))
+		return -EINVAL;
+	ret = conc_parse_value(tok, &limit);
+	if (ret)
+		return ret;
+	ret = conc_set_request(tg, limit);
+	return ret ?: nbytes;
+}
+
+/*
+ * Show the ceiling of the children created from now on: "max" or a positive
+ * integer.
+ */
+int cpu_concurrency_child_ceiling_show(struct seq_file *sf, void *v)
+{
+	conc_show_value(sf, READ_ONCE(css_tg(seq_css(sf))->conc.child_ceiling));
+	return 0;
+}
+
+ssize_t cpu_concurrency_child_ceiling_write(struct kernfs_open_file *of,
+						    char *buf, size_t nbytes, loff_t off)
+{
+	unsigned int ceiling;
+	int ret;
+
+	ret = conc_parse_value(strstrip(buf), &ceiling);
+	if (ret)
+		return ret;
+	/*
+	 * conc_tg_take_ceiling() reads the value in one load. A child takes
+	 * the old value or the new one.
+	 */
+	WRITE_ONCE(css_tg(of_css(of))->conc.child_ceiling, ceiling);
+	return nbytes;
+}
+
+/*
+ * cpu.concurrency.stat: the holds and the rotations of the subtree. See
+ * conc_stat_hold_start() and conc_rotate_for().
+ */
+int cpu_concurrency_stat_show(struct seq_file *sf, void *v)
+{
+	struct tg_concurrency *conc = &css_tg(seq_css(sf))->conc;
+
+	seq_printf(sf, "nr_held %d\n", atomic_read(&conc->st_nr_held));
+	seq_printf(sf, "nr_holds %ld\n", atomic_long_read(&conc->st_nr_holds));
+	seq_printf(sf, "held_usec %llu\n",
+		   div_u64(atomic64_read(&conc->st_held_ns), NSEC_PER_USEC));
+	seq_printf(sf, "nr_rotations %ld\n", atomic_long_read(&conc->st_nr_rotations));
+	seq_printf(sf, "rotated_usec %llu\n",
+		   div_u64(atomic64_read(&conc->st_rotated_ns), NSEC_PER_USEC));
+	return 0;
+}
+
+int cpu_concurrency_events_show(struct seq_file *sf, void *v)
+{
+	struct tg_concurrency *conc = &css_tg(seq_css(sf))->conc;
+
+	seq_printf(sf, "rotation %ld\n", atomic_long_read(&conc->st_nr_rotations));
+	return 0;
+}
+
+int cpu_concurrency_effective_show(struct seq_file *sf, void *v)
+{
+	struct task_group *tg = css_tg(seq_css(sf));
+
+	conc_show_pair(sf, conc_effective_shown(tg), READ_ONCE(tg->conc.ceiling_effective));
+	return 0;
 }
 
 /*
