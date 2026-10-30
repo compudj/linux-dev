@@ -739,6 +739,9 @@ void signal_wake_up_state(struct task_struct *t, unsigned int state)
 	 */
 	if (!wake_up_state(t, state | TASK_INTERRUPTIBLE))
 		kick_process(t);
+	/* A task held by cpu.concurrency.max is not asleep; no wakeup reaches it. */
+	if (state & TASK_WAKEKILL)
+		conc_fatal_signal(t);
 }
 
 static inline void posixtimer_sig_ignore(struct task_struct *tsk, struct sigqueue *q);

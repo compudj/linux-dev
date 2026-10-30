@@ -966,6 +966,8 @@ struct task_struct {
 	int				conc_resv_cpu;
 	/* The entry its affinity mask is registered under in its own group. */
 	struct conc_class			*conc_class;
+	struct callback_head		conc_hold_work;
+	struct list_head		conc_hold_node;
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
 #ifdef CONFIG_PREEMPT_RCU
@@ -2578,7 +2580,9 @@ struct cgroup_subsys_state;
 struct cgroup_taskset;
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 extern void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus);
+extern void conc_fatal_signal(struct task_struct *t);
 #else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static inline void conc_fatal_signal(struct task_struct *t) { }
 static inline void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus) { }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 #endif

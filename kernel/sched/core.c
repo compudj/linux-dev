@@ -340,6 +340,8 @@ void sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags)
 
 static int sched_task_is_throttled(struct task_struct *p, int cpu)
 {
+	if (conc_task_held(p))
+		return 1;
 	if (p->sched_class->task_is_throttled)
 		return p->sched_class->task_is_throttled(p, cpu);
 
@@ -2223,6 +2225,15 @@ inline bool dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 	 * and mark the task ->sched_delayed.
 	 */
 	uclamp_rq_dec(rq, p);
+	if (conc_task_held(p)) {
+		/* Out of its class already; a sleep ends the hold, see conc_held_blocks(). */
+		if (flags & DEQUEUE_SLEEP) {
+			conc_held_blocks(rq, p);
+			return true;
+		}
+		/* Anything else happens to it as to any queued task, see conc_unhold(). */
+		conc_unhold(rq, p, true);
+	}
 	return p->sched_class->dequeue_task(rq, p, flags);
 }
 
@@ -2240,6 +2251,14 @@ void activate_task(struct rq *rq, struct task_struct *p, int flags)
 void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
 {
 	WARN_ON_ONCE(flags & DEQUEUE_SLEEP);
+
+	/*
+	 * A held task is out of its class: it returns there first, as woken
+	 * up where it is, while still queued for the core, so that the class
+	 * sees a plain wakeup and then the dequeue below. See conc_unhold().
+	 */
+	if (conc_task_held(p))
+		conc_unhold(rq, p, true);
 
 	WRITE_ONCE(p->on_rq, TASK_ON_RQ_MIGRATING);
 	ASSERT_EXCLUSIVE_WRITER(p->on_rq);
@@ -2294,6 +2313,9 @@ void wakeup_preempt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct task_struct *donor = rq->donor;
 
+	/* Not in its class: nothing to preempt for, see conc_hold(). */
+	if (conc_task_held(p))
+		return;
 	if (p->sched_class == rq->next_class) {
 		rq->next_class->wakeup_preempt(rq, p, flags);
 
