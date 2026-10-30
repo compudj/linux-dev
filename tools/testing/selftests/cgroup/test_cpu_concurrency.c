@@ -522,6 +522,127 @@ cleanup:
 }
 
 /*
+ * A process whose threads are split between two sibling threaded cgroups
+ * limited to 1 each, under an unlimited parent: it runs on two CPUs and
+ * its mm_cid must stay below 2, the sum of the two limits.
+ */
+struct split_param {
+	char *b;
+};
+
+static int split_threads(const char *cgroup, void *arg)
+{
+	struct split_param *p = arg;
+	struct spinner s[4] = { };
+	cpu_set_t set;
+	char buf[32];
+	int i, cpu, target, seen;
+	long long max;
+
+	for (i = 0; i < 4; i++) {
+		clock_gettime(CLOCK_MONOTONIC, &s[i].until);
+		s[i].until.tv_sec += 1;
+		s[i].max_mm_cid = -1;
+		if (pthread_create(&s[i].thread, NULL, spin, &s[i]))
+			return 1;
+	}
+	for (i = 0; i < 4; i++)
+		while (!__atomic_load_n(&s[i].tid, __ATOMIC_ACQUIRE))
+			usleep(1000);
+	usleep(100000);
+	/*
+	 * Two of the four threads go to the other cgroup. Nothing keeps two
+	 * limited groups apart, so they are pinned to a CPU this group has
+	 * not used, for the process to span two CPUs.
+	 */
+	target = -1;
+	for (cpu = 0; cpu < get_nprocs(); cpu++) {
+		if (!((s[0].cpus_seen[cpu / 64] | s[1].cpus_seen[cpu / 64]) &
+		      (1UL << (cpu % 64)))) {
+			target = cpu;
+			break;
+		}
+	}
+	if (target < 0)
+		return 2;
+	CPU_ZERO(&set);
+	CPU_SET(target, &set);
+	for (i = 2; i < 4; i++) {
+		snprintf(buf, sizeof(buf), "%d", (int)s[i].tid);
+		if (cg_write(p->b, "cgroup.threads", buf)) {
+			fprintf(stderr, "moving a thread to the sibling failed\n");
+			return 3;
+		}
+		if (pthread_setaffinity_np(s[i].thread, sizeof(set), &set)) {
+			fprintf(stderr, "pinning a thread of the sibling failed\n");
+			return 4;
+		}
+	}
+	for (i = 0; i < 4; i++)
+		pthread_join(s[i].thread, NULL);
+
+	seen = count_cpus_seen(s, 4);
+	max = max_mm_cid_seen(s, 4);
+	if (rseq_has_mm_cid() && max >= 2) {
+		fprintf(stderr, "mm_cid %lld seen, sum of limits 2\n", max);
+		return 3;
+	}
+	if (seen < 2) {
+		fprintf(stderr, "only %d CPU used by two limited groups\n", seen);
+		return 5;
+	}
+	return 0;
+}
+
+static int test_concurrency_split(const char *root)
+{
+	struct split_param param = { };
+	char *parent = NULL, *a = NULL;
+	int ret = KSFT_FAIL;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+
+	parent = cg_name(root, "cc_test_split");
+	if (!parent)
+		goto cleanup;
+	a = cg_name(parent, "a");
+	param.b = cg_name(parent, "b");
+	if (!a || !param.b)
+		goto cleanup;
+	if (cg_create(parent))
+		goto cleanup;
+	if (cg_write(parent, "cgroup.subtree_control", "+cpu"))
+		goto cleanup;
+	if (cg_create(a) || cg_create(param.b))
+		goto cleanup;
+	if (cg_write(a, "cgroup.type", "threaded") ||
+	    cg_write(param.b, "cgroup.type", "threaded")) {
+		ret = KSFT_SKIP;
+		goto cleanup;
+	}
+	if (cg_write(a, "cpu.concurrency.max", "1") ||
+	    cg_write(param.b, "cpu.concurrency.max", "1"))
+		goto cleanup;
+
+	if (cg_run(a, split_threads, &param))
+		goto cleanup;
+
+	ret = KSFT_PASS;
+cleanup:
+	if (a)
+		cg_destroy(a);
+	if (param.b)
+		cg_destroy(param.b);
+	if (parent)
+		cg_destroy(parent);
+	free(a);
+	free(param.b);
+	free(parent);
+	return ret;
+}
+
+/*
  * Two threads pinned, while asleep, to two distinct CPUs the group does
  * not use, under a limit of 2 equal to the number of classes: unpinned
  * spinners created then must be placed on the CPUs of those classes, the
@@ -975,6 +1096,28 @@ cleanup:
 	free(param.c);
 	free(parent);
 	return ret;
+}
+
+/*
+ * clone3(2) into @cg a child that exits at once: 0 when it was born,
+ * otherwise the errno of the refusal.
+ */
+static int ns_cid_clone_into(const char *cg)
+{
+	int fd = open(cg, O_RDONLY | O_DIRECTORY), err = 0;
+	pid_t c;
+
+	if (fd < 0)
+		return errno;
+	c = clone_into_cgroup(fd);
+	if (!c)
+		_exit(0);
+	if (c < 0)
+		err = errno;
+	else
+		waitpid(c, NULL, 0);
+	close(fd);
+	return err;
 }
 
 /*
@@ -2964,6 +3107,585 @@ cleanup:
 	return ret;
 }
 
+/* State shared with the process of a round of test_concurrency_cid_decrease(). */
+struct cid_dec {
+	volatile int go, ready, done, stop, at1;
+	volatile long long max_cid;	/* -1 for none */
+	char cg[256];
+};
+
+static struct cid_dec *cd;
+
+/* Has @cg's effective value come down to 1 within a second? */
+static int cid_dec_wait_at1(const char *cg)
+{
+	int i;
+
+	for (i = 0; i < 10000; i++) {
+		if (!cg_read_strcmp(cg, "cpu.concurrency.effective", "1 max\n"))
+			return 1;
+		usleep(100);
+	}
+	return 0;
+}
+
+/* Sleep, a schedule-in under the bound in force, then note the ID given. */
+static void cid_dec_note(void)
+{
+	__u32 cid;
+
+	usleep(100);
+	cid = rseq_field(thread_rseq(), RSEQ_MM_CID_OFFSET);
+	if (cid > cd->max_cid)
+		cd->max_cid = cid;
+}
+
+static void cid_dec_busy(void)
+{
+	spin_ns(20000);
+	usleep(20);
+}
+
+/* The second thread: it holds ID 1 of its own, and writes the decrease. */
+static void *cid_dec_writer(void *arg)
+{
+	while (!cd->go)
+		cid_dec_busy();
+	cg_write(cd->cg, "cpu.concurrency.max", "1");
+	cd->at1 = cid_dec_wait_at1(cd->cg);
+	if (cd->at1)
+		cid_dec_note();
+	cd->done = 1;
+	return NULL;
+}
+
+static void *cid_dec_extra(void *arg)
+{
+	while (!cd->stop)
+		cid_dec_busy();
+	return NULL;
+}
+
+static void *cid_dec_new(void *arg)
+{
+	__u32 cid = rseq_field(thread_rseq(), RSEQ_MM_CID_OFFSET);
+
+	if (cid > cd->max_cid)
+		cd->max_cid = cid;
+	cid_dec_note();
+	return NULL;
+}
+
+/* A round's process: @writer, two threads, one writing; else three, then a new one. */
+static int cid_dec_proc(const char *cg, void *arg)
+{
+	pthread_t t[2], n;
+	int i;
+
+	if (arg) {
+		pthread_create(&t[0], NULL, cid_dec_writer, NULL);
+		usleep(200);
+		cd->ready = 1;
+		while (!cd->done)
+			cid_dec_busy();
+		if (cd->at1)
+			cid_dec_note();
+		pthread_join(t[0], NULL);
+		return 0;
+	}
+	for (i = 0; i < 2; i++)
+		pthread_create(&t[i], NULL, cid_dec_extra, NULL);
+	usleep(200);
+	cd->ready = 1;
+	while (!cd->go)
+		;
+	pthread_create(&n, NULL, cid_dec_new, NULL);
+	pthread_join(n, NULL);
+	cd->stop = 1;
+	for (i = 0; i < 2; i++)
+		pthread_join(t[i], NULL);
+	return 0;
+}
+
+/*
+ * A decrease of the limit gives no thread an ID at or above it at its
+ * next schedule-in. g has the limit 2; each round runs a new process in
+ * g, lowers the limit to 1, and waits for the effective value to read 1:
+ *  - the process has two threads, with IDs 0 and 1 of their own, and the
+ *    thread holding 1 writes the decrease; each thread then sleeps and
+ *    reads its ID. The decrease switches the process to IDs owned by the
+ *    CPUs, which ran short under the new bound and skipped the writer;
+ *  - the process has three threads, more than IDs under 2, so that its
+ *    CPUs own them; after the decrease it creates a fourth, which reads
+ *    its first ID: the one a CPU kept was handed to it as it was.
+ * 60 rounds of each; every ID read must be 0.
+ */
+static int test_concurrency_cid_decrease(const char *root)
+{
+	int ret = KSFT_FAIL, r;
+	char *g = NULL;
+
+	if (!rseq_has_mm_cid())
+		return skip("no mm_cid in the rseq area glibc registered");
+	cd = mmap(NULL, sizeof(*cd), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (cd == MAP_FAILED)
+		return KSFT_FAIL;
+	g = cg_name(root, "cc_test_cid_dec");
+	if (!g || cg_create(g))
+		goto cleanup;
+	snprintf(cd->cg, sizeof(cd->cg), "%s", g);
+	for (r = 0; r < 120; r++) {
+		int writer = r & 1;
+		pid_t pid;
+
+		memset((void *)cd, 0, offsetof(struct cid_dec, cg));
+		cd->max_cid = -1;
+		if (cg_write(g, "cpu.concurrency.max", "2"))
+			goto cleanup;
+		pid = cg_run_nowait(g, cid_dec_proc, writer ? (void *)1 : NULL);
+		if (pid < 0)
+			goto cleanup;
+		while (!cd->ready)
+			usleep(10);
+		usleep(2000);
+		if (writer) {
+			cd->go = 1;
+		} else {
+			if (cg_write(g, "cpu.concurrency.max", "1"))
+				goto cleanup;
+			cd->at1 = cid_dec_wait_at1(g);
+			cd->go = 1;
+		}
+		waitpid(pid, NULL, 0);
+		if (!cd->at1) {
+			fprintf(stderr, "round %d: the effective value stayed above 1 for 1 s\n", r);
+			goto cleanup;
+		}
+		if (cd->max_cid != 0) {
+			fprintf(stderr, "round %d (%s): ID %lld read under effective value 1\n",
+				r, writer ? "a thread writing the decrease" : "a thread created after it",
+				cd->max_cid);
+			goto cleanup;
+		}
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (g) {
+		cg_write(g, "cpu.concurrency.max", "max");
+		cg_destroy(g);
+	}
+	free(g);
+	munmap((void *)cd, sizeof(*cd));
+	return ret;
+}
+
+/* State shared with the processes of test_concurrency_effective_ids(). */
+struct eff_ids {
+	volatile int at1, stop, ready, judged, bad;
+	unsigned int bad_cid;		/* read once its process is reaped */
+	char file[PATH_MAX];
+};
+
+static struct eff_ids *ei;
+
+static void *eff_ids_sleep(void *arg)
+{
+	for (;;)
+		pause();
+	return NULL;
+}
+
+/* The sibling's process: @arg threads that sleep, each walked by a bound update. */
+static int eff_ids_bulk(const char *cgroup, void *arg)
+{
+	long i, n = (long)arg;
+	pthread_attr_t attr;
+
+	pthread_attr_init(&attr);
+	pthread_attr_setstacksize(&attr, 64 * 1024);
+	for (i = 0; i < n; i++) {
+		pthread_t t;
+
+		if (pthread_create(&t, &attr, eff_ids_sleep, NULL))
+			break;
+	}
+	ei->ready = 1;
+	for (;;)
+		pause();
+	return 0;
+}
+
+/*
+ * Run a millisecond, read the effective value, sleep, then read the ID
+ * given at the schedule-in: judged while the limit is 1 only, since an
+ * increase may come between the read and the schedule-in.
+ */
+static void *eff_ids_reader(void *arg)
+{
+	while (!ei->stop) {
+		int at1 = ei->at1, v;
+		__u32 cid;
+		char buf[32];
+
+		spin_ns(1000000);
+		if (read_text(ei->file, buf, sizeof(buf)) <= 0 || !strncmp(buf, "max", 3))
+			continue;
+		v = atoi(buf);
+		usleep(50);
+		cid = rseq_field(thread_rseq(), RSEQ_MM_CID_OFFSET);
+		__sync_synchronize();
+		if (!at1 || !ei->at1)
+			continue;
+		__sync_fetch_and_add(&ei->judged, 1);
+		if (cid >= (__u32)v) {
+			__sync_fetch_and_add(&ei->bad, 1);
+			ei->bad_cid = cid;
+		}
+	}
+	return NULL;
+}
+
+/* A round's process: two readers, each with an ID of its own, 0 and 1. */
+static int eff_ids_proc(const char *cgroup, void *arg)
+{
+	pthread_t t;
+
+	pthread_create(&t, NULL, eff_ids_reader, NULL);
+	eff_ids_reader(NULL);
+	pthread_join(t, NULL);
+	return 0;
+}
+
+/*
+ * cpu.concurrency.effective never reads below the bound the IDs are
+ * still given under: a thread scheduled in after reading it gets an ID
+ * below the value read. g (limit 2) has two children: c0, made first,
+ * holds a process of 1000 sleeping threads, and c1 a new process every
+ * round, two threads that run and read c1's effective value, sleep, and
+ * read their ID. The limit drops to 1 for 100 ms, then is back at 2. The
+ * bounds of a subtree are applied one task after the other, c0's before
+ * c1's: c1's value used to read 1 for those milliseconds while its
+ * process still held IDs 0 and 1 of its own, at every decrease.
+ */
+static int test_concurrency_effective_ids(const char *root)
+{
+	char *g = NULL, *c0 = NULL, *c1 = NULL;
+	int ret = KSFT_FAIL, r, i;
+	pid_t bulk = -1;
+
+	if (!rseq_has_mm_cid())
+		return skip("no mm_cid in the rseq area glibc registered");
+	if (get_nprocs() < 2)
+		return skip("2 CPUs needed, %d online", get_nprocs());
+	ei = mmap(NULL, sizeof(*ei), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (ei == MAP_FAILED)
+		return KSFT_FAIL;
+	memset((void *)ei, 0, sizeof(*ei));
+	g = cg_name(root, "cc_test_eff_ids");
+	c0 = cg_name(g, "c0");
+	c1 = cg_name(g, "c1");
+	if (!g || !c0 || !c1 || cg_create(g) || cg_write(g, "cgroup.subtree_control", "+cpu") ||
+	    cg_create(c0) || cg_create(c1) || cg_write(g, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	snprintf(ei->file, sizeof(ei->file), "%s/cpu.concurrency.effective", c1);
+	bulk = cg_run_nowait(c0, eff_ids_bulk, (void *)1000L);
+	if (bulk < 0)
+		goto cleanup;
+	for (i = 0; i < 5000 && !ei->ready; i++)
+		usleep(1000);
+	if (!ei->ready)
+		goto cleanup;
+	for (r = 0; r < 20; r++) {
+		pid_t pid;
+
+		ei->stop = 0;
+		pid = cg_run_nowait(c1, eff_ids_proc, NULL);
+		if (pid < 0)
+			goto cleanup;
+		usleep(100000);
+		ei->at1 = 1;
+		__sync_synchronize();
+		if (cg_write(g, "cpu.concurrency.max", "1"))
+			goto cleanup;
+		usleep(100000);
+		ei->at1 = 0;
+		__sync_synchronize();
+		ei->stop = 1;
+		waitpid(pid, NULL, 0);
+		if (cg_write(g, "cpu.concurrency.max", "2"))
+			goto cleanup;
+		if (ei->bad) {
+			fprintf(stderr, "round %d: ID %u read after the effective value read 1, %d times\n",
+				r, ei->bad_cid, ei->bad);
+			goto cleanup;
+		}
+	}
+	if (!ei->judged) {
+		fprintf(stderr, "the effective value never read 1\n");
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (bulk > 0) {
+		kill(bulk, SIGKILL);
+		waitpid(bulk, NULL, 0);
+	}
+	if (g)
+		cg_write(g, "cpu.concurrency.max", "max");
+	if (c1)
+		cg_destroy(c1);
+	if (c0)
+		cg_destroy(c0);
+	if (g)
+		cg_destroy(g);
+	free(c1);
+	free(c0);
+	free(g);
+	munmap((void *)ei, sizeof(*ei));
+	return ret;
+}
+
+#ifndef PR_SET_CONCURRENCY_PIN
+#define PR_SET_CONCURRENCY_PIN	82
+#define PR_GET_CONCURRENCY_PIN	83
+#endif /* !PR_SET_CONCURRENCY_PIN */
+
+/*
+ * prctl(PR_SET_CONCURRENCY_PIN): a process pins itself to its cpu cgroup,
+ * for good, and may size per-ID data by the ceiling PR_GET_CONCURRENCY_PIN
+ * returns. In "in", created with the hard value 2 beside "out":
+ *  - the pinned process reads the ceiling 2; unpinning fails with EPERM,
+ *    pinning again succeeds; clone3(CLONE_INTO_CGROUP) of a child into
+ *    out is refused with EBUSY, into in admitted;
+ *  - neither it nor its fork(2) child, which reads the same ceiling, can
+ *    be moved to out (EBUSY), and the cpu controller turned off above
+ *    them is refused with EBUSY;
+ *  - a child that called execve(2) reads no ceiling and moves, as does an
+ *    unpinned process beside them.
+ */
+struct pin_shared {
+	int ready, err, ceiling, child_ceiling;
+	pid_t child, exec;
+};
+
+struct pin_param {
+	struct pin_shared *sh;
+	const char *out;
+	int pipe_wr;
+};
+
+#define PIN_SKIP	-1
+static int pin_run(const char *cgroup, void *arg)
+{
+	struct pin_param *p = arg;
+	struct pin_shared *sh = p->sh;
+	char fd[16];
+	pid_t c;
+
+	if (prctl(PR_GET_CONCURRENCY_PIN, 0, 0, 0, 0)) {
+		sh->err = errno == EINVAL ? PIN_SKIP : 1;
+		goto done;
+	}
+	if (prctl(PR_SET_CONCURRENCY_PIN, 1, 0, 0, 0)) {
+		sh->err = 2;
+		goto done;
+	}
+	sh->ceiling = prctl(PR_GET_CONCURRENCY_PIN, 0, 0, 0, 0);
+	if (prctl(PR_SET_CONCURRENCY_PIN, 0, 0, 0, 0) != -1 || errno != EPERM) {
+		sh->err = 3;
+		goto done;
+	}
+	if (prctl(PR_SET_CONCURRENCY_PIN, 1, 0, 0, 0)) {
+		sh->err = 4;
+		goto done;
+	}
+	if (prctl(PR_SET_CONCURRENCY_PIN, 2, 0, 0, 0) != -1 || errno != EINVAL) {
+		sh->err = 5;
+		goto done;
+	}
+	if (ns_cid_clone_into(p->out) != EBUSY) {
+		sh->err = 6;
+		goto done;
+	}
+	if (ns_cid_clone_into(cgroup)) {
+		sh->err = 7;
+		goto done;
+	}
+	c = fork();
+	if (!c) {
+		__atomic_store_n(&sh->child_ceiling, prctl(PR_GET_CONCURRENCY_PIN, 0, 0, 0, 0),
+				 __ATOMIC_RELEASE);
+		for (;;)
+			pause();
+	}
+	sh->child = c;
+	snprintf(fd, sizeof(fd), "%d", p->pipe_wr);
+	c = fork();
+	if (!c) {
+		execl("/proc/self/exe", "test_cpu_concurrency", "--pin-get", fd, (char *)NULL);
+		_exit(127);
+	}
+	sh->exec = c;
+done:
+	__atomic_store_n(&sh->ready, 1, __ATOMIC_RELEASE);
+	for (;;)
+		pause();
+	return 0;
+}
+
+/* Re-executed by pin_run(): report the ceiling on @fd, then wait to be moved. */
+static int pin_get_main(int fd)
+{
+	int v = prctl(PR_GET_CONCURRENCY_PIN, 0, 0, 0, 0);
+
+	if (write(fd, &v, sizeof(v)) != sizeof(v))
+		return 1;
+	close(fd);
+	for (;;)
+		pause();
+	return 0;
+}
+
+static void pin_kill(pid_t pid, bool reap)
+{
+	if (pid <= 0)
+		return;
+	kill(pid, SIGKILL);
+	if (reap)
+		waitpid(pid, NULL, 0);
+}
+
+static int test_concurrency_pin(const char *root)
+{
+	char *parent = NULL, *in = NULL, *out = NULL;
+	struct pin_param param = { };
+	struct pin_shared *sh;
+	int ret = KSFT_FAIL, pfd[2] = { -1, -1 }, v = -1, err, i;
+	pid_t pinned = -1, other = -1;
+	struct pollfd pf;
+
+	if (need_cpus(2))
+		return KSFT_SKIP;
+	sh = mmap(NULL, sizeof(*sh), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (sh == MAP_FAILED)
+		return KSFT_FAIL;
+	memset(sh, 0, sizeof(*sh));
+	sh->child_ceiling = -1;
+	if (pipe(pfd))
+		goto cleanup;
+	parent = cg_name(root, "cc_test_pin");
+	if (!parent)
+		goto cleanup;
+	in = cg_name(parent, "in");
+	out = cg_name(parent, "out");
+	if (!in || !out)
+		goto cleanup;
+	if (cg_create(parent) || cg_write(parent, "cgroup.subtree_control", "+cpu") ||
+	    cg_write(parent, "cpu.concurrency.child_ceiling", "2") ||
+	    cg_create(in) || cg_create(out))
+		goto cleanup;
+
+	param.sh = sh;
+	param.out = out;
+	param.pipe_wr = pfd[1];
+	pinned = cg_run_nowait(in, pin_run, &param);
+	if (pinned < 0)
+		goto cleanup;
+	for (i = 0; i < 200 && !__atomic_load_n(&sh->ready, __ATOMIC_ACQUIRE); i++)
+		usleep(10000);
+	if (!sh->ready) {
+		fprintf(stderr, "the pinned process did not report\n");
+		goto cleanup;
+	}
+	if (sh->err == PIN_SKIP) {
+		ret = KSFT_SKIP;
+		goto cleanup;
+	}
+	if (sh->err) {
+		fprintf(stderr, "the pinned process failed its check %d\n", sh->err);
+		goto cleanup;
+	}
+	if (sh->ceiling != 2) {
+		fprintf(stderr, "ceiling %d under the hard value 2\n", sh->ceiling);
+		goto cleanup;
+	}
+	for (i = 0; i < 200 && __atomic_load_n(&sh->child_ceiling, __ATOMIC_ACQUIRE) < 0; i++)
+		usleep(10000);
+	if (sh->child_ceiling != 2) {
+		fprintf(stderr, "the fork child of a pinned process reads the ceiling %d, not 2\n",
+			sh->child_ceiling);
+		goto cleanup;
+	}
+
+	err = cg_enter(out, pinned);
+	if (err != -EBUSY) {
+		fprintf(stderr, "moving the pinned process: %s, not EBUSY\n",
+			err ? strerror(-err) : "accepted");
+		goto cleanup;
+	}
+	err = cg_enter(out, sh->child);
+	if (err != -EBUSY) {
+		fprintf(stderr, "moving the fork child of the pinned process: %s, not EBUSY\n",
+			err ? strerror(-err) : "accepted");
+		goto cleanup;
+	}
+	if (cg_enter(in, pinned)) {
+		fprintf(stderr, "writing the pinned process to its own cgroup failed\n");
+		goto cleanup;
+	}
+	err = cg_write(parent, "cgroup.subtree_control", "-cpu");
+	if (err != -EBUSY) {
+		fprintf(stderr, "cpu controller turned off above a pinned process: %s, not EBUSY\n",
+			err ? strerror(-err) : "accepted");
+		goto cleanup;
+	}
+
+	pf.fd = pfd[0];
+	pf.events = POLLIN;
+	if (poll(&pf, 1, 2000) != 1 || read(pfd[0], &v, sizeof(v)) != sizeof(v)) {
+		fprintf(stderr, "the child that called execve(2) did not report\n");
+		goto cleanup;
+	}
+	if (v) {
+		fprintf(stderr, "after execve(2), the ceiling is %d, not 0\n", v);
+		goto cleanup;
+	}
+	err = cg_enter(out, sh->exec);
+	if (err) {
+		fprintf(stderr, "moving a child after its execve(2): %s\n", strerror(-err));
+		goto cleanup;
+	}
+	other = cg_run_nowait(in, sleep_forever, NULL);
+	if (other < 0)
+		goto cleanup;
+	err = cg_enter(out, other);
+	if (err) {
+		fprintf(stderr, "moving an unpinned process: %s\n", strerror(-err));
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	pin_kill(sh->exec, false);
+	pin_kill(sh->child, false);
+	pin_kill(pinned, true);
+	pin_kill(other, true);
+	if (in)
+		cg_destroy(in);
+	if (out)
+		cg_destroy(out);
+	if (parent)
+		cg_destroy(parent);
+	if (pfd[0] >= 0) {
+		close(pfd[0]);
+		close(pfd[1]);
+	}
+	munmap(sh, sizeof(*sh));
+	free(in);
+	free(out);
+	free(parent);
+	return ret;
+}
+
 /*
  * From a process in @out pinned to CPUs @from to @to (every CPU when @from
  * is negative), clone3() with CLONE_INTO_CGROUP into @cg, the child exiting
@@ -3976,6 +4698,7 @@ struct cc_test {
 	T(test_concurrency_relax),
 	T(test_concurrency_move),
 	T(test_concurrency_hotplug),
+	T(test_concurrency_split),
 	T(test_concurrency_hard),
 	T(test_concurrency_cpuset_refused),
 	T(test_concurrency_sleepers),
@@ -3997,6 +4720,9 @@ struct cc_test {
 	T(test_concurrency_refused_affinity),
 	T(test_concurrency_offline_affinity),
 	T(test_concurrency_setmove_mask),
+	T(test_concurrency_cid_decrease),
+	T(test_concurrency_effective_ids),
+	T(test_concurrency_pin),
 	T(test_concurrency_clone_into),
 	T(test_concurrency_self_move),
 	T(test_concurrency_vhost),
@@ -4011,6 +4737,8 @@ int main(int argc, char *argv[])
 	char *probe;
 	int i;
 
+	if (argc == 3 && !strcmp(argv[1], "--pin-get"))
+		return pin_get_main(atoi(argv[2]));
 	ksft_print_header();
 	if (cg_find_unified_root(root, sizeof(root), NULL))
 		ksft_exit_skip("cgroup v2 isn't mounted\n");
