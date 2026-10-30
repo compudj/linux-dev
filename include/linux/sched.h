@@ -2624,4 +2624,18 @@ static inline int conc_cpuset_check(struct cgroup_subsys_state *css,
 	return 0;
 }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
+#if defined(CONFIG_SCHED_MAX_CONCURRENCY) && defined(CONFIG_SCHED_MM_CID)
+extern int sched_conc_set_pin(unsigned long pin);
+extern int sched_conc_get_pin(void);
+#endif
+#if !(defined(CONFIG_SCHED_MAX_CONCURRENCY) && defined(CONFIG_SCHED_MM_CID))
+static inline int sched_conc_set_pin(unsigned long pin)
+{
+	return -EINVAL;
+}
+static inline int sched_conc_get_pin(void)
+{
+	return -EINVAL;
+}
+#endif
 #endif

@@ -335,6 +335,14 @@ static struct irq_work conc_hold_irq_work = IRQ_WORK_INIT_HARD(conc_hold_irq_wor
 unsigned int conc_limit_gen;
 static LIST_HEAD(conc_attach_srcs);
 
+#ifdef CONFIG_SCHED_MM_CID
+static int conc_pin_check(struct cgroup_taskset *tset);
+static int conc_pin_fork_check(struct task_struct *p, struct kernel_clone_args *kargs);
+
+/* A process pinned itself since boot: the checks below have something to find. */
+static bool conc_pinned_any;
+#endif /* CONFIG_SCHED_MM_CID */
+
 static inline bool conc_cpu_usable(int cpu)
 {
 	return cpu_active(cpu) && !cpumask_test_cpu(cpu, &conc_offlining_cpus);
@@ -6456,6 +6464,15 @@ int cpu_concurrency_effective_show(struct seq_file *sf, void *v)
 	return 0;
 }
 
+#ifndef CONFIG_SCHED_MM_CID
+static inline int conc_pin_check(struct cgroup_taskset *tset) { return 0; }
+
+static inline int conc_pin_fork_check(struct task_struct *p, struct kernel_clone_args *kargs)
+{
+	return 0;
+}
+#endif /* !CONFIG_SCHED_MM_CID */
+
 /* Is @tg in the subtree of @top? */
 static bool conc_tg_below(struct task_group *tg, struct task_group *top)
 {
@@ -6813,10 +6830,71 @@ static bool conc_tg_is_ancestor(struct task_group *anc, struct task_group *tg)
 }
 
 /*
+ * prctl(PR_SET_CONCURRENCY_PIN): the calling process pins itself to its
+ * cpu cgroup, for good. No task using its mm may change cpu cgroup any
+ * more (conc_pin_check(), conc_pin_fork_check()), and a new thread joins its
+ * creator's group: the lowest common ancestor of the groups of the users
+ * of the mm's domain can only descend. The domain's bound stays within
+ * the effective ceiling of that ancestor, which counts whenever it has
+ * one (a ceiling starts counting below it), and which never changes:
+ * that is the ceiling the pin records, or the number of possible CPUs
+ * when no ceiling applies. A fork(2) child, whose memory is a copy,
+ * inherits the pin with its ceiling (dup_mm()); execve(2) starts an mm of
+ * its own, unpinned.
+ *
+ * Under cgroup_mutex, which every change of cgroup holds from its check
+ * to the change: a migration (can_attach() to attach()), clone3(2) with
+ * CLONE_INTO_CGROUP (cgroup_css_set_fork() to cgroup_post_fork()).
+ */
+int sched_conc_set_pin(unsigned long pin)
+{
+	struct mm_struct *mm = current->mm;
+	struct task_group *lca = NULL;
+	struct cid_domain *dom;
+	unsigned int ceiling;
+	struct cid_user *u;
+
+	if (pin > 1 || !mm || (current->flags & PF_KTHREAD))
+		return -EINVAL;
+	/* No way back. */
+	if (!pin)
+		return READ_ONCE(mm->conc_pin) ? -EPERM : 0;
+	cgroup_lock();
+	if (mm->conc_pin)
+		goto out;
+	dom = &mm->mm_cid;
+	scoped_guard(raw_spinlock_irq, &dom->lock) {
+		hlist_for_each_entry(u, &dom->user_list, node) {
+			struct task_group *tg = READ_ONCE(cid_user_task(dom, u)->sched_task_group);
+
+			lca = lca ? conc_tg_lca(lca, tg) : tg;
+		}
+	}
+	ceiling = lca ? READ_ONCE(lca->conc.ceiling_effective) : 0;
+	if (!ceiling || ceiling > num_possible_cpus())
+		ceiling = num_possible_cpus();
+	WRITE_ONCE(mm->conc_pin, ceiling);
+	conc_pinned_any = true;
+out:
+	cgroup_unlock();
+	return 0;
+}
+
+/* prctl(PR_GET_CONCURRENCY_PIN): the ceiling of the pin, 0 when not pinned. */
+int sched_conc_get_pin(void)
+{
+	struct mm_struct *mm = current->mm;
+
+	if (!mm || (current->flags & PF_KTHREAD))
+		return -EINVAL;
+	return READ_ONCE(mm->conc_pin);
+}
+
+/*
  * Is @t pinned to its cpu cgroup? Its mm is read under task_lock(), as
  * execve(2) replaces it. A kernel thread borrowing an mm is not.
  */
-static __maybe_unused bool conc_task_pinned(struct task_struct *t)
+static bool conc_task_pinned(struct task_struct *t)
 {
 	bool pinned;
 
@@ -6826,6 +6904,41 @@ static __maybe_unused bool conc_task_pinned(struct task_struct *t)
 	pinned = t->mm && READ_ONCE(t->mm->conc_pin);
 	task_unlock(t);
 	return pinned;
+}
+
+/*
+ * can_attach(): a pinned task may not change cpu cgroup, whether written
+ * to cgroup.procs or cgroup.threads, or moved by a change of the
+ * controllers enabled above it: -EBUSY. Under cgroup_mutex, as the pins
+ * are set.
+ */
+static int conc_pin_check(struct cgroup_taskset *tset)
+{
+	struct cgroup_subsys_state *css;
+	struct task_struct *task;
+
+	lockdep_assert_held(&cgroup_mutex);
+	if (!conc_pinned_any)
+		return 0;
+	cgroup_taskset_for_each(task, css, tset) {
+		if (task_css(task, cpu_cgrp_id) != css && conc_task_pinned(task))
+			return -EBUSY;
+	}
+	return 0;
+}
+
+/*
+ * clone3(2) with CLONE_INTO_CGROUP: the child of a pinned process, whose
+ * memory is sized by the pin's ceiling or is its parent's, is born in its
+ * parent's cpu cgroup or not at all: -EBUSY. Under cgroup_mutex, held for
+ * CLONE_INTO_CGROUP.
+ */
+static int conc_pin_fork_check(struct task_struct *p, struct kernel_clone_args *kargs)
+{
+	lockdep_assert_held(&cgroup_mutex);
+	if (!conc_pinned_any || !p->mm || (p->flags & PF_KTHREAD) || !READ_ONCE(p->mm->conc_pin))
+		return 0;
+	return kargs->cset->subsys[cpu_cgrp_id] != task_css(current, cpu_cgrp_id) ? -EBUSY : 0;
 }
 
 /* The innermost counting group at or above the domain's common ancestor. */

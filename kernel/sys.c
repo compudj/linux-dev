@@ -2889,6 +2889,16 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			return -EINVAL;
 		error = rseq_slice_extension_prctl(arg2, arg3);
 		break;
+	case PR_SET_CONCURRENCY_PIN:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = sched_conc_set_pin(arg2);
+		break;
+	case PR_GET_CONCURRENCY_PIN:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = sched_conc_get_pin();
+		break;
 	case PR_GET_CFI:
 		if (arg2 != PR_CFI_BRANCH_LANDING_PADS)
 			return -EINVAL;
