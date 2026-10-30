@@ -6,6 +6,7 @@
  * scheduler calls are inline in concurrency.h.
  */
 
+#include <linux/delay.h>
 #include <linux/sched/isolation.h>
 #include <linux/sched/clock.h>
 #include <linux/sched/mm.h>
@@ -30,6 +31,14 @@
 /* The active groups from @tg up. */
 #define for_each_conc_level_from(lvl, tg)						\
 	for (lvl = (tg); conc_active(&lvl->conc); lvl = lvl->parent)
+
+#define CONC_EVICT_ROUNDS	10
+/*
+ * conc_hold_cpu() waits for the tasks of a slot to be held. It looks every
+ * 50 to 100 us, this many times: 20 to 40 ms in all. A task is held at its
+ * next return to user space, which a reschedule forces.
+ */
+#define CONC_HOLD_ROUNDS	400
 
 /* An ancestor of the top group, outside the moved set, that counts it. */
 struct conc_sm_ancestor {
@@ -76,6 +85,15 @@ static DEFINE_MUTEX(conc_mutex);
  */
 static struct cpumask conc_offlining_cpus __read_mostly;
 
+/*
+ * Serialize a set-move stopper against a late arrival. The stopper holds it
+ * from its count check to its relabel. A late arrival holds it to claim an
+ * evicting slot. If the claim comes before the check, the task is moved.
+ * Otherwise the claim finds the slot gone and the task selects again. Take
+ * it before tg->conc.lock.
+ */
+static DEFINE_RAW_SPINLOCK(conc_sm_lock);
+
 static int conc_subtree_snapshot(struct task_group *top, struct cgroup_subsys_state ***out,
 				 int *nr);
 static void conc_subtree_release(struct cgroup_subsys_state **arr, int n);
@@ -105,6 +123,12 @@ static struct task_group *conc_pin_task_group(struct task_struct *p);
 
 static void conc_notify_tree(struct task_group *top);
 
+static int conc_evict_cpu(struct task_group *tg, int cpu, bool set_move, bool hold,
+			struct task_struct *mask_task, const struct cpumask *mask,
+			const struct cpumask *within);
+static int conc_hold_cpu(struct task_group *tg, int cpu);
+static bool conc_make_headroom(struct task_group *tg);
+static bool conc_needs_retry(struct task_group *tg);
 
 /*
  * Holding
@@ -382,7 +406,13 @@ static bool __conc_has_room(struct tg_concurrency *conc)
 	return !conc->effective || conc->nr_used < conc->effective;
 }
 
-static __maybe_unused struct cpumask *conc_alloc_scratch(void)
+static bool conc_has_room(struct tg_concurrency *conc)
+{
+	guard(raw_spinlock_irqsave)(&conc->lock);
+	return __conc_has_room(conc);
+}
+
+static struct cpumask *conc_alloc_scratch(void)
 {
 	return kmalloc(cpumask_size(), GFP_KERNEL);
 }
@@ -487,6 +517,36 @@ out:
 	if (parent_claimed && !parent_used)
 		conc_release(tg->parent, cpu);
 	return ret;
+}
+
+/*
+ * Claim a slot of @tg on @cpu which is being evicted or drained. Used for a
+ * task which found no other CPU within the limit (a late arrival). The
+ * group's concurrency IDs are still on that CPU. conc_sm_lock orders this
+ * against the set-move stopper.
+ *
+ * Return false if the slot is not evicting or draining any more. The caller
+ * then selects again.
+ */
+static bool conc_claim_late(struct task_group *tg, int cpu)
+{
+	struct tg_concurrency *conc = &tg->conc;
+	atomic_t *slot = per_cpu_ptr(conc->present, cpu);
+	int v = atomic_read(slot);
+
+	if (!conc_slot_evicting(v) && v != CONC_SLOT_DRAINING)
+		return false;
+
+	guard(raw_spinlock)(&conc_sm_lock);
+	guard(raw_spinlock)(&conc->lock);
+	v = atomic_read(slot);
+	if (conc_slot_evicting(v))
+		atomic_inc(slot);
+	else if (v == CONC_SLOT_DRAINING)
+		atomic_set(slot, 1);	/* the cleaner notices and keeps the slot */
+	else
+		return false;
+	return true;
 }
 
 /*
@@ -641,8 +701,14 @@ again:
 		 *
 		 * The claim fails when the slot is gone. The used set
 		 * changed then, so select again.
+		 *
+		 * A held task takes no such slot. It needs no CPU now, and
+		 * the eviction may have just held it to empty that slot,
+		 * see conc_hold_cpu().
 		 */
 		for_each_cpu_and(c, tg->conc.used, p->cpus_ptr) {
+			if (held)
+				break;
 			if (!is_cpu_allowed(p, c))
 				continue;
 			if (conc_claim_late(tg, c)) {
@@ -1222,6 +1288,33 @@ static int conc_drain_cpu(struct task_group *tg, int cpu)
 }
 
 /*
+ * Drain the idle slots which the child groups of @tg keep on @cpu. A slot
+ * is sticky. It stays after the tasks of the child left the CPU or the
+ * group, and still counts as an entity of @tg. Leave the busy children
+ * alone.
+ */
+static __maybe_unused void conc_drain_idle_children(struct task_group *tg, int cpu)
+{
+	struct task_group *child;
+
+	lockdep_assert_held(&conc_mutex);
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(child, &tg->children, siblings) {
+		if (!cpumask_test_cpu(cpu, child->conc.used))
+			continue;
+		/* A dying child is drained too, see __conc_drain_cpu(). */
+		if (!css_tryget(&child->css))
+			continue;
+		rcu_read_unlock();
+		__conc_drain_cpu(child, cpu, false);
+		rcu_read_lock();
+		css_put(&child->css);
+	}
+	rcu_read_unlock();
+}
+
+/*
  * Remove idle slots of a group at its limit until a new slot fits. The
  * next task that needs a new CPU then finds room. Also apply the
  * concurrency bounds after the reported value dropped, see
@@ -1474,10 +1567,15 @@ static void conc_detach_children(struct task_group *tg, struct cpumask *scratch)
  * counts. Switch counting on or off to match. Walk in pre-order, so that a
  * parent's state is final when its children are visited. Shrinking is
  * left to the caller.
+ *
+ * Return 1 if a value changed which the concurrency ID bounds or the
+ * effective files depend on, see __conc_retry(), and 0 if none did. Return
+ * -ENOMEM if the subtree could not be walked. Nothing was changed then.
  */
-static __maybe_unused void conc_update_tree(struct task_group *top, struct cpumask *scratch)
+static int conc_update_tree(struct task_group *top, struct cpumask *scratch)
 {
 	struct cgroup_subsys_state **csses, *css;
+	bool changed = false;
 	int nr_css, k;
 
 	lockdep_assert_held(&conc_mutex);
@@ -1489,7 +1587,7 @@ static __maybe_unused void conc_update_tree(struct task_group *top, struct cpuma
 	 */
 	if (conc_subtree_snapshot(top, &csses, &nr_css)) {
 		pr_warn_once("conc: no memory to update the limits of css %d\n", top->css.id);
-		return;
+		return -ENOMEM;
 	}
 	for (k = 0; k < nr_css; k++) {
 		bool should_active, new_prop, walk = false, teardown = false;
@@ -1498,6 +1596,7 @@ static __maybe_unused void conc_update_tree(struct task_group *top, struct cpuma
 		struct tg_concurrency *conc;
 		unsigned long flags;
 		int cpu, attach = 0;
+		bool stalled;
 
 		css = csses[k];
 		if (!css)
@@ -1532,6 +1631,15 @@ static __maybe_unused void conc_update_tree(struct task_group *top, struct cpuma
 
 		raw_spin_lock_irqsave(&conc->lock, flags);
 		was = conc_report_ceiling(conc);
+		/*
+		 * A drop of the reported value which is not applied to the
+		 * bounds yet counts as a change too, see
+		 * conc_report_drop().
+		 */
+		changed |= eff != conc->effective || ceiling != conc->ceiling_effective ||
+			   should_active != conc->active || new_prop != conc->propagate ||
+			   conc->bounds_pending;
+		stalled = conc->shrink_pending;
 		conc->effective = eff;
 		conc->ceiling_effective = ceiling;
 		if (should_active && !conc->active) {
@@ -1556,10 +1664,18 @@ static __maybe_unused void conc_update_tree(struct task_group *top, struct cpuma
 			attach = new_prop ? 1 : -1;
 		}
 		conc->shrink_pending = eff && conc->nr_used > eff;
+		changed |= conc->shrink_pending != stalled;
 		/* The caller applies the bounds, see conc_bounds_apply(). */
 		if (conc_report_ceiling(conc) < was)
 			conc_report_drop(conc, was);
 		raw_spin_unlock_irqrestore(&conc->lock, flags);
+		/*
+		 * The shown value may also differ from the one last
+		 * notified. A stalled group reports the number of CPUs it
+		 * uses, see conc_report_ceiling().
+		 */
+		changed |= conc_effective_shown(tg) != conc->reported ||
+			   ceiling != conc->reported_ceiling;
 
 		if (attach) {
 			for_each_cpu(cpu, scratch) {
@@ -1576,6 +1692,7 @@ static __maybe_unused void conc_update_tree(struct task_group *top, struct cpuma
 			conc_deactivate_tasks(tg);
 	}
 	conc_subtree_release(csses, nr_css);
+	return changed;
 }
 
 /*
@@ -1601,6 +1718,108 @@ static void conc_notify_tree(struct task_group *top)
 }
 
 /*
+ * Eviction
+ *
+ * Eviction empties a CPU of the tasks of a group. The tasks of that group
+ * never hold slots on more CPUs than before. This keeps the concurrency IDs
+ * of its processes below their bound.
+ *
+ * There are two mechanisms:
+ *
+ *  - join: a task moves to a CPU which its own group already uses. No slot
+ *    is added, so the CPU count of the group does not grow. Used for
+ *    shrinking.
+ *
+ *  - set-move: all the tasks of a subtree on a CPU move to one new CPU
+ *    under stop_two_cpus(). The tasks are moved, the slots are relabelled
+ *    and the CPU-owned concurrency IDs are transferred in one step, while
+ *    neither CPU runs anything else. Used when a CPU must be vacated
+ *    (hot-unplug, an affinity change) and its tasks cannot join.
+ *
+ * The used set during a set-move
+ *
+ * The destination slot is reserved before the stopper runs. A reserved slot
+ * is in the used set, but it refuses the claims of tasks. Take a moved
+ * group which did not use the destination. Until the stopper runs, its used
+ * set holds one CPU more than its tasks hold slots on. This can be one CPU
+ * above the limit.
+ *
+ * The same holds for an ancestor whose only entity on the source CPU is the
+ * moved subtree. Any other ancestor without a slot on the destination gets
+ * one only if its limit has room for it.
+ *
+ * Stopping the arrivals before a set-move
+ *
+ * Arrivals on the source CPU are stopped in three steps, so that the
+ * stopper sees every task which holds a slot there:
+ *  - the slot values are made negative, so new claims are refused;
+ *  - synchronize_rcu() waits for the claims already made, which run with
+ *    interrupts disabled from the claim to the enqueue;
+ *  - the stopper flushes the wakelist.
+ */
+
+/*
+ * Return a used CPU of @p's group which @p can move to from @cpu, or -1.
+ * Prefer an idle CPU. Skip a slot in a transient state. Use @mask in place
+ * of @p's mask when given (an affinity change is in progress). Keep to
+ * @within when given.
+ */
+static int conc_join_dest(struct task_struct *p, int cpu, const struct cpumask *mask,
+			const struct cpumask *within)
+{
+	struct task_group *tg;
+	int c, best = -1;
+
+	guard(rcu)();
+	tg = task_group(p);
+	for_each_cpu_and(c, tg->conc.used, mask ?: p->cpus_ptr) {
+		if (c == cpu || !conc_cpu_usable(c))
+			continue;
+		if (within && !cpumask_test_cpu(c, within))
+			continue;
+		if (atomic_read(per_cpu_ptr(tg->conc.present, c)) < 0)
+			continue;	/* in a transient state */
+		if (available_idle_cpu(c))
+			return c;
+		if (best < 0)
+			best = c;
+	}
+	return best;
+}
+
+/*
+ * Mark the slot of @tg on @cpu as evicting. Return false if there is no
+ * slot, or if the slot is in another transient state.
+ */
+static bool conc_mark_evicting(struct task_group *tg, int cpu)
+{
+	struct tg_concurrency *conc = &tg->conc;
+	atomic_t *slot = per_cpu_ptr(conc->present, cpu);
+	unsigned long flags;
+	bool ok;
+
+	raw_spin_lock_irqsave(&conc->lock, flags);
+	ok = atomic_read(slot) >= 0;
+	if (ok) {
+		atomic_sub(CONC_SLOT_EVICT_BIAS, slot);
+		conc->nr_evicting++;
+	}
+	raw_spin_unlock_irqrestore(&conc->lock, flags);
+	return ok;
+}
+
+static void conc_unmark_evicting(struct task_group *tg, int cpu)
+{
+	struct tg_concurrency *conc = &tg->conc;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&conc->lock, flags);
+	atomic_add(CONC_SLOT_EVICT_BIAS, per_cpu_ptr(conc->present, cpu));
+	conc->nr_evicting--;
+	raw_spin_unlock_irqrestore(&conc->lock, flags);
+}
+
+/*
  * Return true if the limit never changes the mask of @t on its own. This
  * holds for kernel threads, for tasks whose affinity cannot be set, and
  * for deadline tasks. The bandwidth of a deadline task is admitted per
@@ -1610,6 +1829,46 @@ static void conc_notify_tree(struct task_group *top)
 static inline bool conc_task_mask_fixed(struct task_struct *t)
 {
 	return t->flags & (PF_KTHREAD | PF_NO_SETAFFINITY) || dl_task(t);
+}
+
+/*
+ * Make headroom in @tg for one more slot. Return true if there is headroom.
+ *
+ * Drain idle slots first. Then evict used CPUs whose tasks can all join.
+ * Stop when one more slot fits within the limit.
+ */
+static __maybe_unused bool conc_make_headroom(struct task_group *tg)
+{
+	struct tg_concurrency *conc = &tg->conc;
+	cpumask_var_t cpus;
+	int c;
+
+	lockdep_assert_held(&conc_mutex);
+
+	if (conc_has_room(conc))
+		return true;
+	if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
+		return false;
+	cpumask_copy(cpus, conc->used);
+	/*
+	 * Drain the slots which are idle at this level, or which hold idle
+	 * children only.
+	 */
+	for_each_cpu(c, cpus) {
+		if (atomic_read(per_cpu_ptr(conc->present, c)) < 0)
+			continue;
+		if (!conc_drain_cpu(tg, c) && conc_has_room(conc))
+			goto out;
+	}
+	for_each_cpu(c, cpus) {
+		if (atomic_read(per_cpu_ptr(conc->present, c)) <= 0)
+			continue;
+		if (!conc_evict_cpu(tg, c, false, false, NULL, NULL, NULL) && conc_has_room(conc))
+			goto out;
+	}
+out:
+	free_cpumask_var(cpus);
+	return conc_has_room(conc);
 }
 
 static __maybe_unused int conc_resv_cpu(struct conc_resv *resv)
@@ -2072,6 +2331,483 @@ static void conc_hold_work_fn(struct work_struct *work)
 		mod_delayed_work(system_dfl_wq, &conc_hold_work, 1);
 }
 
+/*
+ * Request a hold for @t if it holds a slot of @tg on @cpu. Return false if
+ * @t is there and cannot be held.
+ */
+static bool conc_hold_task_on(struct task_struct *t, struct task_group *tg, int cpu)
+{
+	guard(raw_spinlock_irq)(&t->pi_lock);
+	if (task_cpu(t) != cpu || !READ_ONCE(t->conc_accounted) || task_group(t) != tg)
+		return true;
+	return conc_hold_request(t, CONC_HOLD_EVICT);
+}
+
+/*
+ * Empty @cpu of @tg's subtree by holding its tasks.
+ *
+ * Request a hold for every task of the subtree which holds a slot on @cpu.
+ * These are the tasks which could neither join nor be set-moved. Refuse
+ * arrivals on the CPU while waiting for them. Drain the slot once it is
+ * empty.
+ *
+ * Return -EBUSY if a task cannot be held (a kernel thread), or if the slot
+ * is not empty after CONC_HOLD_ROUNDS tries. The slot then stays, and
+ * shrink_pending with it.
+ */
+static int conc_hold_cpu(struct task_group *tg, int cpu)
+{
+	struct cgroup_subsys_state *css;
+	struct task_group **groups;
+	int i, n = 0, nr = 0, marked, round, ret = -EBUSY;
+
+	lockdep_assert_held(&conc_mutex);
+
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &tg->css)
+		if (cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+			nr++;
+	rcu_read_unlock();
+	if (!nr)
+		return conc_drain_cpu(tg, cpu);
+	groups = kvcalloc(nr, sizeof(*groups), GFP_KERNEL);
+	if (!groups)
+		return -ENOMEM;
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &tg->css) {
+		if (!cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+			continue;
+		if (n == nr)
+			break;
+		/* A dying group has no task to hold. */
+		if (!css_tryget_online(css))
+			continue;
+		groups[n++] = css_tg(css);
+	}
+	rcu_read_unlock();
+
+	for (round = 0; round < CONC_HOLD_ROUNDS; round++) {
+		bool ok = true;
+
+		/* Stop arrivals at every level, the top first. */
+		for (marked = 0; marked < n; marked++) {
+			if (!conc_mark_evicting(groups[marked], cpu))
+				break;
+		}
+		if (marked == n) {
+			for (i = 0; i < n && ok; i++) {
+				struct css_task_iter it;
+				struct task_struct *t;
+
+				css_task_iter_start(&groups[i]->css, 0, &it);
+				while ((t = css_task_iter_next(&it))) {
+					if (!conc_hold_task_on(t, groups[i], cpu))
+						ok = false;
+				}
+				css_task_iter_end(&it);
+			}
+			if (ok)
+				usleep_range(50, 100);
+		}
+		for (i = 0; i < marked; i++)
+			conc_unmark_evicting(groups[i], cpu);
+		if (marked < n || !ok) {
+			ret = -EBUSY;
+			break;
+		}
+		ret = conc_drain_cpu(tg, cpu);
+		if (!ret)
+			break;
+	}
+	for (i = 0; i < n; i++)
+		css_put(&groups[i]->css);
+	kvfree(groups);
+	return ret;
+}
+
+/* A descendant group whose slot an eviction marks, see conc_evict_cpu(). */
+struct conc_evict_mark {
+	struct task_group	*tg;
+	bool			marked;
+};
+
+/*
+ * Collect the descendants of @tg which use @cpu. Return the array and set
+ * @nr to its length. Return NULL if there is none, or if the allocation
+ * failed: the marks of the descendants are an optimization.
+ */
+static struct conc_evict_mark *conc_evict_marks_alloc(struct task_group *tg, int cpu, int *nr)
+{
+	struct cgroup_subsys_state *css;
+	struct conc_evict_mark *marks;
+	int n = 0, max = 0;
+
+	*nr = 0;
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &tg->css)
+		if (css_tg(css) != tg && cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+			max++;
+	rcu_read_unlock();
+	if (!max)
+		return NULL;
+	marks = kvcalloc(max, sizeof(*marks), GFP_KERNEL);
+	if (!marks)
+		return NULL;
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &tg->css) {
+		if (css_tg(css) == tg || !cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+			continue;
+		if (n == max)
+			break;
+		/* No task arrives in a dying group. */
+		if (!css_tryget_online(css))
+			continue;
+		marks[n++].tg = css_tg(css);
+	}
+	rcu_read_unlock();
+	*nr = n;
+	return marks;
+}
+
+/* Mark the slots which can be marked. The others stay open to arrivals. */
+static void conc_evict_marks_set(struct conc_evict_mark *marks, int nr, int cpu)
+{
+	int i;
+
+	for (i = 0; i < nr; i++)
+		marks[i].marked = conc_mark_evicting(marks[i].tg, cpu);
+}
+
+static void conc_evict_marks_clear(struct conc_evict_mark *marks, int nr, int cpu)
+{
+	int i;
+
+	for (i = 0; i < nr; i++) {
+		if (marks[i].marked)
+			conc_unmark_evicting(marks[i].tg, cpu);
+		marks[i].marked = false;
+	}
+}
+
+static void conc_evict_marks_free(struct conc_evict_mark *marks, int nr)
+{
+	int i;
+
+	for (i = 0; i < nr; i++)
+		css_put(&marks[i].tg->css);
+	kvfree(marks);
+}
+
+/*
+ * Empty @cpu of the tasks of @tg's subtree. Return 0 when the slot is gone.
+ * Return -EBUSY and leave the slot in place when nothing works.
+ *
+ * The steps:
+ *  - tasks join used CPUs of their own group;
+ *  - with @set_move, the rest is set-moved to a new CPU, taken from @within
+ *    when given;
+ *  - with @hold, what is left is held, see conc_hold_cpu().
+ *
+ * @mask_task, when given, is checked against @mask in place of its own mask
+ * (an affinity change is in progress).
+ */
+static int conc_evict_cpu(struct task_group *tg, int cpu, bool set_move, bool hold,
+			struct task_struct *mask_task, const struct cpumask *mask,
+			const struct cpumask *within)
+{
+	struct tg_concurrency *conc = &tg->conc;
+	atomic_t *slot = per_cpu_ptr(conc->present, cpu);
+	cpumask_var_t scratch;
+	int ret = -EBUSY, v, round, remaining = 0, nr_marks;
+	struct conc_evict_mark *marks;
+	bool stuck = false;
+
+	lockdep_assert_held(&conc_mutex);
+
+	v = atomic_read(slot);
+	if (v == CONC_SLOT_UNUSED || v == CONC_SLOT_DRAINING)
+		return 0;
+	/*
+	 * Drain an idle slot at once. A task which wakes up claims a slot
+	 * without the lock and may take this one first. Then evict that
+	 * task, as from a busy slot. Do not give up: the group would stay
+	 * over its limit with no task held and nothing to retry.
+	 */
+	if (v == 0) {
+		if (!conc_drain_cpu(tg, cpu))
+			return 0;
+		v = atomic_read(slot);
+		if (v == CONC_SLOT_UNUSED || v == CONC_SLOT_DRAINING)
+			return 0;
+	}
+	if (v < 0)
+		return -EBUSY;
+	if (!conc_mark_evicting(tg, cpu))
+		return -EBUSY;
+	/*
+	 * The mark of @tg refuses a task which would bring a new slot to
+	 * @cpu. A descendant which has a slot there still takes arrivals.
+	 * Mark these slots too.
+	 */
+	marks = conc_evict_marks_alloc(tg, cpu, &nr_marks);
+	conc_evict_marks_set(marks, nr_marks, cpu);
+
+	/* Join: move each task to a CPU its group already uses. */
+	for (round = 0; round < CONC_EVICT_ROUNDS; round++) {
+		struct cgroup_subsys_state *css;
+
+		remaining = 0;
+		stuck = false;
+		rcu_read_lock();
+		css_for_each_descendant_pre(css, &tg->css) {
+			struct css_task_iter it;
+			struct task_struct *t;
+
+			if (!cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+				continue;
+			if (!css_tryget_online(css))
+				continue;
+			rcu_read_unlock();
+			css_task_iter_start(css, 0, &it);
+			while ((t = css_task_iter_next(&it))) {
+				struct migration_arg arg = { .task = t };
+				int dest;
+
+				/*
+				 * Move the present tasks only. A sleeper holds
+				 * no slot.
+				 */
+				if (task_cpu(t) != cpu || !READ_ONCE(t->conc_accounted))
+					continue;
+				dest = conc_join_dest(t, cpu, t == mask_task ? mask : NULL, within);
+				if (dest < 0) {
+					remaining++;
+					continue;
+				}
+				arg.dest_cpu = dest;
+				stop_one_cpu(cpu, migration_cpu_stop, &arg);
+				/* Its migration is disabled, or the move was refused. */
+				if (task_cpu(t) == cpu && READ_ONCE(t->conc_accounted))
+					stuck = true;
+			}
+			css_task_iter_end(&it);
+			rcu_read_lock();
+			css_put(css);
+		}
+		rcu_read_unlock();
+
+		/*
+		 * Everything joined. The slots left are idle and can be
+		 * drained.
+		 */
+		if (!remaining) {
+			conc_evict_marks_clear(marks, nr_marks, cpu);
+			conc_unmark_evicting(tg, cpu);
+			ret = conc_drain_cpu(tg, cpu);
+			if (!ret)
+				break;
+			/*
+			 * The drain failed. A task arrived late, or a child
+			 * slot is not idle after all. Try again.
+			 */
+			if (!conc_mark_evicting(tg, cpu)) {
+				conc_evict_marks_free(marks, nr_marks);
+				return -EBUSY;
+			}
+			conc_evict_marks_set(marks, nr_marks, cpu);
+			schedule_timeout_uninterruptible(1);
+			continue;
+		}
+		break;
+	}
+
+	conc_evict_marks_clear(marks, nr_marks, cpu);
+	conc_evict_marks_free(marks, nr_marks);
+	/* The slot is gone, and its mark with it. */
+	if (!ret)
+		return 0;
+	conc_unmark_evicting(tg, cpu);
+	/*
+	 * Go on with the set-move and the hold when tasks could not join, or
+	 * when a task which had a CPU to join did not move. Otherwise the
+	 * slot keeps an entity which this walk cannot see, such as an
+	 * exiting task. Nothing here can move it.
+	 */
+	if (!remaining && !stuck)
+		return ret;
+	if (!alloc_cpumask_var(&scratch, GFP_KERNEL))
+		return -ENOMEM;
+
+	/*
+	 * Consolidate. Set-move a child subtree whose tasks could not join
+	 * within the child onto a CPU which this level already uses. That
+	 * adds no CPU at this level. Then check the children again.
+	 */
+	for (round = 0; round < CONC_EVICT_ROUNDS; round++) {
+		struct task_group *child, *pinned = NULL;
+
+		rcu_read_lock();
+		list_for_each_entry_rcu(child, &tg->children, siblings) {
+			if (!cpumask_test_cpu(cpu, child->conc.used) ||
+			    !css_tryget_online(&child->css))
+				continue;
+			pinned = child;
+			break;
+		}
+		rcu_read_unlock();
+		if (!pinned)
+			break;
+		v = conc_set_move_dest(pinned, cpu, scratch, tg->conc.used, mask_task, mask);
+		ret = v >= 0 ? conc_set_move(pinned, cpu, v, mask_task, mask) : -EBUSY;
+		css_put(&pinned->css);
+		if (ret)
+			break;
+	}
+	ret = conc_drain_cpu(tg, cpu);
+	if (!ret) {
+		free_cpumask_var(scratch);
+		return 0;
+	}
+	if (!set_move) {
+		free_cpumask_var(scratch);
+		return hold ? conc_hold_cpu(tg, cpu) : -EBUSY;
+	}
+
+	/* Set-move: relocate what could not join, all at once. */
+	v = conc_set_move_dest(tg, cpu, scratch, within, mask_task, mask);
+	free_cpumask_var(scratch);
+	if (v >= 0 && !conc_set_move(tg, cpu, v, mask_task, mask))
+		return 0;
+	/*
+	 * No common destination. Hold what is left if the caller asks for
+	 * it.
+	 */
+	return hold ? conc_hold_cpu(tg, cpu) : -EBUSY;
+}
+
+/*
+ * Evict CPUs of @tg until it is within its effective limit. Take the CPU
+ * with the lowest slot count first. Tasks join, and the tasks which cannot
+ * join are held. A set-move is not used: it would not reduce the count.
+ * Leave shrink_pending set if @tg is still over its limit.
+ */
+static void conc_shrink(struct task_group *tg)
+{
+	struct tg_concurrency *conc = &tg->conc;
+	unsigned long flags;
+	cpumask_var_t tried;
+
+	lockdep_assert_held(&conc_mutex);
+
+	if (!zalloc_cpumask_var(&tried, GFP_KERNEL))
+		goto out;
+
+	while (conc->active && conc->effective && READ_ONCE(conc->nr_used) > conc->effective) {
+		int cpu, victim = -1, best = INT_MAX;
+
+		for_each_cpu(cpu, conc->used) {
+			int v = atomic_read(per_cpu_ptr(conc->present, cpu));
+
+			if (v < 0 || cpumask_test_cpu(cpu, tried))
+				continue;
+			if (v < best) {
+				best = v;
+				victim = cpu;
+			}
+		}
+		if (victim < 0)
+			break;
+		cpumask_set_cpu(victim, tried);
+		conc_evict_cpu(tg, victim, false, true, NULL, NULL, NULL);
+	}
+	free_cpumask_var(tried);
+out:
+	raw_spin_lock_irqsave(&conc->lock, flags);
+	conc->shrink_pending = conc->effective && conc->nr_used > conc->effective;
+	raw_spin_unlock_irqrestore(&conc->lock, flags);
+}
+
+/*
+ * Shrink every group of the subtree which is over its limit, innermost
+ * first. Return true if a group freed a CPU.
+ */
+static bool conc_shrink_tree(struct task_group *top)
+{
+	struct cgroup_subsys_state *css;
+	unsigned int before;
+	bool shrunk = false;
+
+	lockdep_assert_held(&conc_mutex);
+
+	rcu_read_lock();
+	css_for_each_descendant_post(css, &top->css) {
+		struct task_group *tg = css_tg(css);
+
+		if (!tg->conc.active || !tg->conc.effective ||
+		    READ_ONCE(tg->conc.nr_used) <= tg->conc.effective)
+			continue;
+		/* The reference pins the position across the sleep. */
+		if (!css_tryget_online(css))
+			continue;
+		rcu_read_unlock();
+		before = READ_ONCE(tg->conc.nr_used);
+		conc_shrink(tg);
+		/* A shrink which freed no CPU changed nothing. */
+		if (READ_ONCE(tg->conc.nr_used) < before)
+			shrunk = true;
+		rcu_read_lock();
+		css_put(css);
+	}
+	rcu_read_unlock();
+	return shrunk;
+}
+
+/*
+ * Re-evaluate the limits which cover @tg, after an event which can unblock
+ * a stalled shrink. The caller holds conc_mutex and a reference on @tg.
+ */
+static void __conc_retry(struct task_group *tg)
+{
+	struct task_group *top = tg;
+	struct cpumask *scratch;
+	bool changed;
+
+	lockdep_assert_held(&conc_mutex);
+
+	/* The topmost active group: effective values flow down from there. */
+	if (!top->conc.active)
+		return;
+	while (top->parent && top->parent->conc.active)
+		top = top->parent;
+
+	scratch = conc_alloc_scratch();
+	if (!scratch)
+		return;
+	/* A walk which failed for lack of memory is tried again as a change. */
+	changed = conc_update_tree(top, scratch) != 0;
+	changed |= conc_shrink_tree(top);
+	/*
+	 * Applying the bounds visits every task. Skip it, and the
+	 * notification of the effective files, when the retry changed
+	 * nothing.
+	 */
+	if (changed) {
+		conc_bounds_apply(top);
+		conc_notify_tree(top);
+	}
+	kfree(scratch);
+	conc_hold_kick();
+}
+
+static __maybe_unused void conc_retry(struct task_group *tg)
+{
+	if (!conc_active(&tg->conc))
+		return;
+	mutex_lock(&conc_mutex);
+	__conc_retry(tg);
+	mutex_unlock(&conc_mutex);
+}
+
 /* Return the group of @p with a reference, or NULL if it does not count. */
 static struct task_group *conc_pin_task_group(struct task_struct *p)
 {
@@ -2084,6 +2820,21 @@ static struct task_group *conc_pin_task_group(struct task_struct *p)
 	if (!conc_active(&tg->conc) || !css_tryget_online(&tg->css))
 		return NULL;
 	return tg;
+}
+
+/*
+ * Return true if a limit which covers @tg is exceeded and its shrink is
+ * stalled. A retry can then change something.
+ */
+static __maybe_unused bool conc_needs_retry(struct task_group *tg)
+{
+	struct task_group *lvl;
+
+	for_each_conc_level_from(lvl, tg) {
+		if (READ_ONCE(lvl->conc.shrink_pending))
+			return true;
+	}
+	return false;
 }
 
 #ifdef CONFIG_SCHED_MM_CID
