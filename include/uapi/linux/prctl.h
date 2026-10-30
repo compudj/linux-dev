@@ -416,4 +416,14 @@ struct prctl_mm_map {
 # define PR_CFI_DISABLE		_BITUL(1)
 # define PR_CFI_LOCK		_BITUL(2)
 
+/*
+ * Pin the calling process to its cpu cgroup, for good: arg2 is 1. Its
+ * threads can no longer change cpu cgroup, and the rseq concurrency IDs of
+ * its memory map (mm_cid) stay below the ceiling PR_GET_CONCURRENCY_PIN
+ * returns, 0 when the process is not pinned. A fork(2) child inherits the
+ * pin, execve(2) drops it. See
+ * Documentation/scheduler/sched-max-concurrency.rst.
+ */
+#define PR_SET_CONCURRENCY_PIN		82
+#define PR_GET_CONCURRENCY_PIN		83
 #endif /* _LINUX_PRCTL_H */

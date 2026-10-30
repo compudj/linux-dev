@@ -180,7 +180,13 @@ struct rseq {
 	 * user-space with single-copy atomicity semantics. This field should
 	 * only be read by the thread which registered this data structure.
 	 * Aligned on 32-bit. Contains the current thread's concurrency ID
-	 * (allocated uniquely within a memory map).
+	 * (allocated uniquely within a memory map), below the number of
+	 * possible CPUs. Under a cpu.concurrency.max limit, it is also kept
+	 * below the limit in force for the cgroups of the process's threads,
+	 * which changes with the limit and when the process is moved to
+	 * another cgroup: data indexed by mm_cid is sized by the number of
+	 * possible CPUs, or by the ceiling prctl(PR_GET_CONCURRENCY_PIN)
+	 * returns once the process pinned itself to its cpu cgroup.
 	 */
 	__u32 mm_cid;
 
