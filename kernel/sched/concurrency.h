@@ -11,27 +11,9 @@
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 /* Filled in by a later patch. */
-static inline int conc_make_reachable(struct task_group *tg, const struct cpumask *mask)
-{
-	return false;
-}
-
-/* Filled in by a later patch. */
 static inline unsigned int conc_ns_clamp(struct cid_domain *dom, unsigned int bound)
 {
 	return bound;
-}
-
-/* Filled in by a later patch. */
-static inline int conc_set_move(struct task_group *top, int src, int dst, struct task_struct *mask_task, const struct cpumask *mask)
-{
-	return -EBUSY;
-}
-
-/* Filled in by a later patch. */
-static inline int conc_set_move_dest(struct task_group *top, int src, struct cpumask *scratch, const struct cpumask *within, struct task_struct *mask_task, const struct cpumask *mask)
-{
-	return -EBUSY;
 }
 
 /* Filled in by a later patch. */
