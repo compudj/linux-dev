@@ -610,6 +610,29 @@ that both the source and destination cgroups are reachable from the
 namespace of the process which is attempting the migration.  If either
 is not reachable, the migration is rejected with -ENOENT.
 
+A "cpu.concurrency.max" limit (see the cpu controller) gives a delegatee
+two holds on the delegator that no other control gives.  The affinities a
+delegatee sets, counted by their width, keep the enforced value of
+"cpu.concurrency.max" of the delegated cgroup at that width for as long
+as they stand: the delegator who needs the lower value back narrows
+"cpuset.cpus" of the delegated cgroup, where it names CPUs, which cuts
+the affinities, or the affinities themselves, or ends the processes.
+Last, a limit a delegatee sets inside its sub-hierarchy judges the
+delegator's writes to "cpuset.cpus" above it as it judges the
+delegatee's own: one that would make masks there overlap without
+nesting, or raise their width above the enforced value, fails with
+EBUSY until the delegator removes that limit or the affinities.
+
+A "cpu.concurrency.max" limit above several delegated sub-hierarchies is
+shared by them, as a cpuset above them shares its CPUs: they draw on one
+count of CPUs, and their masks are judged together under it.  The
+affinities of one can then refuse those of another, masks overlapping
+without nesting being refused across them as within one, and children
+whose limits add up to more than it can take each other's room.  The
+sched_conc_shape_conflict tracepoint names the process whose mask a
+refusal overlaps.  Delegatees meant to be independent each get a limit
+of their own, and none above them.
+
 
 Guidelines
 ----------
@@ -1236,6 +1259,302 @@ will be referred to. All time durations are in microseconds.
 	This file affects only processes under the fair-class scheduler and a BPF
 	scheduler with the ``cgroup_set_bandwidth`` callback depending on what
 	the callback actually does.
+
+  cpu.concurrency.max
+	A read-write single value file which exists on non-root
+	cgroups.  The default is "max".  The value is "max" or a
+	positive integer no larger than the number of possible CPUs.
+
+	The limit is the maximum number of CPUs on which the processes
+	of the cgroup, including those in descendant cgroups, may be
+	present at any instant; "max" means no limit.  Unlike
+	"cpuset.cpus", the limit does not name CPUs: the scheduler
+	chooses which CPUs are used and may change them over time.  A
+	write of a limit above the effective ceiling, see
+	"cpu.concurrency.ceiling", fails with EINVAL.
+
+	The limit is a request.  A child can never be allowed more
+	than its parent.  The affinity masks of the processes in the
+	cgroup, whether set with sched_setaffinity(2) or imposed by
+	cpusets, must be nested or disjoint (one containing the
+	other, or sharing no CPU), and are counted by their width: the
+	number of minimal ones, those containing no other.  A limit
+	smaller than the width cannot be guaranteed without breaking an
+	affinity.  Writing a limit never fails because of the
+	placement of processes or the width of their masks: the request
+	is recorded, and the enforced value reported by
+	"cpu.concurrency.effective" stays at the width until the
+	masks change or go away, then drops to the request by itself,
+	never past the effective ceiling.  Masks that overlap without
+	nesting when a limit starts are counted apart, one more each,
+	until they change or go away.
+
+	Nothing but this file and the ancestors' can raise the enforced
+	value: sched_setaffinity(2) fails with EINVAL when the requested
+	mask, within the cpuset, would raise the width above the requested
+	limit of the cgroup or of an ancestor, or overlap another mask of
+	it without nesting, and writes to "cpuset.cpus", migrations
+	between cgroups and clone3(2) with CLONE_INTO_CGROUP fail with
+	EBUSY when they would raise it above the enforced value or make
+	masks overlap that way.  The two rules differ on purpose: a
+	process's own request must not keep a limit at the width of its
+	masks, above the request, and the writes of the cgroup's managers
+	must not fail only because a limit is still at that width.  Masks
+	are judged as configured, whatever CPUs are online, so that CPU
+	hotplug, task exits and migrations out of the cgroup never make an
+	accepted configuration exceed the limit; the CPUs of a partition
+	count as the partition's even while
+	they are offline.  A write to "cpuset.cpus" that is accepted moves
+	the CPUs in use into the new set before it applies to the
+	processes, so that the limit holds across it.  Writes to
+	"cpuset.cpus.partition" and "cpuset.cpus.exclusive" are judged
+	the same way, by the masks they would leave the processes beside
+	the partition with.  A change of a partition with partitions below
+	it, and a few changes beside partitions that CPU hotplug
+	invalidated, cannot be judged: they fail with EBUSY while a cpuset
+	they could change, one that the CPUs they could move reach, names
+	CPUs under this limit or holds a process of the limit.  A write of
+	"cpuset.cpus.partition" that makes a cgroup a partition root never
+	fails for the limit: refused, the partition root is invalid,
+	"Refused by a concurrency limit", claims no CPU, and stays so,
+	whatever changes around it, until the file is written again.
+
+	Under this limit, cpusets and affinities are taken as they are,
+	never cut or replaced: what cpuset cuts from a request it gives
+	back on its own, as when a partition root's cgroup is removed,
+	which cannot be refused.  Every cpuset of a limited subtree must
+	name no CPU, an empty "cpuset.cpus" inheriting its parent's, or
+	only CPUs it is granted: CPUs of its parent, none of them held by
+	a partition, offline ones counting as granted.  A partition root
+	of the subtree must be granted all the CPUs it asks for.  The
+	affinity a process sets with sched_setaffinity(2) must lie within
+	its cpuset, or name every possible CPU, unless its cpuset is one
+	of the limited subtree that names CPUs: such a cpuset is granted
+	all it names and changes only by writes this limit judges, so an
+	affinity it cuts is accepted, and counted as the intersection,
+	whatever its "cpuset.cpus" becomes; but it cannot be made to name
+	nothing, inheriting its parent's CPUs, while an affinity is cut.
+	Writes to "cpuset.cpus", "cpuset.cpus.exclusive" and
+	"cpuset.cpus.partition", anywhere in the hierarchy, that would
+	break this fail with EBUSY, and so does moving into the subtree,
+	or cloning into it with CLONE_INTO_CGROUP, a process whose
+	affinity its new cpuset would cut; sched_setaffinity(2) fails with
+	EINVAL.  Setting a limit on a subtree that holds such a cpuset or
+	process fails with EBUSY, as does enabling the cpu controller over
+	such a cpuset where "child_ceiling" gives the cgroups a ceiling.
+	Removing a partition root's cgroup then widens only the masks
+	inherited from its parent, which contain all the others, and never
+	raises the width.
+
+	SCHED_DEADLINE processes are kept out of a limited subtree.
+	Their bandwidth is admitted against every CPU of their root
+	domain, which a limit takes from them as an affinity narrower
+	than the root domain would, and such an affinity is refused to
+	them.  In a limited subtree, sched_setattr(2) to SCHED_DEADLINE
+	fails with EPERM; moving a SCHED_DEADLINE process into it fails
+	with EBUSY, and so does setting a limit on a subtree that holds
+	one.  Not while deadline admission control is off
+	("sched_rt_runtime_us" at -1).
+
+	A partition root ("cpuset.cpus.partition" at "root") with a
+	limit of its own and no limited ancestor is the exception: its
+	SCHED_DEADLINE processes are admitted against its limit, each
+	CPU keeping the share of its fair server, rather than against
+	all of its CPUs, and sched_setattr(2) fails with EBUSY past
+	that.  A cgroup below it with a lower limit of its own takes
+	none, and none is admitted beside a mask narrower than the
+	partition's.  While it holds SCHED_DEADLINE processes, lowering
+	its limit under their bandwidth, a lower limit over one of
+	them, a mask narrower than the partition, and making it a
+	member again fail with EBUSY, sched_setaffinity(2) with EINVAL.
+	The limit can always be raised or removed.  On CPUs of unequal
+	capacity no partition root takes SCHED_DEADLINE processes under
+	a limit.
+
+	Against the same cpusets and affinities without a limit:
+
+	========================  ====================  ========================
+	Change                    Without a limit       Under a limit
+	========================  ====================  ========================
+	affinity past cpuset      accepted, cut to the  EINVAL; taken cut if the
+	                          cpuset                cpuset names its CPUs
+	overlapping affinities    accepted              EINVAL: masks must nest
+	                                                or be disjoint
+	cpuset.cpus past parent   accepted, effective   EBUSY
+	                          CPUs intersected
+	move cutting affinity     affinity cut          EBUSY
+	partition root write      invalid only when it  may be invalid,
+	                          lacks CPUs            "Refused by a
+	                                                concurrency limit",
+	                                                until written again
+	where a process runs      any CPU of its mask   CPUs its cgroup uses;
+	                                                held, runnable, until
+	                                                one of them frees
+	CPU hotplug               effective masks       verdicts unchanged,
+	                          follow it             offline CPUs count
+	SCHED_DEADLINE            mask must cover its   EPERM; EBUSY to move
+	                          root domain           one in or to limit it;
+	                                                admitted against the
+	                                                limit of a partition
+	                                                root
+	========================  ====================  ========================
+
+	Limitation: masks that overlap without being nested are refused
+	even when fewer CPUs would serve them all.  Whatever the limit,
+	processes pinned to CPUs {1,2} and to CPUs {2,3} cannot both be
+	in the limited subtree, although CPU 2 serves both masks;
+	sliding windows of consecutive CPUs and masks of all CPUs but
+	one are refused the same way.  The masks are those of the whole
+	subtree: a mask in one cgroup is refused when it overlaps,
+	without nesting, a mask in a sibling cgroup under the same
+	limit.  Masks that follow the hardware topology (SMT siblings,
+	cores, caches, nodes), and exclusive CPU sets beside a shared
+	pool, are nested or disjoint and are not affected.
+
+	The limit also bounds the concurrency IDs that rseq(2) reports
+	to the processes of the cgroup, ``mm_cid``.  The bound of
+	``mm_cid`` follows the cgroup the process is in, and a process
+	moved out of the subtree leaves its ceiling behind: data
+	indexed by ``mm_cid`` is sized by the number of possible CPUs,
+	unless the process pinned itself to its cpu cgroup with
+	prctl(``PR_SET_CONCURRENCY_PIN``).  A pinned process cannot be
+	moved to another cpu cgroup, whether through "cgroup.procs",
+	"cgroup.threads" or by turning the cpu controller off above it,
+	nor clone a child into one with ``CLONE_INTO_CGROUP``, all
+	failing with EBUSY; its ``mm_cid`` stays below the ceiling
+	prctl(``PR_GET_CONCURRENCY_PIN``) returns, the effective ceiling
+	value when it pinned itself.  The pin cannot be undone; a
+	fork(2) child inherits it, execve(2) drops it.
+
+	This file affects all processes in the cgroup, whatever their
+	scheduling policy.  Kernel threads attached to the cgroup follow
+	the limit like other tasks: they are placed on the CPUs in use,
+	moved with them and counted while they fit.  Unlike a user
+	process, a kernel thread that finds no CPU within the limit is
+	not held back: it runs on without being counted until it next
+	sleeps, so the cgroup may transiently be present on more CPUs
+	than the limit through the kernel threads it contains.  Kernel
+	threads hold no concurrency ID and their excess is not counted,
+	so the IDs of the processes stay below the limit meanwhile.
+
+	A process that finds no CPU within the limit is held back until
+	one frees: it stays runnable (state "R") and uses no CPU time
+	meanwhile.  SIGSTOP, ptrace(2) and "cgroup.freeze" take effect
+	on a held process once it is placed, as they complete on its
+	way back to user space; SIGKILL ends the hold at once.
+
+	What the limit makes fail, and with which error:
+
+	- sched_setaffinity(2): EINVAL, when the mask would raise the
+	  width above the requested limit of the cgroup or of an
+	  ancestor, would overlap another mask of the limited subtree
+	  without nesting, or neither lies within the cpuset nor names
+	  every possible CPU.
+	- "cgroup.procs", "cgroup.threads" and clone3(2) with
+	  CLONE_INTO_CGROUP: EBUSY, when the move would raise the width
+	  above the enforced value or make masks overlap without
+	  nesting, the new cpuset would cut the
+	  process's affinity, the process is a SCHED_DEADLINE one bound
+	  for a limited subtree other than a partition root under its
+	  own limit, its mask is narrower than such a partition root
+	  holding SCHED_DEADLINE processes, or the process pinned itself
+	  to its cgroup.
+	- "cpuset.cpus", "cpuset.cpus.exclusive" and
+	  "cpuset.cpus.partition": EBUSY, when the write would raise the
+	  width above an enforced value or make masks overlap without
+	  nesting, leave a cpuset of a limited
+	  subtree granting other CPUs than it names, narrow a mask
+	  inside a partition root holding SCHED_DEADLINE processes under
+	  its limit, make such a partition root a member, or cannot be
+	  judged; but a write of "cpuset.cpus.partition" that makes a
+	  cgroup a partition root, which is created invalid instead.
+	- "cpu.concurrency.max": EINVAL for a value out of range, a limit
+	  value above the effective ceiling or a ceiling other
+	  than the cgroup's; EBUSY for a limit that would start a
+	  limit over a cpuset or an affinity the subtree could not take
+	  as it is, or over a SCHED_DEADLINE process but in a partition
+	  root whose limit their bandwidth fits, for a limit that would
+	  lower a partition root's under the bandwidth of its
+	  SCHED_DEADLINE processes, or one below it that would bound
+	  them;
+	  "cgroup.subtree_control" enabling the cpu controller: EBUSY,
+	  when "child_ceiling" would give a cgroup a ceiling over such a
+	  cpuset or process.
+	- prctl(PR_SET_CONCURRENCY_PIN) with 0: EPERM, a pin cannot be
+	  undone.
+
+	Every refusal is reported by the sched_conc_refuse tracepoint:
+	the process judged, the operation and the reason.  A refusal of
+	masks overlapping without nesting is also reported by
+	sched_conc_shape_conflict, with the mask the refused one
+	overlaps and a process holding it, possibly in another cgroup
+	under the same limit.  The affinity
+	a process requested, before its cpuset cut it, is
+	"Cpus_requested" in /proc/<pid>/status.
+
+	Of these, sched_setaffinity(2), the migrations between cgroups,
+	the cpuset writes and the writes to this file may wait: for the
+	migrations, forks and affinity changes judged before them to be
+	applied, for the CPUs a move needs to be vacated, and, when the
+	last limit or ceiling goes, for the held processes to be placed.
+
+	The limit is the width of what "cpu.max" bounds in area: a
+	quota of 2.5 CPUs maps to a limit of 3, the ceiling of the
+	quota, while "cpu.weight" is unaffected.  CPU hotplug does not
+	change the enforced value, as masks are judged as configured.
+	A container runtime gives a container's cgroup its ceiling by
+	writing "cpu.concurrency.child_ceiling" on the parent before
+	creating the cgroup, or by creating an intermediate cgroup of
+	its own.
+	See :ref:`Documentation/scheduler/sched-max-concurrency.rst
+	<sched-max-concurrency>` for details.
+
+  cpu.concurrency.ceiling
+	A read-only single value file which exists on non-root
+	cgroups: "max" or a positive integer.
+
+	The ceiling "cpu.concurrency.max" can never be raised above.
+	It never changes: the cgroup takes it when it is created, from
+	"cpu.concurrency.child_ceiling" of its parent, and keeps it
+	for its whole life.
+
+  cpu.concurrency.effective
+	A read-only file which exists on non-root cgroups, holding two
+	values, "limit ceiling", as enforced.
+
+	The limit is the number of CPUs actually enforced for
+	"cpu.concurrency.max", or "max".  After a decrease of the limit
+	that could not be completed, it reports the number of CPUs still
+	in use until the next change of affinity, cgroup membership or
+	limit allows the decrease.  While the CPUs in use are being moved,
+	it may read one above the limit for a moment: the destination is
+	reserved before the source is emptied.  It never reads below the
+	bound the concurrency IDs of the processes of the cgroup are still
+	given under: a decrease shows once their bounds follow it, so that
+	a thread of a process whose threads all belong to the cgroup,
+	scheduled in after reading the limit, holds an ID below it.  The
+	ceiling is the smallest ceiling on the path to the root, or "max",
+	and never changes.  A file event is generated whenever a value
+	changes.
+
+  cpu.concurrency.child_ceiling
+	A read-write single value file which exists on all cgroups,
+	the root included.  The default is "max".
+
+	The ceiling of "cpu.concurrency.max" that a child cgroup
+	takes when it is created, or when the cpu controller is enabled
+	on it, and keeps for its whole life: "max" or a positive
+	integer no larger than the number of possible CPUs.  A write
+	changes the value for the children created
+	afterwards, not for those that exist.  A process may thus size
+	data by the ceiling it reads, without the value ever
+	changing under it.  The manager that creates children writes
+	the value first; two managers creating children of the same
+	cgroup can each create an intermediate cgroup of their own and
+	set its value there.  The file is listed in
+	"/sys/kernel/cgroup/delegate": the manager a cgroup is delegated
+	to may write it, as it distributes the cgroup's own ceiling
+	among its children.
 
   cpu.pressure
 	A read-write nested-keyed file.
@@ -2532,6 +2851,18 @@ Cpuset Interface Files
 	The value of "cpuset.cpus" stays constant until the next update
 	and won't be affected by any CPU hotplug events.
 
+	Under a "cpu.concurrency.max" limit anywhere in the hierarchy, a
+	write to this file, to "cpuset.cpus.exclusive" or to
+	"cpuset.cpus.partition" fails with EBUSY when the masks it would
+	leave the tasks of a limited cgroup with exceed the limit or
+	overlap without being nested, or when it would leave a cpuset of a
+	limited subtree granting other CPUs than it names.  Masks are
+	judged by the configured CPUs, those a cpuset names or inherits,
+	whatever CPUs are online.  A write of "cpuset.cpus.partition"
+	making a cgroup a partition root does not fail: the partition root
+	is invalid instead, with the reason "Refused by a concurrency
+	limit".  See "cpu.concurrency.max".
+
   cpuset.cpus.effective
 	A read-only multiple values file which exists on all
 	cpuset-enabled cgroups.
@@ -2742,6 +3073,12 @@ Cpuset Interface Files
 
 	In the case of an invalid partition root, a descriptive string on
 	why the partition is invalid is included within parentheses.
+
+	A partition root that a "cpu.concurrency.max" limit refused, see
+	there, is invalid with the reason "Refused by a concurrency
+	limit".  Unlike the other reasons, this one does not go away when
+	the CPUs around the partition root change: it stays invalid,
+	claiming no CPU, until "cpuset.cpus.partition" is written again.
 
 	For a local partition root to be valid, the following conditions
 	must be met.

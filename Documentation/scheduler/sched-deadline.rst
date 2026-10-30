@@ -690,6 +690,17 @@ Deadline Task Scheduling
  See :ref:`Documentation/admin-guide/cgroup-v1/cpusets.rst <cpusets>` and
  :ref:`Documentation/admin-guide/cgroup-v2.rst <cgroup-v2>` for more information.
 
+ For the same reason, deadline tasks cannot be in a cgroup subtree under a
+ ``cpu.concurrency.max`` limit, which bounds the CPUs its tasks use at once
+ below those of their root domain: ``sched_setattr(2)`` to SCHED_DEADLINE fails
+ there with EPERM, and moving a deadline task into such a subtree, or setting a
+ limit over one that holds it, fails with EBUSY. The exception is a partition
+ root (section 5.2) with a limit of its own and no limited ancestor: its root
+ domain is admitted against the limit, each CPU keeping the share of its fair
+ server, so that its deadline tasks are scheduled by global EDF on that many
+ CPUs, wherever they are in the partition. A partition of many CPUs can then
+ host deadline work sized by the limit, without choosing its CPUs.
+
 5.1 Using cgroup v1 cpuset controller
 -------------------------------------
 
