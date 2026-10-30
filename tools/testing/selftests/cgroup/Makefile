@@ -10,6 +10,7 @@ TEST_GEN_FILES := wait_inotify
 TEST_GEN_PROGS  = test_core
 TEST_GEN_PROGS += test_cpu
 TEST_GEN_PROGS += test_cpu_concurrency
+TEST_GEN_PROGS += test_cpu_concurrency_stress
 TEST_GEN_PROGS += test_cpuset
 TEST_GEN_PROGS += test_freezer
 TEST_GEN_PROGS += test_hugetlb_memcg
@@ -28,6 +29,7 @@ include lib/libcgroup.mk
 $(OUTPUT)/test_core: $(LIBCGROUP_O)
 $(OUTPUT)/test_cpu: $(LIBCGROUP_O)
 $(OUTPUT)/test_cpu_concurrency: $(LIBCGROUP_O) cpu_concurrency_util.c
+$(OUTPUT)/test_cpu_concurrency_stress: $(LIBCGROUP_O) cpu_concurrency_util.c
 $(OUTPUT)/test_cpuset: $(LIBCGROUP_O)
 $(OUTPUT)/test_freezer: $(LIBCGROUP_O)
 $(OUTPUT)/test_hugetlb_memcg: $(LIBCGROUP_O)
