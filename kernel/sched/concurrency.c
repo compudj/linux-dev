@@ -96,6 +96,8 @@ static void conc_task_entitled(struct task_struct *t, struct cpumask *mask);
 static struct task_group *conc_pin_task_group(struct task_struct *p);
 #endif /* CONFIG_SCHED_MM_CID */
 
+static void conc_notify_tree(struct task_group *top);
+
 static unsigned int conc_class_cap(struct tg_concurrency *conc);
 static struct task_group *conc_pin_task_group(struct task_struct *p);
 atomic_t conc_nr_held;
@@ -417,6 +419,30 @@ static void conc_used_add(struct tg_concurrency *conc, int cpu)
 	cpumask_set_cpu(cpu, conc->used);
 	cpumask_andnot(conc->unused_cores, conc->unused_cores, cpu_smt_mask(cpu));
 	WRITE_ONCE(conc->nr_used, conc->nr_used + 1);
+}
+
+/*
+ * The value cpu.concurrency.effective reports for @conc, see
+ * conc_effective_report(), as a ceiling: UINT_MAX for none. Under conc->lock.
+ */
+static unsigned int conc_report_ceiling(struct tg_concurrency *conc)
+{
+	if (!conc->effective)
+		return UINT_MAX;
+	return conc->shrink_pending ? max(conc->effective, conc->nr_used) : conc->effective;
+}
+
+/*
+ * The value reported for @conc is about to drop from @from. The concurrency
+ * IDs of the domains it bounds may have been given under @from (see
+ * __conc_dom_bound()) and keep it until their bounds are applied again: the
+ * file shows no less until then, see conc_bounds_apply(). Under conc->lock.
+ */
+static void conc_report_drop(struct tg_concurrency *conc, unsigned int from)
+{
+	lockdep_assert_held(&conc->lock);
+	conc->shown_floor = max(conc->shown_floor, from);
+	conc->bounds_pending = true;
 }
 
 /*
@@ -849,7 +875,7 @@ void conc_task_fork(struct task_struct *p)
 }
 
 /* The levels a merge of @child copies its list into, see conc_classes_merge(). */
-static __maybe_unused int conc_merge_depth(struct task_group *child)
+static int conc_merge_depth(struct task_group *child)
 {
 	struct task_group *lvl;
 	int n = 0;
@@ -870,7 +896,7 @@ static __maybe_unused int conc_merge_depth(struct task_group *child)
  * see conc_chain_unlock(); each level's lock nests inside in turn, the one
  * place where two group locks nest.
  */
-static __maybe_unused void conc_classes_merge(struct task_group *child, int sign, struct conc_class **pre, int npre)
+static void conc_classes_merge(struct task_group *child, int sign, struct conc_class **pre, int npre)
 {
 	struct tg_concurrency *conc = &child->conc;
 	struct task_group *lvl = child->parent;
@@ -1211,7 +1237,7 @@ out:
  * starts counting has no list a merge could add, see conc_update_tree().
  * Called under RCU from that walk: atomic allocations only.
  */
-static __maybe_unused void conc_classes_build(struct task_group *tg)
+static void conc_classes_build(struct task_group *tg)
 {
 	struct css_task_iter it;
 	struct task_struct *t;
@@ -1238,7 +1264,7 @@ static __maybe_unused void conc_classes_build(struct task_group *tg)
  * @tg stops counting: drop its list and unclass its direct tasks, the dead
  * ones too, which keep their entry until they are reaped.
  */
-static __maybe_unused void conc_classes_teardown(struct task_group *tg)
+static void conc_classes_teardown(struct task_group *tg)
 {
 	struct css_task_iter it;
 	struct task_struct *t;
@@ -1276,7 +1302,37 @@ static __maybe_unused void conc_classes_unregister_dead(struct task_group *tg)
 	css_task_iter_end(&it);
 }
 
-static __maybe_unused void conc_activate_tasks(struct task_group *tg)
+/*
+ * Claim slots for the tasks of @tg that are present but were never
+ * accounted, when the group starts counting. Tasks claimed concurrently
+ * carry the bit already and are skipped; the ones beyond the limit are
+ * held at their next return to user space.
+ */
+
+/*
+ * The tasks of @tg, which stops counting, give their slots back: a task is
+ * accounted only while its group counts, which is what lets the hot paths
+ * skip the accounted flag behind the key (conc_task_release()). A held task
+ * is placed by the placement work, which the caller kicks.
+ */
+static void conc_deactivate_tasks(struct task_group *tg)
+{
+	struct css_task_iter it;
+	struct task_struct *t;
+
+	css_task_iter_start(&tg->css, 0, &it);
+	while ((t = css_task_iter_next(&it))) {
+		guard(task_rq_lock)(t);
+
+		if (!t->conc_accounted || task_group(t) != tg)
+			continue;
+		t->conc_accounted = 0;
+		conc_release(tg, task_cpu(t));
+	}
+	css_task_iter_end(&it);
+}
+
+static void conc_activate_tasks(struct task_group *tg)
 {
 	struct css_task_iter it;
 	struct task_struct *t;
@@ -1302,6 +1358,32 @@ static __maybe_unused void conc_activate_tasks(struct task_group *tg)
 		}
 	}
 	css_task_iter_end(&it);
+}
+
+/* What cpu.concurrency.effective reports: 0 is "max". */
+static __maybe_unused unsigned int conc_effective_report(struct task_group *tg)
+{
+	struct tg_concurrency *conc = &tg->conc;
+	unsigned int eff = READ_ONCE(conc->effective);
+
+	if (eff && READ_ONCE(conc->shrink_pending))
+		eff = max(eff, READ_ONCE(conc->nr_used));
+	return eff;
+}
+
+/*
+ * What cpu.concurrency.effective shows: the value reported, but never
+ * less than a bound the concurrency IDs of its domains may still be given
+ * under, see conc_report_drop(). 0 for "max".
+ */
+static unsigned int conc_effective_shown(struct task_group *tg)
+{
+	struct tg_concurrency *conc = &tg->conc;
+	unsigned int val;
+
+	guard(raw_spinlock_irqsave)(&conc->lock);
+	val = max(conc_report_ceiling(conc), conc->shown_floor);
+	return val == UINT_MAX ? 0 : val;
 }
 
 /*
@@ -1552,7 +1634,7 @@ out:
 	return width;
 }
 
-static __maybe_unused unsigned int conc_recount_width(struct task_group *tg)
+static unsigned int conc_recount_width(struct task_group *tg)
 {
 	return __conc_recount_width(tg, NULL, NULL, NULL, 0, NULL, 0);
 }
@@ -1563,7 +1645,7 @@ static __maybe_unused unsigned int conc_recount_width(struct task_group *tg)
  * Snapshot under the lock, computed outside it. UINT_MAX when it could
  * not be computed.
  */
-static __maybe_unused unsigned int conc_level_width(struct tg_concurrency *conc, const struct cpumask *del,
+static unsigned int conc_level_width(struct tg_concurrency *conc, const struct cpumask *del,
 				   const struct cpumask *add, gfp_t gfp)
 {
 	unsigned int n, cap, width;
@@ -1623,6 +1705,216 @@ static __maybe_unused unsigned int conc_class_cap_requested(struct tg_concurrenc
 	if (ceiling && (!cap || cap > ceiling))
 		cap = ceiling;
 	return cap;
+}
+
+/*
+ * @tg is about to stop counting: stop its children from propagating their
+ * slots into it first, releasing the entities they hold there, so that a
+ * child's claim that finds @tg inactive finds its own propagation stopped
+ * too (conc_claim_slow()). A child that counts on its own goes on doing so;
+ * its list, which @tg is about to drop, is merged no more.
+ */
+static void conc_detach_children(struct task_group *tg, struct cpumask *scratch)
+{
+	struct task_group *child;
+	unsigned long flags;
+	bool was;
+	int cpu;
+
+	list_for_each_entry_rcu(child, &tg->children, siblings) {
+		struct tg_concurrency *conc = &child->conc;
+
+		raw_spin_lock_irqsave(&conc->lock, flags);
+		was = conc->propagate;
+		if (was) {
+			cpumask_copy(scratch, conc->used);
+			conc->propagate = false;
+			conc->merged = false;
+		}
+		raw_spin_unlock_irqrestore(&conc->lock, flags);
+		if (!was)
+			continue;
+		for_each_cpu(cpu, scratch)
+			conc_release(tg, cpu);
+	}
+}
+
+/*
+ * Recompute the effective limit of every group in the subtree of @top:
+ *
+ *   effective = max(min(request, effective(parent)), width)
+ *
+ * and switch counting on or off accordingly. Walked in pre-order so that a
+ * parent's state is final when its children are visited. Shrinking is
+ * left to the caller.
+ */
+static __maybe_unused void conc_update_tree(struct task_group *top, struct cpumask *scratch)
+{
+	struct cgroup_subsys_state **csses, *css;
+	int nr_css, k;
+
+	lockdep_assert_held(&conc_mutex);
+
+	/*
+	 * A walk that allocates, builds lists and visits every task: on a
+	 * referenced snapshot of the subtree rather than under RCU. A group
+	 * created meanwhile is walked by conc_tg_online() once linked in.
+	 */
+	if (conc_subtree_snapshot(top, &csses, &nr_css)) {
+		pr_warn_once("conc: no memory to update the limits of css %d\n", top->css.id);
+		return;
+	}
+	for (k = 0; k < nr_css; k++) {
+		struct task_group *tg, *parent;
+		css = csses[k];
+		if (!css)
+			continue;
+		tg = css_tg(css);
+		parent = READ_ONCE(tg->parent);
+		struct tg_concurrency *conc = &tg->conc;
+		unsigned int eff = conc->request, ceiling = conc->ceiling, was;
+		bool should_active, new_prop, walk = false, teardown = false;
+		unsigned long flags;
+		int cpu, attach = 0;
+
+		/*
+		 * Not linked in yet (sched_online_group()): conc_tg_online()
+		 * walks it once it is, and no task can join it before. Dying:
+		 * no task can join it either, and conc_tg_offline() resets it.
+		 */
+		if (!parent || css_is_dying(css))
+			continue;
+
+		if (parent->conc.effective && (!eff || eff > parent->conc.effective))
+			eff = parent->conc.effective;
+		if (parent->conc.ceiling_effective && (!ceiling || ceiling > parent->conc.ceiling_effective))
+			ceiling = parent->conc.ceiling_effective;
+		/*
+		 * A limit below the width of the masks is relaxed to it,
+		 * once a recount of the tasks confirms it (a group starting to
+		 * count has no list yet: the recount alone), and never past the
+		 * ceiling, which the refusals keep the width within.
+		 */
+		if (eff) {
+			unsigned int w = conc->active ? conc_level_width(conc, NULL, NULL, GFP_KERNEL) :
+						      conc_recount_width(tg);
+
+			if (w > eff)
+				eff = max(eff, conc->active ? min(w, conc_recount_width(tg)) : w);
+			if (ceiling && eff > ceiling)
+				eff = ceiling;
+		}
+		/* A ceiling alone caps the width, see conc_check_affinity(). */
+		should_active = eff || ceiling || parent->conc.active;
+		new_prop = should_active && parent->conc.active;
+		if (!should_active && conc->active)
+			conc_detach_children(tg, scratch);
+
+		raw_spin_lock_irqsave(&conc->lock, flags);
+		was = conc_report_ceiling(conc);
+		conc->effective = eff;
+		conc->ceiling_effective = ceiling;
+		if (should_active && !conc->active) {
+			conc->active = true;
+			walk = true;
+		} else if (!should_active && conc->active) {
+			conc->active = false;
+			teardown = true;
+		}
+		if (conc->propagate != new_prop) {
+			/*
+			 * Attach to or detach from the parent as entities. The
+			 * slots are snapshotted together with the flag flip, so
+			 * that a concurrent slot add either propagates itself
+			 * or is in the snapshot; slot removal holds conc_mutex.
+			 * Group locks never nest, so this happens below.
+			 */
+			cpumask_copy(scratch, conc->used);
+			conc->propagate = new_prop;
+			attach = new_prop ? 1 : -1;
+		}
+		/*
+		 * A newly counting group has an empty list, merged as it is
+		 * when its parent counts. One its parent no longer counts is
+		 * merged no more: the parent dropped its list. A counting group
+		 * its parent starts counting is merged by the copy below.
+		 */
+		if (walk || !new_prop)
+			conc->merged = new_prop;
+		conc->shrink_pending = eff && conc->nr_used > eff;
+		/* The caller applies the bounds, see conc_bounds_apply(). */
+		if (conc_report_ceiling(conc) < was)
+			conc_report_drop(conc, was);
+		raw_spin_unlock_irqrestore(&conc->lock, flags);
+
+		if (attach) {
+			for_each_cpu(cpu, scratch) {
+				if (attach > 0)
+					conc_claim(parent, cpu, true, NULL);
+				else
+					conc_release(parent, cpu);
+			}
+		}
+		/*
+		 * The parent's list follows: a group that was counting already
+		 * is merged or unmerged here. A newly counting group builds its
+		 * list below, registering its tasks at every counting level,
+		 * the parent's included, since a group starts counting only
+		 * along with its counting ancestors: merging that list too
+		 * would count its tasks twice above it, and the copy an exit
+		 * leaves behind would be a class no task has, keeping the
+		 * cleaner off the slot it alone seems to hit.
+		 */
+		if (attach && !walk) {
+			int n = attach > 0 ? conc_nr_masks(conc) * conc_merge_depth(tg) : 0;
+			struct conc_class **pre = conc_class_prealloc(n, GFP_KERNEL);
+
+			/*
+			 * Every counting level from the parent up counts the
+			 * subtree now, the levels the parent's list is merged
+			 * into: the ones that started counting in this walk
+			 * built their lists before this group's turn, from
+			 * their own tasks. A group stops propagating only when
+			 * its parent stops counting, which drops the parent's
+			 * list: then nothing above counts it.
+			 */
+			conc_classes_merge(tg, attach, pre, n);
+			conc_class_prealloc_free(pre, n);
+		}
+
+		if (walk) {
+			conc_activate_tasks(tg);
+			conc_classes_build(tg);
+		}
+		if (teardown) {
+			conc_deactivate_tasks(tg);
+			conc_classes_teardown(tg);
+		}
+		/* Classes built or merged here may lack their headroom. */
+		if (conc->active && conc->effective &&
+		    READ_ONCE(conc->nr_used) + READ_ONCE(conc->unhit) > conc->effective)
+			conc_want_headroom(conc);
+	}
+	conc_subtree_release(csses, nr_css);
+}
+
+/* Raise cgroup_file_notify() where the reported effective value changed. */
+static void conc_notify_tree(struct task_group *top)
+{
+	struct cgroup_subsys_state *css;
+
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &top->css) {
+		struct task_group *tg = css_tg(css);
+		unsigned int val = conc_effective_shown(tg), ceiling = tg->conc.ceiling_effective;
+
+		if (val != tg->conc.reported || ceiling != tg->conc.reported_ceiling) {
+			tg->conc.reported = val;
+			tg->conc.reported_ceiling = ceiling;
+			cgroup_file_notify(&tg->conc.effective_file);
+		}
+	}
+	rcu_read_unlock();
 }
 
 /*
