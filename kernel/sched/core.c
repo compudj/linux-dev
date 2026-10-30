@@ -2193,6 +2193,8 @@ void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	 */
 	uclamp_rq_inc(rq, p, flags);
 
+	/* A held task is dequeued, hence unheld, first, see conc_unhold(). */
+	conc_debug_enqueue(p);
 	p->sched_class->enqueue_task(rq, p, flags);
 
 	psi_enqueue(p, flags);
@@ -4673,6 +4675,24 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	WARN_ON_ONCE(p->se.sched_delayed);
 	WARN_ON_ONCE(p->is_blocked);
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	/* The slot, if any, belongs to the parent; so does a pending hold. */
+	p->conc_accounted			= 0;
+	p->conc_hold_pending		= 0;
+	p->conc_held			= 0;
+	p->conc_fork_pending		= 0;
+	p->conc_resv_cpu			= -1;
+	p->conc_move_seq			= 0;
+	p->conc_class			= NULL;
+	p->conc_outside			= 0;
+	init_task_work(&p->conc_hold_work, conc_hold_task_work);
+	INIT_LIST_HEAD(&p->conc_hold_node);
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+	p->conc_debug_wait_at		= 0;
+	INIT_LIST_HEAD(&p->conc_debug_wait_node);
+#endif
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	p->se.cfs_rq			= NULL;
 #ifdef CONFIG_CFS_BANDWIDTH
@@ -5589,6 +5609,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		}
 	}
 
+	conc_debug_switch(rq, prev, next);
 	mm_cid_switch_to(prev, next);
 
 	/*

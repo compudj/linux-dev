@@ -89,6 +89,14 @@ static inline enum conc_claim_result conc_claim(struct task_group *tg, int cpu, 
 }
 
 extern atomic_t conc_nr_held;
+
+/* A held task is never enqueued, see conc_hold(): checked under the debug option. */
+static inline void conc_debug_enqueue(struct task_struct *p)
+{
+	if (IS_ENABLED(CONFIG_SCHED_MAX_CONCURRENCY_DEBUG))
+		WARN_ON_ONCE(p->conc_held);
+}
+
 extern void conc_hold_kick(void);
 extern void conc_held_blocks(struct rq *rq, struct task_struct *p);
 extern void conc_unhold(struct rq *rq, struct task_struct *p, bool rehold);
@@ -383,6 +391,8 @@ static inline int conc_scx_enable(void) { return 0; }
 
 static inline void conc_scx_disable(void) { }
 
+static inline void conc_debug_enqueue(struct task_struct *p) { }
+
 static inline void conc_cpu_deactivate(unsigned int cpu) { }
 
 static inline void conc_cpu_activate(unsigned int cpu) { }
@@ -428,7 +438,10 @@ static inline void conc_dom_drop_stale_cids(struct cid_domain *dom) { }
 #endif /* CONFIG_SCHED_MM_CID */
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 
-#ifndef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+extern bool conc_debug_no_slot(int v);
+extern void conc_debug_switch(struct rq *rq, struct task_struct *prev, struct task_struct *next);
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 static inline void conc_debug_switch(struct rq *rq, struct task_struct *prev,
 				   struct task_struct *next) { }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */

@@ -978,6 +978,14 @@ struct task_struct {
 	struct conc_class			*conc_class;
 	struct callback_head		conc_hold_work;
 	struct list_head		conc_hold_node;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+	/* Its wait for a slot, see conc_debug_hold_watch_fn(). */
+	u64				conc_debug_wait_at;
+	u64				conc_debug_hold_at;
+	u64				conc_debug_held_ns;
+	unsigned int			conc_debug_holds;
+	struct list_head		conc_debug_wait_node;
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
 #ifdef CONFIG_PREEMPT_RCU
