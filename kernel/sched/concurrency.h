@@ -33,16 +33,6 @@ static inline bool conc_hold_request(struct task_struct *p, u8 why)
 }
 
 /* Filled in by a later patch. */
-static inline void conc_notify_tree(struct task_group *top)
-{
-}
-
-/* Filled in by a later patch. */
-static inline void conc_report_drop(struct tg_concurrency *conc, unsigned int from)
-{
-}
-
-/* Filled in by a later patch. */
 static inline void conc_slot_removed(struct task_group *tg, int cpu)
 {
 }
