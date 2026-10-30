@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 test_core
 test_cpu
+test_cpu_concurrency
 test_cpuset
 test_freezer
 test_hugetlb_memcg
