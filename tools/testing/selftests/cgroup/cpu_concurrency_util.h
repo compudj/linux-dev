@@ -40,6 +40,7 @@
 
 #include "kselftest.h"
 #include "cgroup_util.h"
+#include "cpu_concurrency_rseq.h"
 
 #define MAX_THREADS	64
 

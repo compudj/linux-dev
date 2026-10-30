@@ -858,6 +858,129 @@ cleanup:
 }
 
 /*
+ * One process has threads in two cgroups. a and b are threaded children
+ * of an unlimited parent. Each has the limit 1. Four threads spin in a.
+ * Two of them are then moved to b and pinned to one CPU which the other
+ * two have not used. The process must have run on two CPUs at least. No
+ * thread may read an mm_cid of 2 or more: 2 is the sum of the two limits.
+ */
+struct split_param {
+	char *b;
+};
+
+static int split_threads(const char *cgroup, void *arg)
+{
+	struct split_param *p = arg;
+	struct spinner s[4] = { };
+	cpu_set_t set;
+	char buf[32];
+	int i, cpu, target, seen;
+	long long max;
+
+	for (i = 0; i < 4; i++) {
+		clock_gettime(CLOCK_MONOTONIC, &s[i].until);
+		s[i].until.tv_sec += 1;
+		s[i].max_mm_cid = -1;
+		if (pthread_create(&s[i].thread, NULL, spin, &s[i]))
+			return 1;
+	}
+	for (i = 0; i < 4; i++)
+		while (!__atomic_load_n(&s[i].tid, __ATOMIC_ACQUIRE))
+			usleep(1000);
+	usleep(100000);
+	/*
+	 * Move two of the four threads to the other cgroup. Two limited
+	 * cgroups may share a CPU. To make the process use two CPUs, pin
+	 * these two threads to a CPU which the other two have not used.
+	 */
+	target = -1;
+	for (cpu = 0; cpu < get_nprocs(); cpu++) {
+		if (!((s[0].cpus_seen[cpu / 64] | s[1].cpus_seen[cpu / 64]) &
+		      (1UL << (cpu % 64)))) {
+			target = cpu;
+			break;
+		}
+	}
+	if (target < 0)
+		return 2;
+	CPU_ZERO(&set);
+	CPU_SET(target, &set);
+	for (i = 2; i < 4; i++) {
+		snprintf(buf, sizeof(buf), "%d", (int)s[i].tid);
+		if (cg_write(p->b, "cgroup.threads", buf)) {
+			fprintf(stderr, "moving a thread to the sibling failed\n");
+			return 3;
+		}
+		if (pthread_setaffinity_np(s[i].thread, sizeof(set), &set)) {
+			fprintf(stderr, "pinning a thread of the sibling failed\n");
+			return 4;
+		}
+	}
+	for (i = 0; i < 4; i++)
+		pthread_join(s[i].thread, NULL);
+
+	seen = count_cpus_seen(s, 4);
+	max = max_mm_cid_seen(s, 4);
+	if (rseq_has_mm_cid() && max >= 2) {
+		fprintf(stderr, "mm_cid %lld seen, sum of limits 2\n", max);
+		return 3;
+	}
+	if (seen < 2) {
+		fprintf(stderr, "only %d CPU used by two limited groups\n", seen);
+		return 5;
+	}
+	return 0;
+}
+
+static int test_concurrency_split(const char *root)
+{
+	struct split_param param = { };
+	char *parent = NULL, *a = NULL;
+	int ret = KSFT_FAIL;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+
+	parent = cg_name(root, "cc_test_split");
+	if (!parent)
+		goto cleanup;
+	a = cg_name(parent, "a");
+	param.b = cg_name(parent, "b");
+	if (!a || !param.b)
+		goto cleanup;
+	if (cg_create(parent))
+		goto cleanup;
+	if (cg_write(parent, "cgroup.subtree_control", "+cpu"))
+		goto cleanup;
+	if (cg_create(a) || cg_create(param.b))
+		goto cleanup;
+	if (cg_write(a, "cgroup.type", "threaded") ||
+	    cg_write(param.b, "cgroup.type", "threaded")) {
+		ret = skip("no threaded cgroups");
+		goto cleanup;
+	}
+	if (cg_write(a, "cpu.concurrency.max", "1") ||
+	    cg_write(param.b, "cpu.concurrency.max", "1"))
+		goto cleanup;
+
+	if (cg_run(a, split_threads, &param))
+		goto cleanup;
+
+	ret = KSFT_PASS;
+cleanup:
+	if (a)
+		cg_destroy(a);
+	if (param.b)
+		cg_destroy(param.b);
+	if (parent)
+		cg_destroy(parent);
+	free(a);
+	free(param.b);
+	free(parent);
+	return ret;
+}
+
+/*
  * test_concurrency_sleepers() runs this in a cgroup limited to 2. Start
  * two sleepers. While they sleep, pin each to one of the last two CPUs.
  * Then start three spinners, which can run on every CPU. The sleepers
@@ -1222,6 +1345,72 @@ cleanup:
 	free(parent);
 	return ret;
 }
+
+/*
+ * Test the concurrency ID namespace under a limit.
+ *
+ * Cgroups, by their name in struct ns_cid_param:
+ *
+ *   base            child_ceiling 4
+ *   `- outer        child_ceiling 3
+ *      |- parent    ceiling 3, cpu.concurrency.max 2
+ *      |  |- a      every process starts here
+ *      |  `- in
+ *      `- out       ceiling 3, no limit
+ *
+ * Processes:
+ *  - The creator runs ns_cid_run(). It must be in the namespace of init,
+ *    and it stays there.
+ *  - The helper is forked by the creator before unshare(2). It is
+ *    single-threaded and in the namespace of the creator.
+ *  - Members 0 and 1 are forked by the creator after
+ *    unshare(CLONE_NEWCID). Each has NS_CID_THREADS threads which read
+ *    ns_cid in a loop.
+ *
+ * Steps, driven by the creator:
+ *  1. unshare(CLONE_NEWCID). ns/cid of the creator is still the one of
+ *     init. ns/cid_for_children is new. PR_GET_NS_CID_MAX of the creator
+ *     is at least the number of online CPUs.
+ *  2. Fork the members. Their ns/cid is the new namespace. Each reads the
+ *     maximum 3. That is the ceiling of "parent", not the 4 written on
+ *     "base".
+ *  3. Move member 1 to "out". The write fails with EBUSY.
+ *  4. Move member 1 to "in" and back to "a". Both writes succeed.
+ *  5. clone3(CLONE_NEWCID | CLONE_INTO_CGROUP) one child into "out" and
+ *     one into "in". Each child is in a namespace of its own. Each reads
+ *     the maximum 3 and one ns_cid below 3. A clone3(2) which fails with
+ *     ENOSYS is accepted.
+ *  6. Move the helper to "out". Its setns(2) to the namespace of member 0
+ *     fails with EBUSY.
+ *  7. Move the helper to "a". Its setns(2) succeeds. Its next
+ *     NS_CID_JOIN_SAMPLES reads of ns_cid are below 2.
+ *  8. Move the helper to "in" and back to "a". Its reads are still below
+ *     2. It reads the maximum 3.
+ *  9. The helper starts NS_CID_THREADS threads. Its setns(2) fails with
+ *     EUSERS.
+ * 10. Write 1 to cpu.concurrency.max of "parent" and wait for
+ *     cpu.concurrency.effective to show it. Every sample of the members
+ *     in the next phase is 0. The helper still reads the maximum 3.
+ *
+ * In all steps, no thread of a member reads an ns_cid at or above the
+ * limit 2. The test does not compare the IDs of two running threads.
+ */
+#ifndef CLONE_NEWCID
+#define CLONE_NEWCID	0x00000040
+#endif
+#ifndef PR_GET_NS_CID_MAX
+#define PR_GET_NS_CID_MAX	82
+#endif
+#define NS_CID_THREADS	3
+#define NS_CID_PHASES	6
+#define NS_CID_SKIP	100
+/* What a member's threads saw, by phase. */
+struct ns_cid_seen {
+	unsigned int max_cid[NS_CID_PHASES];	/* largest ns_cid seen */
+	unsigned long ids[NS_CID_PHASES];	/* samples */
+	volatile int violation;			/* a sample reached sh->max */
+	unsigned long violations;		/* how many such samples */
+};
 
 /*
  * Return the ID of the cgroup @cg, or 0. It is the inode number of the
@@ -2893,6 +3082,1264 @@ cleanup:
 	free(cs);
 	free(ct);
 	free(p);
+	return ret;
+}
+
+/*
+ * State shared with the process of one round of
+ * test_concurrency_cid_decrease().
+ */
+struct cid_dec {
+	volatile long long max_cid;	/* -1 for none */
+	volatile int go, ready, done, stop, at1;
+	char cg[256];
+};
+
+static struct cid_dec *cd;
+
+/* Return 1 if @cg's effective value reads 1 within a second, else 0. */
+static int cid_dec_wait_at1(const char *cg)
+{
+	int i;
+
+	for (i = 0; i < 10000; i++) {
+		if (!cg_read_strcmp(cg, "cpu.concurrency.effective", "1 max\n"))
+			return 1;
+		usleep(100);
+	}
+	return 0;
+}
+
+/*
+ * Sleep, so that the thread is scheduled in again under the current
+ * bound. Then record its ID.
+ */
+static void cid_dec_note(void)
+{
+	__u32 cid;
+
+	usleep(100);
+	cid = rseq_field(thread_rseq(), RSEQ_MM_CID_OFFSET);
+	if (cid > cd->max_cid)
+		cd->max_cid = cid;
+}
+
+static void cid_dec_busy(void)
+{
+	spin_ns(20000);
+	usleep(20);
+}
+
+/*
+ * The second thread of the process. Write the decrease, wait until the
+ * effective value reads 1, then record the ID of this thread.
+ */
+static void *cid_dec_writer(void *arg)
+{
+	while (!cd->go)
+		cid_dec_busy();
+	cg_write(cd->cg, "cpu.concurrency.max", "1");
+	cd->at1 = cid_dec_wait_at1(cd->cg);
+	if (cd->at1)
+		cid_dec_note();
+	cd->done = 1;
+	return NULL;
+}
+
+static void *cid_dec_extra(void *arg)
+{
+	while (!cd->stop)
+		cid_dec_busy();
+	return NULL;
+}
+
+static void *cid_dec_new(void *arg)
+{
+	__u32 cid = rseq_field(thread_rseq(), RSEQ_MM_CID_OFFSET);
+
+	if (cid > cd->max_cid)
+		cd->max_cid = cid;
+	cid_dec_note();
+	return NULL;
+}
+
+/*
+ * The process of one round. With @arg set, it has two threads and one of
+ * them writes the decrease. Without, it has three threads, then starts a
+ * fourth after the decrease.
+ */
+static int cid_dec_proc(const char *cg, void *arg)
+{
+	pthread_t t[2], n;
+	int i;
+
+	if (arg) {
+		pthread_create(&t[0], NULL, cid_dec_writer, NULL);
+		usleep(200);
+		cd->ready = 1;
+		while (!cd->done)
+			cid_dec_busy();
+		if (cd->at1)
+			cid_dec_note();
+		pthread_join(t[0], NULL);
+		return 0;
+	}
+	for (i = 0; i < 2; i++)
+		pthread_create(&t[i], NULL, cid_dec_extra, NULL);
+	usleep(200);
+	cd->ready = 1;
+	while (!cd->go)
+		;
+	pthread_create(&n, NULL, cid_dec_new, NULL);
+	pthread_join(n, NULL);
+	cd->stop = 1;
+	for (i = 0; i < 2; i++)
+		pthread_join(t[i], NULL);
+	return 0;
+}
+
+/*
+ * After a decrease of the limit, no thread gets an ID at or above it at
+ * its next schedule-in. g gets the limit 2 at the start of each round. A
+ * new process then runs in g. The limit is lowered to 1, and the round
+ * waits until the effective value reads 1. Two kinds of round, 60 of
+ * each:
+ *  - The process has two threads, so each holds an ID of its own. The
+ *    second thread writes the decrease. Then each thread sleeps and
+ *    reads its ID.
+ *  - The process has three threads. This is more than the IDs below 2,
+ *    so the CPUs hold the IDs. The harness writes the decrease. The
+ *    process then creates a fourth thread, which reads its ID at its
+ *    start and again after a sleep.
+ * Every ID read must be 0.
+ */
+static int test_concurrency_cid_decrease(const char *root)
+{
+	int ret = KSFT_FAIL, r;
+	char *g = NULL;
+
+	if (!rseq_has_mm_cid())
+		return skip("no mm_cid in the rseq area glibc registered");
+	cd = mmap(NULL, sizeof(*cd), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (cd == MAP_FAILED)
+		return KSFT_FAIL;
+	g = cg_name(root, "cc_test_cid_dec");
+	if (!g || cg_create(g))
+		goto cleanup;
+	snprintf(cd->cg, sizeof(cd->cg), "%s", g);
+	for (r = 0; r < 120; r++) {
+		int writer = r & 1;
+		pid_t pid;
+
+		memset((void *)cd, 0, offsetof(struct cid_dec, cg));
+		cd->max_cid = -1;
+		if (cg_write(g, "cpu.concurrency.max", "2"))
+			goto cleanup;
+		pid = cg_run_nowait(g, cid_dec_proc, writer ? (void *)1 : NULL);
+		if (pid < 0)
+			goto cleanup;
+		while (!cd->ready)
+			usleep(10);
+		usleep(2000);
+		if (writer) {
+			cd->go = 1;
+		} else {
+			if (cg_write(g, "cpu.concurrency.max", "1"))
+				goto cleanup;
+			cd->at1 = cid_dec_wait_at1(g);
+			cd->go = 1;
+		}
+		waitpid(pid, NULL, 0);
+		if (!cd->at1) {
+			fprintf(stderr, "round %d: the effective value stayed above 1 for 1 s\n", r);
+			goto cleanup;
+		}
+		if (cd->max_cid != 0) {
+			fprintf(stderr, "round %d (%s): ID %lld read under effective value 1\n",
+				r, writer ? "a thread writing the decrease" : "a thread created after it",
+				cd->max_cid);
+			goto cleanup;
+		}
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (g) {
+		cg_write(g, "cpu.concurrency.max", "max");
+		cg_destroy(g);
+	}
+	free(g);
+	munmap((void *)cd, sizeof(*cd));
+	return ret;
+}
+
+/* State shared with the processes of test_concurrency_effective_ids(). */
+struct eff_ids {
+	volatile int at1, stop, ready, bad;
+	volatile int sampled;		/* samples taken while the limit was 1 */
+	volatile int judged;		/* those of them which read the value 1 */
+	unsigned int bad_cid;		/* read once its process is reaped */
+	char file[PATH_MAX];
+};
+
+static struct eff_ids *ei;
+
+static void *eff_ids_sleep(void *arg)
+{
+	for (;;)
+		pause();
+	return NULL;
+}
+
+/*
+ * The process of c0. Start @arg threads which sleep. A bound update
+ * visits each of them.
+ */
+static int eff_ids_bulk(const char *cgroup, void *arg)
+{
+	long i, n = (long)arg;
+	pthread_attr_t attr;
+
+	pthread_attr_init(&attr);
+	pthread_attr_setstacksize(&attr, 64 * 1024);
+	for (i = 0; i < n; i++) {
+		pthread_t t;
+
+		if (pthread_create(&t, &attr, eff_ids_sleep, NULL))
+			break;
+	}
+	ei->ready = 1;
+	for (;;)
+		pause();
+	return 0;
+}
+
+/*
+ * Loop: run for a millisecond, read the effective value, sleep, then
+ * read the ID given at the schedule-in. A sample counts only when the
+ * harness had set the limit to 1 before and after it. Otherwise the
+ * limit may have gone up between the read of the file and the
+ * schedule-in. A sample is judged when the file read 1: only then does
+ * it show that a decrease reached the IDs.
+ */
+static void *eff_ids_reader(void *arg)
+{
+	while (!ei->stop) {
+		int at1 = ei->at1, v;
+		__u32 cid;
+		char buf[32];
+
+		spin_ns(1000000);
+		if (read_text(ei->file, buf, sizeof(buf)) <= 0 || !strncmp(buf, "max", 3))
+			continue;
+		v = atoi(buf);
+		usleep(50);
+		cid = rseq_field(thread_rseq(), RSEQ_MM_CID_OFFSET);
+		__sync_synchronize();
+		if (!at1 || !ei->at1)
+			continue;
+		__sync_fetch_and_add(&ei->sampled, 1);
+		if (v == 1)
+			__sync_fetch_and_add(&ei->judged, 1);
+		if (cid >= (__u32)v) {
+			__sync_fetch_and_add(&ei->bad, 1);
+			ei->bad_cid = cid;
+		}
+	}
+	return NULL;
+}
+
+/* The process of one round. Its two threads are readers. */
+static int eff_ids_proc(const char *cgroup, void *arg)
+{
+	pthread_t t;
+
+	pthread_create(&t, NULL, eff_ids_reader, NULL);
+	eff_ids_reader(NULL);
+	pthread_join(t, NULL);
+	return 0;
+}
+
+/*
+ * cpu.concurrency.effective shows a decrease only once the ID bounds
+ * follow it. So a thread which reads the file, and is scheduled in after
+ * that, gets an ID below the value it read.
+ * g has the limit 2 and two children. c0 is created first. It holds a
+ * process of 1000 sleeping threads. The bounds of a subtree are applied
+ * one after the other, c0's before c1's, so the update takes time before
+ * it reaches c1. In each of 20 rounds, a new process runs in c1. Its two
+ * threads loop: run 1 ms, read c1's effective value, sleep, read their
+ * ID. The harness writes a limit of 1 to g, waits 100 ms, then writes 2
+ * again. Of the samples taken while the harness had the limit at 1, no
+ * ID may be at or above the value read before it. At least one of these
+ * samples must have read the value 1.
+ */
+static int test_concurrency_effective_ids(const char *root)
+{
+	char *g = NULL, *c0 = NULL, *c1 = NULL;
+	int ret = KSFT_FAIL, r, i;
+	pid_t bulk = -1;
+
+	if (!rseq_has_mm_cid())
+		return skip("no mm_cid in the rseq area glibc registered");
+	if (get_nprocs() < 2)
+		return skip("2 CPUs needed, %d online", get_nprocs());
+	ei = mmap(NULL, sizeof(*ei), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (ei == MAP_FAILED)
+		return KSFT_FAIL;
+	memset((void *)ei, 0, sizeof(*ei));
+	g = cg_name(root, "cc_test_eff_ids");
+	c0 = cg_name(g, "c0");
+	c1 = cg_name(g, "c1");
+	if (!g || !c0 || !c1 || cg_create(g) || cg_write(g, "cgroup.subtree_control", "+cpu") ||
+	    cg_create(c0) || cg_create(c1) || cg_write(g, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	snprintf(ei->file, sizeof(ei->file), "%s/cpu.concurrency.effective", c1);
+	bulk = cg_run_nowait(c0, eff_ids_bulk, (void *)1000L);
+	if (bulk < 0)
+		goto cleanup;
+	for (i = 0; i < 5000 && !ei->ready; i++)
+		usleep(1000);
+	if (!ei->ready)
+		goto cleanup;
+	for (r = 0; r < 20; r++) {
+		pid_t pid;
+
+		ei->stop = 0;
+		pid = cg_run_nowait(c1, eff_ids_proc, NULL);
+		if (pid < 0)
+			goto cleanup;
+		usleep(100000);
+		ei->at1 = 1;
+		__sync_synchronize();
+		if (cg_write(g, "cpu.concurrency.max", "1"))
+			goto cleanup;
+		usleep(100000);
+		ei->at1 = 0;
+		__sync_synchronize();
+		ei->stop = 1;
+		waitpid(pid, NULL, 0);
+		if (cg_write(g, "cpu.concurrency.max", "2"))
+			goto cleanup;
+		if (ei->bad) {
+			fprintf(stderr, "round %d: ID %u read after the effective value read 1, %d times\n",
+				r, ei->bad_cid, ei->bad);
+			goto cleanup;
+		}
+	}
+	if (!ei->judged) {
+		fprintf(stderr, "the effective value never read 1 in %d samples taken under the limit 1\n",
+			ei->sampled);
+		goto cleanup;
+	}
+	ksft_print_msg("%d samples under the limit 1, %d of them after the effective value read 1\n",
+		       ei->sampled, ei->judged);
+	ret = KSFT_PASS;
+cleanup:
+	if (bulk > 0) {
+		kill(bulk, SIGKILL);
+		waitpid(bulk, NULL, 0);
+	}
+	if (g)
+		cg_write(g, "cpu.concurrency.max", "max");
+	if (c1)
+		cg_destroy(c1);
+	if (c0)
+		cg_destroy(c0);
+	if (g)
+		cg_destroy(g);
+	free(c1);
+	free(c0);
+	free(g);
+	munmap((void *)ei, sizeof(*ei));
+	return ret;
+}
+
+/*
+ * Shared state of the cases which check that two tasks running at once
+ * never read the same ID: ids_unique, limit_raise_ids and
+ * ids_complete_after_rounds. It lives in a shared mapping.
+ *
+ * Each thread adds 1 to the entry of its ID in a table, with
+ * lib_rseq_count_by_id(). The table of mm_cid belongs to one process. The
+ * table of ns_cid belongs to one namespace. A thread adds its number of
+ * successful calls to @counted when it ends. The sum of the tables can
+ * then be below @counted. If so, two threads wrote one entry at the same
+ * time. They ran at once with the same ID.
+ */
+#define IDU_IDS		1024	/* entries of a table */
+#define IDU_SLOTS	16	/* threads which the harness watches */
+#define IDU_PROCS	4	/* processes, each with a table of mm_cid */
+#define IDU_MM		LIB_RSEQ_MM_CID
+#define IDU_NS		LIB_RSEQ_NS_CID
+struct idu_slot {
+	unsigned long ids_seen;		/* bit i: read ID i; the harness clears it */
+	volatile unsigned long loops;
+	volatile int ack;		/* the last epoch after which it slept */
+};
+
+struct idu_shared {
+	volatile int stop;
+	volatile int up;		/* watched threads which run */
+	volatile int noext;		/* a thread has no rseq area with its IDs */
+	volatile int epoch;		/* see idu_thread() */
+	volatile int nap_us;		/* see idu_thread() */
+	int nthreads;			/* threads of idu_spin_proc() */
+	unsigned int limit_ids;		/* every ID must be below this */
+	int bad;			/* 1 + IDU_MM or IDU_NS: an ID was not */
+	unsigned long bad_reads;	/* how many reads were not */
+	volatile unsigned int bad_id;	/* the first one */
+	volatile unsigned long bad_loops;	/* loops of its thread before it */
+	volatile int bad_slot;		/* slot of its thread, -1 if not watched */
+	unsigned long counted[2];	/* by IDU_MM and IDU_NS */
+	unsigned long churned;		/* threads and processes which ended */
+	volatile unsigned long writes;	/* limit writes which returned */
+	struct idu_slot slot[IDU_SLOTS];
+	unsigned long mm_table[IDU_PROCS][IDU_IDS];
+	unsigned long ns_table[IDU_IDS];
+};
+
+struct idu_arg {
+	struct idu_shared *sh;
+	pthread_t thread;
+	unsigned long *mm_table;
+	unsigned long *ns_table;	/* NULL: count by mm_cid only */
+	unsigned long rounds;		/* end after that many loops; 0: at sh->stop */
+	int slot;			/* -1: not watched */
+};
+
+/*
+ * Count once by the ID @kind of the calling thread, in the table of @a.
+ * Return 0 when the entry was incremented. Otherwise the ID was not below
+ * sh->limit_ids: record the first such read in @sh, count it, and return
+ * 1. @loops is the number of loops the thread has done.
+ */
+static int idu_count(struct idu_arg *a, int kind, unsigned long loops)
+{
+	unsigned long *table = kind == IDU_NS ? a->ns_table : a->mm_table;
+	struct idu_shared *sh = a->sh;
+	unsigned int id;
+	int none = 0;
+
+	if (!lib_rseq_count_by_id(kind, table, sh->limit_ids, &id))
+		return 0;
+	if (__atomic_compare_exchange_n(&sh->bad, &none, 1 + kind, false,
+					__ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+		sh->bad_id = id;
+		sh->bad_loops = loops;
+		sh->bad_slot = a->slot;
+	}
+	__atomic_add_fetch(&sh->bad_reads, 1, __ATOMIC_RELAXED);
+	return 1;
+}
+
+/* About one millisecond of loops in idu_thread() on the test machines. */
+#define IDU_NAP_EVERY	20000
+
+/*
+ * Count by mm_cid in a->mm_table, and by ns_cid in a->ns_table if it is
+ * set, until sh->stop or for a->rounds loops. A read of an ID which is not
+ * below sh->limit_ids is reported in sh->bad and counts nothing. Set
+ * sh->noext and count nothing if the rseq area of the thread lacks one of
+ * these IDs.
+ *
+ * A watched thread (a->slot >= 0) also does this for the harness:
+ *  - It records each ID it reads in its slot: ns_cid if it counts by it,
+ *    else mm_cid.
+ *  - When sh->epoch changes, it sleeps 100 us and then stores the epoch in
+ *    its slot. The sleep makes it schedule in again, so the IDs it reads
+ *    from then on were given after the change.
+ *  - While sh->nap_us is set, it sleeps that long every IDU_NAP_EVERY
+ *    loops.
+ */
+static void *idu_thread(void *arg)
+{
+	struct idu_arg *a = arg;
+	struct idu_shared *sh = a->sh;
+	struct idu_slot *slot = a->slot >= 0 ? &sh->slot[a->slot] : NULL;
+	int seen_kind = a->ns_table ? IDU_NS : IDU_MM;
+	unsigned long ok[2] = { }, loops = 0;
+	int epoch = sh->epoch, nap, ready;
+
+	ready = !lib_rseq_register() && lib_rseq_has_id(IDU_MM) &&
+		(!a->ns_table || lib_rseq_has_id(IDU_NS));
+	if (!ready)
+		sh->noext = 1;
+	if (slot)
+		__atomic_add_fetch(&sh->up, 1, __ATOMIC_RELEASE);
+	if (!ready)
+		goto out;
+	while (!sh->stop && (!a->rounds || loops < a->rounds)) {
+		if (idu_count(a, IDU_MM, loops))
+			continue;
+		ok[IDU_MM]++;
+		if (a->ns_table) {
+			if (idu_count(a, IDU_NS, loops))
+				continue;
+			ok[IDU_NS]++;
+		}
+		loops++;
+		if (!slot)
+			continue;
+		__atomic_fetch_or(&slot->ids_seen, 1UL << (lib_rseq_id(seen_kind) & 63),
+				  __ATOMIC_RELAXED);
+		slot->loops = loops;
+		if (sh->epoch != epoch) {
+			epoch = sh->epoch;
+			usleep(100);
+			slot->ack = epoch;
+		}
+		nap = sh->nap_us;
+		if (nap && loops % IDU_NAP_EVERY == 0)
+			usleep(nap);
+	}
+	__atomic_add_fetch(&sh->counted[IDU_MM], ok[IDU_MM], __ATOMIC_RELAXED);
+	__atomic_add_fetch(&sh->counted[IDU_NS], ok[IDU_NS], __ATOMIC_RELAXED);
+out:
+	lib_rseq_unregister();
+	return NULL;
+}
+
+/*
+ * Start @n watched threads which count until sh->stop. Their slots start
+ * at @slot. Return 0, or -1.
+ */
+static int idu_start(struct idu_shared *sh, struct idu_arg *a, int n, int slot,
+		     unsigned long *mm_table, unsigned long *ns_table)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		a[i] = (struct idu_arg){ .sh = sh, .mm_table = mm_table, .ns_table = ns_table,
+					 .slot = slot + i };
+		if (pthread_create(&a[i].thread, NULL, idu_thread, &a[i]))
+			return -1;
+	}
+	return 0;
+}
+
+/*
+ * Until sh->stop: start @n threads which each count for 20000 loops, and
+ * join them. They are not watched.
+ */
+static void idu_churn(struct idu_shared *sh, int n, unsigned long *mm_table,
+		      unsigned long *ns_table)
+{
+	struct idu_arg a[IDU_SLOTS];
+	int i, started;
+
+	while (!sh->stop) {
+		for (started = 0; started < n; started++) {
+			a[started] = (struct idu_arg){ .sh = sh, .mm_table = mm_table,
+						       .ns_table = ns_table, .rounds = 20000,
+						       .slot = -1 };
+			if (pthread_create(&a[started].thread, NULL, idu_thread, &a[started]))
+				break;
+		}
+		for (i = 0; i < started; i++)
+			pthread_join(a[i].thread, NULL);
+		__atomic_add_fetch(&sh->churned, started, __ATOMIC_RELAXED);
+		if (!started)
+			usleep(1000);
+	}
+}
+
+/*
+ * Wait until @pid ends. Return its exit status, or -1 if it was killed by
+ * a signal. Kill it and return -1 if it has not ended after @seconds.
+ */
+static int idu_reap(pid_t pid, int seconds)
+{
+	int i, status;
+
+	for (i = 0; i < seconds * 1000; i++) {
+		if (waitpid(pid, &status, WNOHANG) == pid)
+			return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+		usleep(1000);
+	}
+	kill(pid, SIGKILL);
+	/* Do not wait for ever: a task stuck in the kernel does not die. */
+	for (i = 0; i < 1000; i++) {
+		if (waitpid(pid, &status, WNOHANG) == pid)
+			break;
+		usleep(1000);
+	}
+	return -1;
+}
+
+/*
+ * Write cpu.concurrency.max of @g every 10 ms until sh->stop. The values
+ * are those of limits[], in a loop. Count the writes in sh->writes. Run in
+ * a process of its own, so that the test can time out when a write does
+ * not return.
+ */
+static int idu_writer(const char *g, struct idu_shared *sh)
+{
+	static char * const limits[] = { "1", "3", "max", "2" };
+	int i = 0;
+
+	prctl(PR_SET_PDEATHSIG, SIGKILL);
+	while (!sh->stop) {
+		if (cg_write(g, "cpu.concurrency.max", limits[i++ % ARRAY_SIZE(limits)]))
+			return 1;
+		sh->writes++;
+		usleep(10000);
+	}
+	return 0;
+}
+
+/* Wait up to 10 s until @n watched threads run. Return 0, or -1. */
+static int idu_wait_up(struct idu_shared *sh, int n)
+{
+	int i;
+
+	for (i = 0; i < 10000; i++) {
+		if (sh->noext)
+			return -1;
+		if (__atomic_load_n(&sh->up, __ATOMIC_ACQUIRE) >= n)
+			return 0;
+		usleep(1000);
+	}
+	return -1;
+}
+
+/*
+ * Compare the tables with the counts, once every thread has ended. Print
+ * what is wrong. Return 0 if no ID was out of range and no increment was
+ * lost.
+ */
+static int idu_check(struct idu_shared *sh)
+{
+	unsigned long sum[2] = { };
+	static const char * const name[] = { "mm_cid", "ns_cid" };
+	int i, j, ret = 0;
+
+	for (i = 0; i < IDU_PROCS; i++)
+		for (j = 0; j < IDU_IDS; j++)
+			sum[IDU_MM] += sh->mm_table[i][j];
+	for (j = 0; j < IDU_IDS; j++)
+		sum[IDU_NS] += sh->ns_table[j];
+	if (sh->bad) {
+		fprintf(stderr, "%lu reads of an ID which is not below %u; the first: %s %#x, by a thread which had counted %lu times\n",
+			sh->bad_reads, sh->limit_ids, name[sh->bad - 1], sh->bad_id, sh->bad_loops);
+		ret = 1;
+	}
+	for (i = 0; i < 2; i++) {
+		if (sum[i] == sh->counted[i])
+			continue;
+		fprintf(stderr, "%lu of %lu increments by %s lost: two threads ran at once with one ID\n",
+			sh->counted[i] - sum[i], sh->counted[i], name[i]);
+		ret = 1;
+	}
+	return ret;
+}
+
+/*
+ * Wait until cpu.concurrency.effective of @cg shows the limit @want. Return
+ * 0, or -1 after 2 s. The file follows a write once the tasks are within
+ * the limit and the ID bounds are applied. Both take a few scheduler
+ * ticks.
+ */
+static int idu_wait_effective(const char *cg, int want)
+{
+	char buf[64];
+	int i;
+
+	for (i = 0; i < 2000; i++) {
+		if (!cg_read(cg, "cpu.concurrency.effective", buf, sizeof(buf)) &&
+		    buf[0] != 'm' && atoi(buf) == want)
+			return 0;
+		usleep(1000);
+	}
+	return -1;
+}
+
+/*
+ * Run the case @name in a new execution of this program, and return its
+ * result. A case calls this when lib_rseq_glibc_hides_ns_cid(): glibc
+ * registered an rseq area without ns_cid for the threads of this program.
+ *
+ * A child of the calling process sets GLIBC_TUNABLES=glibc.pthread.rseq=0
+ * and executes this program with the arguments OWN_RSEQ_ARG and @name.
+ * glibc then registers no rseq area there, and the rseq selftest library
+ * registers one with ns_cid for each thread of the case. main() of the new
+ * execution runs the case @name alone, see own_rseq_main(). The exit
+ * status is the result of the case. This is how the tests of
+ * tools/testing/selftests/rseq get such an area too.
+ *
+ * The new execution runs this function if glibc registered an area
+ * without ns_cid again. The case is then skipped.
+ */
+#define OWN_RSEQ_ARG	"--own-rseq"
+static int own_rseq_child;	/* this is the new execution */
+
+static int own_rseq_run(const char *name)
+{
+	const char *old = getenv("GLIBC_TUNABLES");
+	char tunables[1024];
+	int status;
+	pid_t pid;
+
+	if (own_rseq_child)
+		return skip("glibc.pthread.rseq=0 does not stop the rseq area of glibc, without ns_cid");
+	ksft_print_msg("%s runs in a new execution, without the rseq area of glibc\n", name);
+	fflush(stdout);
+	fflush(stderr);
+	pid = fork();
+	if (pid < 0)
+		return KSFT_FAIL;
+	if (!pid) {
+		prctl(PR_SET_PDEATHSIG, SIGKILL);
+		snprintf(tunables, sizeof(tunables), "%s:glibc.pthread.rseq=0", old ? old : "");
+		if (!setenv("GLIBC_TUNABLES", tunables, 1))
+			execl("/proc/self/exe", "test_cpu_concurrency", OWN_RSEQ_ARG, name, NULL);
+		fprintf(stderr, "cannot execute this program again: %s\n", strerror(errno));
+		_exit(KSFT_FAIL);
+	}
+	if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status))
+		return KSFT_FAIL;
+	return WEXITSTATUS(status);
+}
+
+/*
+ * Say whether the calling case can count: by mm_cid, and with @ns by
+ * ns_cid too. Return -1 if it can. Otherwise return the result of the
+ * case @name: KSFT_SKIP, or what own_rseq_run() returns.
+ */
+static int idu_setup(const char *name, int ns)
+{
+	if (ns && lib_rseq_glibc_hides_ns_cid())
+		return own_rseq_run(name);
+	if (!lib_rseq_has_id(IDU_MM))
+		return skip("no rseq area with mm_cid, or no rseq library for this architecture");
+	return -1;
+}
+
+static struct idu_shared *idu_map(void)
+{
+	struct idu_shared *sh;
+
+	sh = mmap(NULL, sizeof(*sh), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (sh == MAP_FAILED)
+		return NULL;
+	memset(sh, 0, sizeof(*sh));
+	return sh;
+}
+
+/* The process of the first part of ids_unique. */
+static int idu_mm_proc(const char *cgroup, void *arg)
+{
+	struct idu_shared *sh = arg;
+	struct idu_arg a[4];
+	int i;
+
+	prctl(PR_SET_PDEATHSIG, SIGKILL);
+	if (idu_start(sh, a, 4, 0, sh->mm_table[0], NULL))
+		return 1;
+	idu_churn(sh, 4, sh->mm_table[0], NULL);
+	for (i = 0; i < 4; i++)
+		pthread_join(a[i].thread, NULL);
+	return 0;
+}
+
+/* Member @idx of the second part of ids_unique. */
+static int idu_ns_member(struct idu_shared *sh, int idx)
+{
+	struct idu_arg a[3];
+	int i;
+
+	prctl(PR_SET_PDEATHSIG, SIGKILL);
+	if (idu_start(sh, a, 3, 3 * idx, sh->mm_table[idx], sh->ns_table))
+		return 1;
+	idu_churn(sh, 2, sh->mm_table[idx], sh->ns_table);
+	for (i = 0; i < 3; i++)
+		pthread_join(a[i].thread, NULL);
+	return 0;
+}
+
+/* The creator of the second part of ids_unique. */
+static int idu_ns_proc(const char *cgroup, void *arg)
+{
+	struct idu_shared *sh = arg;
+	pid_t member[3], pid;
+	int i, n, ret = 0, status;
+
+	prctl(PR_SET_PDEATHSIG, SIGKILL);
+	if (unshare(CLONE_NEWCID)) {
+		if (errno == EINVAL || errno == EPERM) {
+			ksft_print_msg("no concurrency ID namespace (CLONE_NEWCID)\n");
+			return NS_CID_SKIP;
+		}
+		fprintf(stderr, "unshare(CLONE_NEWCID): %s\n", strerror(errno));
+		return 2;
+	}
+	for (n = 0; n < 3; n++) {
+		member[n] = fork();
+		if (member[n] == 0)
+			exit(idu_ns_member(sh, n));
+		if (member[n] < 0) {
+			fprintf(stderr, "fork of member %d: %s\n", n, strerror(errno));
+			ret = 3;
+			sh->stop = 1;
+			break;
+		}
+	}
+	/* Short members: each counts in one thread for 20000 loops. */
+	while (!sh->stop) {
+		pid = fork();
+		if (pid == 0) {
+			struct idu_arg a = { .sh = sh, .mm_table = sh->mm_table[3],
+					     .ns_table = sh->ns_table, .rounds = 20000,
+					     .slot = -1 };
+
+			prctl(PR_SET_PDEATHSIG, SIGKILL);
+			idu_thread(&a);
+			exit(0);
+		}
+		if (pid < 0) {
+			fprintf(stderr, "fork of a short member: %s\n", strerror(errno));
+			ret = 3;
+			break;
+		}
+		waitpid(pid, &status, 0);
+		__atomic_add_fetch(&sh->churned, 1, __ATOMIC_RELAXED);
+	}
+	for (i = 0; i < n; i++) {
+		waitpid(member[i], &status, 0);
+		if (!ret && (!WIFEXITED(status) || WEXITSTATUS(status)))
+			ret = 4;
+	}
+	return ret;
+}
+
+/*
+ * Run one part of ids_unique in @g: idu_mm_proc() or idu_ns_proc() with
+ * @threads watched threads. Return 0, NS_CID_SKIP, or another value on
+ * failure.
+ */
+static int idu_part(const char *g, struct idu_shared *sh,
+		    int (*proc)(const char *cgroup, void *arg), int threads, const char *what)
+{
+	pid_t pid, writer;
+	int ret;
+
+	memset(sh, 0, sizeof(*sh));
+	sh->limit_ids = MIN(get_nprocs_conf(), IDU_IDS);
+	/* The first member of the namespace must join under a limit. */
+	if (cg_write(g, "cpu.concurrency.max", "2"))
+		return 1;
+	pid = cg_run_nowait(g, proc, sh);
+	if (pid < 0)
+		return 1;
+	if (idu_wait_up(sh, threads)) {
+		sh->stop = 1;
+		ret = idu_reap(pid, 10);
+		if (ret == NS_CID_SKIP)
+			return ret;
+		if (sh->noext)
+			return skip("no ns_cid in the rseq area of a thread") ? NS_CID_SKIP : 1;
+		fprintf(stderr, "%s: %d of %d threads started in 10 s\n", what, sh->up, threads);
+		return 1;
+	}
+	writer = fork();
+	if (writer == 0)
+		exit(idu_writer(g, sh));
+	if (writer < 0) {
+		sh->stop = 1;
+		idu_reap(pid, 10);
+		return 1;
+	}
+	sleep(3);
+	sh->stop = 1;
+	/*
+	 * A write walks the tasks of the cgroup, a few hundred at most. The
+	 * threads only have to see sh->stop and return. 30 s is far more
+	 * than either takes.
+	 */
+	ret = idu_reap(writer, 30);
+	if (ret) {
+		fprintf(stderr, "%s: a write of cpu.concurrency.max failed or has not returned after 30 s (%lu writes done)\n",
+			what, sh->writes);
+		idu_reap(pid, 1);
+		return 1;
+	}
+	ret = idu_reap(pid, 30);
+	if (ret) {
+		fprintf(stderr, "%s: the process did not end normally within 30 s (%d)\n", what, ret);
+		return 1;
+	}
+	if (idu_check(sh))
+		return 1;
+	if (!sh->counted[IDU_MM] || !sh->churned) {
+		fprintf(stderr, "%s: %lu increments, %lu threads came and went\n", what,
+			sh->counted[IDU_MM], sh->churned);
+		return 1;
+	}
+	ksft_print_msg("%s: %lu increments by mm_cid, %lu by ns_cid, none lost; %lu threads or processes came and went, %lu limit writes\n",
+		       what, sh->counted[IDU_MM], sh->counted[IDU_NS], sh->churned, sh->writes);
+	return 0;
+}
+
+/*
+ * Two tasks which run at the same time never read the same mm_cid, and
+ * never the same ns_cid within one namespace.
+ *
+ * Cgroup: g. The test process stays outside. Each part lasts 3 s. During
+ * a part, a child of the test process writes cpu.concurrency.max of g
+ * every 10 ms, see idu_writer(). The child is outside g too.
+ *
+ * Part 1, mm_cid. One process in g. Four of its threads count for the
+ * whole part. Its first thread starts four more threads. Each counts
+ * 20000 times and ends. The first thread then starts four again, until
+ * the end of the part.
+ *
+ * Part 2, ns_cid. A creator in g calls unshare(CLONE_NEWCID) while the
+ * limit is 2, so the namespace gets the home g. It forks three members.
+ * In each member, three threads count for the whole part, and two more at
+ * a time count 20000 times and end. The creator also forks a fourth
+ * member again and again: it counts 20000 times in its only thread and
+ * exits.
+ *
+ * "Count" is one call of lib_rseq_count_by_id() by mm_cid, in a table of the
+ * process. In part 2 it is also one call by ns_cid, in a table which all
+ * members share. See struct idu_shared for what a lost increment proves.
+ *
+ * The test fails if an increment was lost, or if a thread read an ID
+ * which is not below the number of possible CPUs. It also fails if the
+ * writer or the processes of g have not ended 30 s after the end of a
+ * part. It is skipped without part 2 if the kernel has no concurrency ID
+ * namespace.
+ */
+static int test_concurrency_ids_unique(const char *root)
+{
+	struct idu_shared *sh;
+	int ret = KSFT_FAIL, r;
+	char *g = NULL;
+
+	r = idu_setup("test_concurrency_ids_unique", 1);
+	if (r >= 0)
+		return r;
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	sh = idu_map();
+	if (!sh)
+		return KSFT_FAIL;
+	g = cg_name(root, "cc_test_ids_unique");
+	if (!g || cg_create(g))
+		goto cleanup;
+	if (idu_part(g, sh, idu_mm_proc, 4, "one process"))
+		goto cleanup;
+	r = idu_part(g, sh, idu_ns_proc, 9, "one namespace");
+	if (r == NS_CID_SKIP)
+		ret = KSFT_SKIP;
+	else if (!r)
+		ret = KSFT_PASS;
+cleanup:
+	if (g) {
+		cg_write(g, "cpu.concurrency.max", "max");
+		cg_destroy(g);
+	}
+	free(g);
+	munmap(sh, sizeof(*sh));
+	return ret;
+}
+
+/*
+ * The process of limit_raise_ids and ids_complete_after_rounds. Its
+ * sh->nthreads threads, the first one included, are watched and count by
+ * mm_cid until sh->stop.
+ */
+static int idu_spin_proc(const char *cgroup, void *arg)
+{
+	struct idu_shared *sh = arg;
+	struct idu_arg a[IDU_SLOTS];
+	int i, n = sh->nthreads - 1;
+
+	prctl(PR_SET_PDEATHSIG, SIGKILL);
+	if (idu_start(sh, a, n, 0, sh->mm_table[0], NULL))
+		return 1;
+	a[n] = (struct idu_arg){ .sh = sh, .mm_table = sh->mm_table[0], .slot = n };
+	idu_thread(&a[n]);
+	for (i = 0; i < n; i++)
+		pthread_join(a[i].thread, NULL);
+	return 0;
+}
+
+/*
+ * Start idu_spin_proc() in @g with @threads threads. Every ID they read
+ * must be below @limit_ids. Return the pid once all threads run, or -1.
+ */
+static pid_t idu_spin_start(const char *g, struct idu_shared *sh, int threads,
+			    unsigned int limit_ids)
+{
+	pid_t pid;
+
+	memset(sh, 0, sizeof(*sh));
+	sh->limit_ids = limit_ids;
+	sh->nthreads = threads;
+	pid = cg_run_nowait(g, idu_spin_proc, sh);
+	if (pid < 0)
+		return -1;
+	if (idu_wait_up(sh, threads)) {
+		fprintf(stderr, "%d of %d threads started in 10 s\n", sh->up, threads);
+		sh->stop = 1;
+		idu_reap(pid, 10);
+		return -1;
+	}
+	return pid;
+}
+
+/*
+ * Stop the process of idu_spin_start() and check its counts. Return 0 if
+ * it ended within 30 s, read no ID out of range and lost no increment.
+ */
+static int idu_spin_stop(struct idu_shared *sh, pid_t pid)
+{
+	int ret;
+
+	sh->stop = 1;
+	ret = idu_reap(pid, 30);
+	if (ret) {
+		fprintf(stderr, "the process did not end normally within 30 s (%d)\n", ret);
+		return 1;
+	}
+	return idu_check(sh);
+}
+
+/*
+ * Forget the IDs which the first @n watched threads have read. Wait @ms.
+ * Return the IDs they read meanwhile, one bit per ID.
+ */
+static unsigned long idu_ids_seen(struct idu_shared *sh, int n, int ms)
+{
+	unsigned long ids = 0;
+	int i;
+
+	for (i = 0; i < n; i++)
+		__atomic_exchange_n(&sh->slot[i].ids_seen, 0, __ATOMIC_RELAXED);
+	usleep(ms * 1000);
+	for (i = 0; i < n; i++)
+		ids |= __atomic_load_n(&sh->slot[i].ids_seen, __ATOMIC_RELAXED);
+	return ids;
+}
+
+/*
+ * Wait until one window of 20 ms shows the IDs @want, and no other, for
+ * the first @n watched threads. Return 0. Return -1 after 2 s, with the
+ * IDs of the last window in @got. The threads run all the time, so each
+ * one reads its ID in every window in which it gets the CPU. 2 s is 100
+ * windows.
+ */
+static int idu_wait_ids(struct idu_shared *sh, int n, unsigned long want, unsigned long *got)
+{
+	int i;
+
+	for (i = 0; i < 100; i++) {
+		*got = idu_ids_seen(sh, n, 20);
+		if (*got == want)
+			return 0;
+	}
+	return -1;
+}
+
+/*
+ * Make the first @n watched threads sleep once, see idu_thread(). Return
+ * 0 when all have, -1 after 2 s. A thread sees the request within one
+ * loop and sleeps 100 us. With more threads than CPUs it must first get
+ * the CPU, which takes a few scheduler periods.
+ */
+static int idu_new_epoch(struct idu_shared *sh, int n)
+{
+	int e = sh->epoch + 1, i, j;
+
+	sh->epoch = e;
+	for (i = 0; i < 2000; i++) {
+		for (j = 0; j < n && sh->slot[j].ack == e; j++)
+			;
+		if (j == n)
+			return 0;
+		usleep(1000);
+	}
+	return -1;
+}
+
+/*
+ * Raise a limit over a process whose IDs are owned by the CPUs.
+ *
+ * Cgroup: g, with cpu.concurrency.max 2. One process in g has three
+ * threads. Each counts by mm_cid without a pause, see idu_thread(). The
+ * process has more threads than IDs below 2, so the CPUs own the IDs.
+ *
+ * 50 rounds, all steps done by the test process from outside g:
+ *  1. Write 3 to cpu.concurrency.max. Wait until cpu.concurrency.effective
+ *     shows 3. The kernel then gives each thread an ID of its own.
+ *  2. Wait for a window of 20 ms in which the three threads read the IDs
+ *     0, 1 and 2, see idu_wait_ids(). Three IDs below 3 exist only if no
+ *     earlier round lost one.
+ *  3. Write 2. Wait until the file shows 2. Then make each thread sleep
+ *     once, so that it is scheduled in under the new limit.
+ *  4. Read the IDs of the three threads for 20 ms. Each must be 0 or 1.
+ *
+ * The test also fails if a thread read an ID at or above 3 at any time.
+ * It fails if an increment was lost: two threads ran at once with one ID.
+ *
+ * The kernel gives each thread its own ID in step 1 only if the three
+ * threads are fewer than half the possible CPUs. So the test needs 8.
+ */
+static int test_concurrency_limit_raise_ids(const char *root)
+{
+	struct idu_shared *sh;
+	int ret = KSFT_FAIL, r;
+	unsigned long ids;
+	pid_t pid = -1;
+	char *g = NULL;
+
+	r = idu_setup("test_concurrency_limit_raise_ids", 0);
+	if (r >= 0)
+		return r;
+	if (get_nprocs_conf() < 8 || need_cpus(8))
+		return skip("8 CPUs needed");
+	sh = idu_map();
+	if (!sh)
+		return KSFT_FAIL;
+	g = cg_name(root, "cc_test_raise_ids");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	pid = idu_spin_start(g, sh, 3, 3);
+	if (pid < 0)
+		goto cleanup;
+	for (r = 0; r < 50; r++) {
+		if (cg_write(g, "cpu.concurrency.max", "3") || idu_wait_effective(g, 3)) {
+			fprintf(stderr, "round %d: the effective value did not reach 3\n", r);
+			goto stop;
+		}
+		if (idu_wait_ids(sh, 3, 0x7, &ids)) {
+			fprintf(stderr, "round %d: three threads under the limit 3 read the IDs %#lx (one bit per ID) for 2 s, expected 0x7\n",
+				r, ids);
+			goto stop;
+		}
+		if (cg_write(g, "cpu.concurrency.max", "2") || idu_wait_effective(g, 2)) {
+			fprintf(stderr, "round %d: the effective value did not reach 2\n", r);
+			goto stop;
+		}
+		if (idu_new_epoch(sh, 3)) {
+			fprintf(stderr, "round %d: a thread did not run for 2 s under the limit 2\n", r);
+			goto stop;
+		}
+		ids = idu_ids_seen(sh, 3, 20);
+		if (!ids || (ids & ~0x3UL)) {
+			fprintf(stderr, "round %d: the IDs %#lx (one bit per ID) read after the effective value showed 2\n",
+				r, ids);
+			goto stop;
+		}
+	}
+	if (!idu_spin_stop(sh, pid))
+		ret = KSFT_PASS;
+	pid = -1;
+stop:
+	if (pid > 0) {
+		/* Report a wrong ID or a lost increment as well. */
+		idu_spin_stop(sh, pid);
+	}
+cleanup:
+	if (g) {
+		cg_write(g, "cpu.concurrency.max", "max");
+		cg_destroy(g);
+	}
+	free(g);
+	munmap(sh, sizeof(*sh));
+	return ret;
+}
+
+/*
+ * No ID is lost when a limit goes down and up many times.
+ *
+ * Cgroup: g, with cpu.concurrency.max 3. One process in g has six
+ * threads. Each counts by mm_cid, see idu_thread(). During step 1 each
+ * thread also sleeps 1 ms after about every millisecond of counting.
+ *
+ * Steps, all done by the test process from outside g:
+ *  1. 500 times: write 1, then 3, to cpu.concurrency.max. After each
+ *     write, wait 0 to 2 ms. The waits come from rand_r() with a fixed
+ *     seed.
+ *  2. Stop the sleeps of the threads. Wait until
+ *     cpu.concurrency.effective shows 3.
+ *  3. Wait for a window of 20 ms in which the threads read the IDs 0, 1
+ *     and 2, see idu_wait_ids(). An ID lost in step 1 leaves two IDs
+ *     below 3, and such a window never comes.
+ *  4. Twice: wait 250 ms and check that each thread has counted
+ *     meanwhile. With six threads on three CPUs, a thread which does not
+ *     run for 250 ms is waiting for an ID.
+ *
+ * The test also fails if a thread read an ID at or above 3 at any time.
+ * It fails if an increment was lost: two threads ran at once with one ID.
+ */
+static int test_concurrency_ids_complete_after_rounds(const char *root)
+{
+	unsigned long ids, loops[6];
+	struct idu_shared *sh;
+	int ret = KSFT_FAIL, r, i;
+	unsigned int seed = 1;
+	pid_t pid = -1;
+	char *g = NULL;
+
+	r = idu_setup("test_concurrency_ids_complete_after_rounds", 0);
+	if (r >= 0)
+		return r;
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	sh = idu_map();
+	if (!sh)
+		return KSFT_FAIL;
+	g = cg_name(root, "cc_test_ids_complete");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "3"))
+		goto cleanup;
+	pid = idu_spin_start(g, sh, 6, 3);
+	if (pid < 0)
+		goto cleanup;
+	sh->nap_us = 1000;
+	for (r = 0; r < 1000; r++) {
+		if (cg_write(g, "cpu.concurrency.max", r & 1 ? "3" : "1")) {
+			fprintf(stderr, "round %d: the limit cannot be written\n", r / 2);
+			goto stop;
+		}
+		usleep(rand_r(&seed) % 2000);
+	}
+	sh->nap_us = 0;
+	if (idu_wait_effective(g, 3)) {
+		fprintf(stderr, "the effective value did not reach 3\n");
+		goto stop;
+	}
+	if (idu_wait_ids(sh, 6, 0x7, &ids)) {
+		fprintf(stderr, "six threads under the limit 3 read the IDs %#lx (one bit per ID) for 2 s, expected 0x7\n",
+			ids);
+		goto stop;
+	}
+	for (r = 0; r < 2; r++) {
+		for (i = 0; i < 6; i++)
+			loops[i] = sh->slot[i].loops;
+		usleep(250000);
+		for (i = 0; i < 6; i++) {
+			if (sh->slot[i].loops == loops[i]) {
+				fprintf(stderr, "thread %d did not count for 250 ms\n", i);
+				goto stop;
+			}
+		}
+	}
+	if (!idu_spin_stop(sh, pid))
+		ret = KSFT_PASS;
+	pid = -1;
+stop:
+	if (pid > 0) {
+		/* Report a wrong ID or a lost increment as well. */
+		idu_spin_stop(sh, pid);
+	}
+cleanup:
+	if (g) {
+		cg_write(g, "cpu.concurrency.max", "max");
+		cg_destroy(g);
+	}
+	free(g);
+	munmap(sh, sizeof(*sh));
 	return ret;
 }
 
@@ -7110,6 +8557,7 @@ struct cc_test {
 	T(test_concurrency_decrease),
 	T(test_concurrency_move),
 	T(test_concurrency_hotplug),
+	T(test_concurrency_split),
 	T(test_concurrency_hard),
 	T(test_concurrency_sleepers),
 	T(test_concurrency_cpuset_class),
@@ -7126,6 +8574,11 @@ struct cc_test {
 	T(test_concurrency_offline_affinity),
 	T(test_concurrency_setmove_mask),
 	T(test_concurrency_headroom_setmove),
+	T(test_concurrency_cid_decrease),
+	T(test_concurrency_effective_ids),
+	T(test_concurrency_ids_unique),
+	T(test_concurrency_limit_raise_ids),
+	T(test_concurrency_ids_complete_after_rounds),
 	T(test_concurrency_clone_into),
 	T(test_concurrency_self_move),
 	T(test_concurrency_vhost),
@@ -7158,6 +8611,27 @@ struct cc_test {
 
 #undef T
 
+/*
+ * Run the case @name alone and return its result: this is the execution
+ * which own_rseq_run() started. The first execution has set up the root
+ * cgroup. It also checks the kernel log and the online CPUs once the case
+ * ends.
+ */
+static int own_rseq_main(const char *name)
+{
+	char root[PATH_MAX];
+	int i;
+
+	own_rseq_child = 1;
+	if (cg_find_unified_root(root, sizeof(root), NULL))
+		return KSFT_FAIL;
+	for (i = 0; i < ARRAY_SIZE(tests); i++) {
+		if (!strcmp(tests[i].name, name))
+			return tests[i].fn(root);
+	}
+	return KSFT_FAIL;
+}
+
 int main(int argc, char *argv[])
 {
 	struct kernel_state ks;
@@ -7165,6 +8639,8 @@ int main(int argc, char *argv[])
 	int i, r, plan = 0;
 	char *probe;
 
+	if (argc == 3 && !strcmp(argv[1], OWN_RSEQ_ARG))
+		return own_rseq_main(argv[2]);
 	ksft_print_header();
 	if (cg_find_unified_root(root, sizeof(root), NULL))
 		ksft_exit_skip("cgroup v2 isn't mounted\n");
