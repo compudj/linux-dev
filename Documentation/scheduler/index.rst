@@ -22,6 +22,7 @@ Scheduler
     sched-rt-group
     sched-stats
     sched-ext
+    sched-max-concurrency
     sched-debug
 
     text_files
