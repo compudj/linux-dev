@@ -983,12 +983,22 @@ struct task_struct {
 	u8				cid_wait;
 	/* Held: out of its class, queued for the core, in TASK_RUNNING, on conc_held_list. */
 	u8				conc_held;
+	/* Forked into another cgroup, judged and not registered yet, see conc_fork_check(). */
+	u8				conc_fork_pending;
 	/* Running a cgroup migration it judged, see conc_wait_attach(). */
 	u8				conc_attaching;
+	/* Applying a cpuset's CPUs to its tasks: retries wait for the end, see conc_pass_end(). */
+	u8				conc_in_pass;
 	/* Its applied mask misses the one it is registered by, see conc_task_set_outside(). */
 	u8				conc_outside;
 	/* The CPU of a slot reserved for this task's arrival, -1 when none. */
 	int				conc_resv_cpu;
+	/*
+	 * Odd from the cpu controller's judgement of a migration of the task
+	 * to the migration's end, see conc_affinity_lock(). Written under
+	 * p->pi_lock.
+	 */
+	unsigned int			conc_move_seq;
 	/* The entry its affinity mask is registered under in its own group. */
 	struct conc_class			*conc_class;
 	struct list_head		conc_hold_node;
@@ -2585,6 +2595,8 @@ struct cgroup_subsys_state;
 struct cgroup_taskset;
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 extern void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus);
+extern void conc_pass_begin(void);
+extern void conc_pass_end(void);
 extern void conc_fatal_signal(struct task_struct *t);
 extern void conc_hold_resume(void);
 extern void sched_cid_resume(void);
@@ -2606,5 +2618,7 @@ static inline void sched_conc_resume_user_mode(void) { }
 static inline void conc_fatal_signal(struct task_struct *t) { }
 static inline void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus) { }
 static inline void sched_conc_resume_user_mode(void) { }
+static inline void conc_pass_begin(void) { }
+static inline void conc_pass_end(void) { }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 #endif

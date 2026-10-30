@@ -1152,6 +1152,8 @@ void cpuset_update_tasks_cpumask(struct cpuset *cs, struct cpumask *new_cpus)
 #endif
 	}
 
+	/* Limited groups retry once, at the end, see conc_pass_end(). */
+	conc_pass_begin();
 	css_task_iter_start(&cs->css, 0, &it);
 	while ((task = css_task_iter_next(&it))) {
 		const struct cpumask *possible_mask = task_cpu_possible_mask(task);
@@ -1170,6 +1172,7 @@ void cpuset_update_tasks_cpumask(struct cpuset *cs, struct cpumask *new_cpus)
 		set_cpus_allowed_ptr(task, new_cpus);
 	}
 	css_task_iter_end(&it);
+	conc_pass_end();
 }
 
 /*

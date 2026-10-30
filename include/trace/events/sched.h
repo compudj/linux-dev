@@ -951,6 +951,50 @@ TRACE_EVENT(sched_conc_refuse,
 	TP_printk("comm=%s pid=%d op=%s why=%s err=%d",
 		  __entry->comm, __entry->pid, __get_str(op), __get_str(why), __entry->err)
 );
+
+/*
+ * The cause of a refusal for masks overlapping without nesting, after
+ * the sched_conc_refuse event of the same task: the mask of the limited
+ * subtree that its mask overlaps, and a task holding that one with the
+ * id of its cgroup. No holder when the overlap is with a mask the same
+ * request changes (a migration of several tasks, a cpuset write); no mask
+ * either when none registered overlaps. One mask only: an event's output
+ * formats its bitmasks in one buffer (trace_print_bitmask_seq()).
+ */
+TRACE_EVENT(sched_conc_shape_conflict,
+
+	TP_PROTO(struct task_struct *p, const char *op, const struct cpumask *other,
+		 struct task_struct *holder, u64 holder_cgroup),
+
+	TP_ARGS(p, op, other, holder, holder_cgroup),
+
+	TP_STRUCT__entry(
+		__array(	char,	comm,		TASK_COMM_LEN	)
+		__field(	pid_t,	pid				)
+		__string(	op,	op				)
+		__cpumask(	other					)
+		__array(	char,	holder_comm,	TASK_COMM_LEN	)
+		__field(	pid_t,	holder_pid			)
+		__field(	u64,	holder_cgroup			)
+	),
+
+	TP_fast_assign(
+		memcpy(__entry->comm, p->comm, TASK_COMM_LEN);
+		__entry->pid		= p->pid;
+		__assign_str(op);
+		__assign_cpumask(other, cpumask_bits(other));
+		if (holder)
+			memcpy(__entry->holder_comm, holder->comm, TASK_COMM_LEN);
+		else
+			memset(__entry->holder_comm, 0, TASK_COMM_LEN);
+		__entry->holder_pid	= holder ? holder->pid : 0;
+		__entry->holder_cgroup	= holder_cgroup;
+	),
+
+	TP_printk("comm=%s pid=%d op=%s overlaps=%s holder=%s/%d cgroup=%llu",
+		  __entry->comm, __entry->pid, __get_str(op), __get_cpumask(other),
+		  __entry->holder_comm, __entry->holder_pid, __entry->holder_cgroup)
+);
 #endif /* _TRACE_SCHED_H */
 
 /* This part must be outside protection */
