@@ -72,6 +72,21 @@ typedef enum {
 	FILE_SPREAD_SLAB,
 } cpuset_filetype_t;
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+/*
+ * The CPUs a cpuset is configured to grant its tasks, as they would be
+ * with every CPU online, and, for a partition root, the CPUs it claims.
+ */
+struct cpuset_conc {
+	cpumask_var_t	cpus;
+	cpumask_var_t	claim;
+	bool		part;		/* a partition root that can take CPUs */
+	bool		under_part;	/* below a partition root other than the top */
+	bool		changed;	/* cpus changed: tasks to register, or to recount */
+	bool		scope;		/* a write that cannot be judged could change it */
+	bool		affected;	/* and the CPUs it could move reach its cpus */
+};
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 struct cpuset {
 	struct cgroup_subsys_state css;
 
@@ -133,6 +148,23 @@ struct cpuset {
 	 */
 	cpumask_var_t exclusive_cpus;
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	/*
+	 * What cpu.concurrency.max judges the cpuset's tasks by, as
+	 * configured (conc), recomputed on every write to the cpus, exclusive
+	 * or partition files, never on hotplug (see cpuset_conc_refresh()),
+	 * and as the write being judged would leave it (conc_trial, see
+	 * cpuset_conc_judge()).
+	 */
+	struct cpuset_conc conc;
+	struct cpuset_conc conc_trial;
+	/*
+	 * A partition root the limit refused: invalid, claiming nothing,
+	 * until cpuset.cpus.partition is written again (see
+	 * cpuset_conc_judge()).
+	 */
+	bool conc_refused;
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 	/*
 	 * This is old Memory Nodes tasks took on.
 	 *

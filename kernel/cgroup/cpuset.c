@@ -398,6 +398,19 @@ static void wait_attach_done_lock(void)
 	}
 }
 
+/**
+ * cpuset_lock_settled - cpuset_lock(), with no migration between cpusets
+ * in flight
+ *
+ * For the concurrency limits, which wait under cpuset_mutex for the
+ * migrations through the cpu controller to be applied: one between
+ * cpusets must not be left waiting for cpuset_mutex in cpuset_attach(),
+ * which comes first. As a cpuset write takes it.
+ */
+void cpuset_lock_settled(void)
+{
+	wait_attach_done_lock();
+}
 static inline void check_insane_mems_config(nodemask_t *nodes)
 {
 	if (!cpusets_insane_config() &&
@@ -643,11 +656,17 @@ static struct cpuset *dup_or_alloc_cpuset(struct cpuset *cs)
 	init_llist_node(&trial->attach_node);
 
 	/* Setup cpumask pointer array */
-	cpumask_var_t *pmask[4] = {
+	cpumask_var_t *pmask[] = {
 		&trial->cpus_allowed,
 		&trial->effective_cpus,
 		&trial->effective_xcpus,
-		&trial->exclusive_cpus
+		&trial->exclusive_cpus,
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+		&trial->conc.cpus,
+		&trial->conc.claim,
+		&trial->conc_trial.cpus,
+		&trial->conc_trial.claim,
+#endif
 	};
 
 	if (alloc_cpumasks(pmask, ARRAY_SIZE(pmask))) {
@@ -661,6 +680,10 @@ static struct cpuset *dup_or_alloc_cpuset(struct cpuset *cs)
 		cpumask_copy(trial->effective_cpus, cs->effective_cpus);
 		cpumask_copy(trial->effective_xcpus, cs->effective_xcpus);
 		cpumask_copy(trial->exclusive_cpus, cs->exclusive_cpus);
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+		cpumask_copy(trial->conc.cpus, cs->conc.cpus);
+		cpumask_copy(trial->conc.claim, cs->conc.claim);
+#endif
 	}
 
 	return trial;
@@ -676,6 +699,12 @@ static inline void free_cpuset(struct cpuset *cs)
 	free_cpumask_var(cs->effective_cpus);
 	free_cpumask_var(cs->effective_xcpus);
 	free_cpumask_var(cs->exclusive_cpus);
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	free_cpumask_var(cs->conc.cpus);
+	free_cpumask_var(cs->conc.claim);
+	free_cpumask_var(cs->conc_trial.cpus);
+	free_cpumask_var(cs->conc_trial.claim);
+#endif
 	kfree(cs);
 }
 
@@ -2482,6 +2511,13 @@ static void partition_cpus_change(struct cpuset *cs, struct cpuset *trialcs,
 	}
 }
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+static void cpuset_conc_refresh(void);
+static void cpuset_conc_online(struct cpuset *cs);
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static inline void cpuset_conc_refresh(void) { }
+static inline void cpuset_conc_online(struct cpuset *cs) { }
+#endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 /**
  * update_cpumask - update the cpus_allowed mask of a cpuset and all tasks in it
  * @cs: the cpuset to consider
@@ -2528,6 +2564,9 @@ static int update_cpumask(struct cpuset *cs, struct cpuset *trialcs,
 	if ((old_prs > 0) && !is_partition_valid(cs))
 		reset_partition_data(cs);
 	spin_unlock_irq(&callback_lock);
+
+	/* The configured CPUs, before the pass below registers the tasks' masks */
+	cpuset_conc_refresh();
 
 	/* effective_cpus/effective_xcpus will be updated here */
 	update_cpumasks_hier(cs, &tmp, force);
@@ -3699,6 +3738,7 @@ static int cpuset_css_online(struct cgroup_subsys_state *css)
 		cpumask_copy(cs->effective_cpus, parent->effective_cpus);
 		cs->effective_mems = parent->effective_mems;
 	}
+	cpuset_conc_online(cs);
 	spin_unlock_irq(&callback_lock);
 	cpuset1_online_css(css);
 
@@ -3910,6 +3950,13 @@ int __init cpuset_init(void)
 	cpumask_setall(top_cpuset.effective_xcpus);
 	cpumask_setall(top_cpuset.exclusive_cpus);
 	nodes_setall(top_cpuset.effective_mems);
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	BUG_ON(!alloc_cpumask_var(&top_cpuset.conc.cpus, GFP_KERNEL));
+	BUG_ON(!zalloc_cpumask_var(&top_cpuset.conc.claim, GFP_KERNEL));
+	BUG_ON(!zalloc_cpumask_var(&top_cpuset.conc_trial.cpus, GFP_KERNEL));
+	BUG_ON(!zalloc_cpumask_var(&top_cpuset.conc_trial.claim, GFP_KERNEL));
+	cpumask_copy(top_cpuset.conc.cpus, cpu_possible_mask);
+#endif
 	init_llist_node(&top_cpuset.attach_node);
 
 	cpuset1_init(&top_cpuset);
@@ -4276,6 +4323,325 @@ void cpuset_cpus_allowed(struct task_struct *tsk, struct cpumask *pmask)
 	spin_unlock_irqrestore(&callback_lock, flags);
 }
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+/*
+ * The cpuset.cpus value @allowed of a member applied to @above, its
+ * parent's configured CPUs, into @out (which may be @above).
+ */
+static void cpuset_conc_member(const struct cpumask *allowed, const struct cpumask *above,
+			     struct cpumask *out)
+{
+	if (cpumask_intersects(allowed, above))
+		cpumask_and(out, above, allowed);
+	else if (out != above)
+		cpumask_copy(out, above);
+}
+/*
+ * A write being judged, see cpuset_conc_judge(): the cpuset written, the
+ * values it would have, what compute_excpus() would then grant it
+ * (@excpus), and whether it is taken to end a valid partition root, which
+ * only the claims of its invalid siblings depend on (@either: none does).
+ */
+struct cpuset_conc_view {
+	struct cpuset		*cs;
+	const struct cpumask	*cpus;		/* cpuset.cpus */
+	const struct cpumask	*xcpus;		/* cpuset.cpus.exclusive */
+	int			prs;		/* cpuset.cpus.partition */
+	bool			valid;
+	bool			either;
+	struct cpumask		excpus;
+};
+static __maybe_unused struct cpuset_conc_view cpuset_conc_view;	/* cpuset_mutex */
+/* @c's state as configured (@v NULL), or as the write @v would leave it. */
+static inline struct cpuset_conc *conc_of(struct cpuset *c, const struct cpuset_conc_view *v)
+{
+	return v ? &c->conc_trial : &c->conc;
+}
+/*
+ * A partition root the limit refused, a member until cpuset.cpus.partition
+ * is written again: the write @v being judged, when it is that one.
+ */
+static inline bool conc_refused(struct cpuset *c, const struct cpuset_conc_view *v)
+{
+	return c->conc_refused && !(v && c == v->cs && v->prs > 0);
+}
+static inline const struct cpumask *conc_cpus_allowed(struct cpuset *c,
+						    const struct cpuset_conc_view *v)
+{
+	return v && c == v->cs ? v->cpus : c->cpus_allowed;
+}
+static inline const struct cpumask *conc_exclusive(struct cpuset *c,
+						 const struct cpuset_conc_view *v)
+{
+	return v && c == v->cs ? v->xcpus : c->exclusive_cpus;
+}
+static inline int conc_prs(struct cpuset *c, const struct cpuset_conc_view *v)
+{
+	return v && c == v->cs ? v->prs : c->partition_root_state;
+}
+/*
+ * compute_excpus() under @v: @c's exclusive CPUs, else its cpuset.cpus,
+ * within its parent's exclusive CPUs, less, when it has no exclusive CPUs
+ * of its own, what its siblings hold exclusive (theirs, else what they
+ * hold as valid partition roots). Under RCU.
+ */
+static void cpuset_conc_excpus(struct cpuset *c, const struct cpuset_conc_view *v,
+			     struct cpumask *excpus)
+{
+	const struct cpumask *x = conc_exclusive(c, v);
+	struct cpuset *parent = parent_cs(c), *sib;
+	struct cgroup_subsys_state *pos;
+
+	cpumask_and(excpus, cpumask_empty(x) ? conc_cpus_allowed(c, v) : x,
+		    parent->effective_xcpus);
+	if (!cpumask_empty(x))
+		return;
+	cpuset_for_each_child(sib, pos, parent) {
+		const struct cpumask *sx = conc_exclusive(sib, v);
+
+		if (sib == c)
+			continue;
+		if (cpumask_empty(sx)) {
+			if (v && sib == v->cs)
+				sx = v->valid ? &v->excpus : cpu_none_mask;
+			else
+				sx = sib->effective_xcpus;
+		}
+		cpumask_andnot(excpus, excpus, sx);
+	}
+}
+/* The partition root @cs, one that takes CPUs, claims them from, under @v. */
+static struct cpuset *cpuset_conc_domain(struct cpuset *cs, const struct cpuset_conc_view *v)
+{
+	struct cpuset *parent = parent_cs(cs);
+
+	return parent == &top_cpuset || conc_of(parent, v)->part ? parent : &top_cpuset;
+}
+/* The union of the claims on @d's CPUs, but @skip's, under @v, into @mask. Under RCU. */
+static void cpuset_conc_taken(struct cpuset *d, struct cpuset *skip,
+			    const struct cpuset_conc_view *v, struct cpumask *mask)
+{
+	struct cgroup_subsys_state *pos;
+	struct cpuset *c;
+
+	cpumask_clear(mask);
+	if (d == &top_cpuset) {
+		/* Its partition children, and remote partitions anywhere below. */
+		cpuset_for_each_descendant_pre(c, pos, d) {
+			if (c != d && c != skip && conc_of(c, v)->part &&
+			    cpuset_conc_domain(c, v) == d)
+				cpumask_or(mask, mask, conc_of(c, v)->claim);
+		}
+	} else {
+		cpuset_for_each_child(c, pos, d) {
+			if (c != skip && conc_of(c, v)->part)
+				cpumask_or(mask, mask, conc_of(c, v)->claim);
+		}
+	}
+}
+/*
+ * Compute the configured CPUs of every cpuset as configured (@v NULL),
+ * marking the cpusets whose CPUs changed for cpuset_conc_reregister(), or
+ * as the write @v would leave them, marking the cpusets it would change.
+ * Under RCU, cpuset_mutex held.
+ */
+static void cpuset_conc_compute(const struct cpuset_conc_view *v)
+{
+	static struct cpumask others, cpus;	/* cpuset_mutex */
+	struct cgroup_subsys_state *pos;
+	struct cpuset *c;
+
+	/* Which partition roots take CPUs, and their claims. */
+	cpuset_for_each_descendant_pre(c, pos, &top_cpuset) {
+		struct cpuset *p = parent_cs(c);
+		struct cpuset_conc *conc = conc_of(c, v), *pcc;
+		int pprs;
+
+		if (c == &top_cpuset)
+			continue;
+		pcc = conc_of(p, v);
+		pprs = conc_prs(p, v);
+		conc->under_part = p != &top_cpuset &&
+				 ((pprs != PRS_MEMBER && !conc_refused(p, v)) || pcc->under_part);
+		/*
+		 * A local partition needs its parent to take CPUs, a remote one
+		 * no partition root above it but the top.
+		 */
+		conc->part = conc_prs(c, v) != PRS_MEMBER && !conc_refused(c, v) &&
+			   (p == &top_cpuset || pcc->part ||
+			    (pprs == PRS_MEMBER && !pcc->under_part));
+		if (!conc->part)
+			cpumask_clear(conc->claim);
+		else if (v && c == v->cs)
+			cpumask_copy(conc->claim, &v->excpus);
+		else if (is_partition_valid(c))
+			cpumask_copy(conc->claim, c->effective_xcpus);
+		else if (v)
+			cpuset_conc_excpus(c, v, conc->claim);
+		else
+			compute_excpus(c, conc->claim);
+	}
+	/* The configured CPUs, top down. */
+	cpuset_for_each_descendant_pre(c, pos, &top_cpuset) {
+		const struct cpumask *allowed = conc_cpus_allowed(c, v);
+		struct cpuset_conc *conc = conc_of(c, v);
+
+		if (c == &top_cpuset) {
+			cpuset_conc_taken(c, NULL, v, &others);
+			cpumask_andnot(&cpus, cpu_possible_mask, &others);
+		} else if (conc->part) {
+			cpuset_conc_taken(cpuset_conc_domain(c, v), c, v, &others);
+			cpumask_andnot(&cpus, conc->claim, &others);
+			if (cpumask_intersects(&cpus, allowed))
+				cpumask_and(&cpus, &cpus, allowed);
+			cpuset_conc_taken(c, NULL, v, &others);
+			cpumask_andnot(&cpus, &cpus, &others);
+		} else {
+			cpuset_conc_member(allowed, conc_of(parent_cs(c), v)->cpus, &cpus);
+		}
+		if (v) {
+			cpumask_copy(conc->cpus, &cpus);
+			conc->changed = !cpumask_equal(&cpus, c->conc.cpus);
+		} else if (!cpumask_equal(&cpus, conc->cpus)) {
+			cpumask_copy(conc->cpus, &cpus);
+			conc->changed = true;
+		}
+	}
+}
+/*
+ * Recompute the configured CPUs of every cpuset, after a write to the
+ * cpus, exclusive or partition files. cpuset_mutex held. The cpusets whose
+ * configured CPUs changed are marked for cpuset_conc_reregister().
+ */
+static void cpuset_conc_refresh(void)
+{
+	lockdep_assert_held(&cpuset_mutex);
+	spin_lock_irq(&callback_lock);
+	rcu_read_lock();
+	cpuset_conc_compute(NULL);
+	rcu_read_unlock();
+	spin_unlock_irq(&callback_lock);
+}
+/*
+ * Are @c's configured CPUs, under @v, the ones it names: a member naming
+ * CPUs, which a limited subtree grants all of them (cpuset_conc_literal()),
+ * so that they change by a judged write only, never by a give-back? See
+ * conc_request_taken().
+ */
+static bool cpuset_conc_fixed(struct cpuset *c, const struct cpuset_conc_view *v)
+{
+	return c != &top_cpuset && !conc_of(c, v)->part && !cpumask_empty(conc_cpus_allowed(c, v));
+}
+/*
+ * An invalid partition root without exclusive CPUs that still holds the
+ * ones it had: hotplug invalidated it, keeping them for when its CPUs come
+ * back, which cpuset's walks drop. Its siblings do not claim them meanwhile.
+ */
+static __maybe_unused bool cpuset_conc_held_xcpus(struct cpuset *c)
+{
+	return is_partition_invalid(c) && cpumask_empty(c->exclusive_cpus) &&
+	       !cpumask_empty(c->effective_xcpus);
+}
+/* A new cpuset, a member: what its parent grants. Under callback_lock. */
+static void cpuset_conc_online(struct cpuset *cs)
+{
+	struct cpuset *parent = parent_cs(cs);
+
+	cs->conc.under_part = parent != &top_cpuset &&
+			    (parent->partition_root_state != PRS_MEMBER || parent->conc.under_part);
+	cs->conc.part = false;
+	cpumask_clear(cs->conc.claim);
+	cpuset_conc_member(cs->cpus_allowed, parent->conc.cpus, cs->conc.cpus);
+}
+static void cpuset_cpus_configured(struct cpuset *cs, struct cpumask *pmask)
+{
+	cpumask_copy(pmask, cs->conc.cpus);
+}
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static void cpuset_cpus_configured(struct cpuset *cs, struct cpumask *pmask)
+{
+	cpumask_copy(pmask, cpu_possible_mask);
+}
+#endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
+/**
+ * cpuset_css_cpus_configured_rcu - the CPUs the cpuset @css is configured
+ * to grant its tasks
+ * @css: a css of the cpuset controller, the destination of a migration
+ * @pmask: the mask to fill
+ *
+ * What the cpuset would grant with every CPU online: a hotplug event never
+ * changes it, a write to cpuset.cpus, cpuset.cpus.exclusive or the
+ * partition state does. Under RCU.
+ */
+void cpuset_css_cpus_configured_rcu(struct cgroup_subsys_state *css, struct cpumask *pmask)
+{
+	WARN_ON_ONCE(!rcu_read_lock_held());
+	cpuset_cpus_configured(css ? css_cs(css) : &top_cpuset, pmask);
+}
+/**
+ * cpuset_task_cpus_configured_rcu - the CPUs @tsk's cpuset is configured
+ * to grant it, see cpuset_css_cpus_configured_rcu(). Under RCU.
+ * @tsk: the task
+ * @pmask: the mask to fill
+ */
+void cpuset_task_cpus_configured_rcu(struct task_struct *tsk, struct cpumask *pmask)
+{
+	WARN_ON_ONCE(!rcu_read_lock_held());
+	cpuset_cpus_configured(task_cs(tsk), pmask);
+	cpumask_and(pmask, pmask, task_cpu_possible_mask(tsk));
+}
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+/**
+ * cpuset_css_cpus_fixed_rcu - are the CPUs the cpuset @css is configured to
+ * grant the ones it names, see cpuset_css_cpus_configured_rcu()?
+ * @css: a css of the cpuset controller
+ *
+ * A member cpuset naming CPUs, which a limited subtree grants all of (see
+ * cpuset_conc_literal()): its configured CPUs change by a write to it, which
+ * the limit judges, never by what a partition root gives back. Under RCU.
+ */
+bool cpuset_css_cpus_fixed_rcu(struct cgroup_subsys_state *css)
+{
+	WARN_ON_ONCE(!rcu_read_lock_held());
+	return cpuset_conc_fixed(css ? css_cs(css) : &top_cpuset, NULL);
+}
+/**
+ * cpuset_task_cpus_fixed_rcu - see cpuset_css_cpus_fixed_rcu(), for @tsk's cpuset
+ * @tsk: the task
+ */
+bool cpuset_task_cpus_fixed_rcu(struct task_struct *tsk)
+{
+	WARN_ON_ONCE(!rcu_read_lock_held());
+	return cpuset_conc_fixed(task_cs(tsk), NULL);
+}
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
+/**
+ * cpuset_task_cpus_rcu - the CPUs the cpuset grants @tsk, lockless.
+ * @tsk: the task
+ * @pmask: the mask to fill
+ *
+ * The mask that cpuset_update_tasks_cpumask() applies to @tsk, before any
+ * requested mask: its cpuset's effective CPUs, which a hotplug event
+ * changes when the cpuset handles it, not when the CPU goes inactive.
+ * Unlike cpuset_cpus_allowed() this takes no lock: an RCU snapshot for
+ * callers that hold a raw lock, consistent with the task's cpus_mask.
+ */
+void cpuset_task_cpus_rcu(struct task_struct *tsk, struct cpumask *pmask)
+{
+	const struct cpumask *possible_mask = task_cpu_possible_mask(tsk);
+	struct cpuset *cs;
+
+	WARN_ON_ONCE(!rcu_read_lock_held());
+	cs = task_cs(tsk);
+	if (cs == &top_cpuset) {
+		cpumask_andnot(pmask, possible_mask, subpartitions_cpus);
+		return;
+	}
+	/* What cpuset_update_tasks_cpumask() applies; a hotplug event reaches it later. */
+	cpumask_and(pmask, possible_mask, cs->effective_cpus);
+	if (cpumask_empty(pmask))
+		cpumask_and(pmask, possible_mask, parent_cs(cs)->effective_cpus);
+}
 /**
  * cpuset_cpus_allowed_fallback - final fallback before complete catastrophe.
  * @tsk: pointer to task_struct with which the scheduler is struggling

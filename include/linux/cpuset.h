@@ -76,9 +76,16 @@ extern void inc_dl_tasks_cs(struct task_struct *task);
 extern void dec_dl_tasks_cs(struct task_struct *task);
 extern void cpuset_lock(void);
 extern void cpuset_unlock(void);
+extern void cpuset_lock_settled(void);
 extern void lockdep_assert_cpuset_lock_held(void);
 extern void cpuset_cpus_allowed_locked(struct task_struct *p, struct cpumask *mask);
 extern void cpuset_cpus_allowed(struct task_struct *p, struct cpumask *mask);
+extern void cpuset_task_cpus_rcu(struct task_struct *p, struct cpumask *mask);
+extern void cpuset_task_cpus_configured_rcu(struct task_struct *p, struct cpumask *mask);
+extern void cpuset_css_cpus_configured_rcu(struct cgroup_subsys_state *css,
+					   struct cpumask *mask);
+extern bool cpuset_task_cpus_fixed_rcu(struct task_struct *p);
+extern bool cpuset_css_cpus_fixed_rcu(struct cgroup_subsys_state *css);
 extern bool cpuset_cpus_allowed_fallback(struct task_struct *p);
 extern int cpuset_num_cpus(struct cgroup *cgroup);
 extern nodemask_t cpuset_mems_allowed(struct task_struct *p);
@@ -198,6 +205,7 @@ static inline void inc_dl_tasks_cs(struct task_struct *task) { }
 static inline void dec_dl_tasks_cs(struct task_struct *task) { }
 static inline void cpuset_lock(void) { }
 static inline void cpuset_unlock(void) { }
+static inline void cpuset_lock_settled(void) { }
 static inline void lockdep_assert_cpuset_lock_held(void) { }
 
 static inline void cpuset_cpus_allowed_locked(struct task_struct *p,
@@ -212,6 +220,29 @@ static inline void cpuset_cpus_allowed(struct task_struct *p,
 	cpuset_cpus_allowed_locked(p, mask);
 }
 
+static inline void cpuset_task_cpus_rcu(struct task_struct *p,
+					struct cpumask *mask)
+{
+	cpumask_copy(mask, task_cpu_possible_mask(p));
+}
+static inline void cpuset_css_cpus_configured_rcu(struct cgroup_subsys_state *css,
+						  struct cpumask *mask)
+{
+	cpumask_copy(mask, cpu_possible_mask);
+}
+static inline bool cpuset_task_cpus_fixed_rcu(struct task_struct *p)
+{
+	return false;
+}
+static inline bool cpuset_css_cpus_fixed_rcu(struct cgroup_subsys_state *css)
+{
+	return false;
+}
+static inline void cpuset_task_cpus_configured_rcu(struct task_struct *p,
+						   struct cpumask *mask)
+{
+	cpumask_copy(mask, task_cpu_possible_mask(p));
+}
 static inline bool cpuset_cpus_allowed_fallback(struct task_struct *p)
 {
 	return false;
