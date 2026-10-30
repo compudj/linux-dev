@@ -4689,6 +4689,16 @@ static void cpuset_conc_compute(const struct cpuset_conc_view *v)
 		}
 	}
 }
+
+/*
+ * The configured CPUs are behind the cpuset files: nothing reads them while
+ * no group has a value (the static key off), so the writes leave them
+ * behind then, and cpuset_conc_sync() brings them up to date before a
+ * group counts. The debug option keeps them current, as it tries every
+ * write (cpuset_conc_judge()). cpuset_mutex.
+ */
+static bool cpuset_conc_stale;
+
 /*
  * Recompute the configured CPUs of every cpuset, after a write to the
  * cpus, exclusive or partition files. cpuset_mutex held. The cpusets whose
@@ -4697,12 +4707,41 @@ static void cpuset_conc_compute(const struct cpuset_conc_view *v)
 static void cpuset_conc_refresh(void)
 {
 	lockdep_assert_held(&cpuset_mutex);
+	if (!IS_ENABLED(CONFIG_SCHED_MAX_CONCURRENCY_DEBUG) && !conc_cpuset_active()) {
+		cpuset_conc_stale = true;
+		return;
+	}
+	cpuset_conc_stale = false;
 	spin_lock_irq(&callback_lock);
 	rcu_read_lock();
 	cpuset_conc_compute(NULL);
 	rcu_read_unlock();
 	spin_unlock_irq(&callback_lock);
 }
+
+/**
+ * cpuset_conc_sync - bring the configured CPUs up to date
+ *
+ * Before a group with a value counts, the static key on and cpuset_mutex
+ * held: the writes made while the key was off left the configured CPUs
+ * behind (cpuset_conc_refresh()). No task was registered by them then, so
+ * none is registered again.
+ */
+void cpuset_conc_sync(void)
+{
+	struct cgroup_subsys_state *pos;
+	struct cpuset *c;
+
+	lockdep_assert_held(&cpuset_mutex);
+	if (!cpuset_conc_stale)
+		return;
+	cpuset_conc_refresh();
+	rcu_read_lock();
+	cpuset_for_each_descendant_pre(c, pos, &top_cpuset)
+		c->conc.changed = false;
+	rcu_read_unlock();
+}
+
 /*
  * Are @c's configured CPUs, under @v, the ones it names: a member naming
  * CPUs, which a limited subtree grants all of them (cpuset_conc_literal()),

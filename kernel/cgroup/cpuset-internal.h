@@ -154,9 +154,9 @@ struct cpuset {
 	/*
 	 * What cpu.concurrency.max judges the cpuset's tasks by, as
 	 * configured (conc), recomputed on every write to the cpus, exclusive
-	 * or partition files, never on hotplug (see cpuset_conc_refresh()),
-	 * and as the write being judged would leave it (conc_trial, see
-	 * cpuset_conc_judge()).
+	 * or partition files while a group may count, never on hotplug (see
+	 * cpuset_conc_refresh()), and as the write being judged would leave it
+	 * (conc_trial, see cpuset_conc_judge()).
 	 */
 	struct cpuset_conc conc;
 	struct cpuset_conc conc_trial;
