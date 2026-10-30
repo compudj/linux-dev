@@ -507,6 +507,36 @@ enum conc_claim_result {
 	CONC_CLAIMED	= 1,	/* an entity was added */
 	CONC_INACTIVE	= 2,	/* the group does not count; nothing was added */
 };
+/*
+ * The mask a task of a group's subtree is configured to run on (its
+ * cpuset's CPUs with every CPU online, within its requested mask), with
+ * the number of tasks that have it. Two masks follow: the configured one,
+ * which hotplug never changes and by which a change is admitted (see
+ * conc_masks_width()), and its live part, the CPUs of it that may be used,
+ * by which tasks are placed. The minimal live parts are the group's
+ * affinity classes, on a list of their own too; equal live parts make one
+ * class. A dormant entry is no class: its live part is empty (every CPU of
+ * it offline or going offline), and its tasks are widened if they wake up
+ * meanwhile; or none of its tasks can run on it, their applied masks lying
+ * outside the mask (see conc_task_set_outside()).
+ */
+struct conc_class {
+	struct list_head	node;
+	struct rb_node		by_mask;	/* in @index of the level */
+	struct rcu_head		rcu;
+	unsigned int		tasks;
+	unsigned int		outside;	/* of @tasks, those whose applied mask misses it */
+	unsigned int		live_weight;	/* CPUs in the live part */
+	u32			hash;		/* of the configured mask, see conc_mask_hash() */
+	struct list_head	min_node;	/* on @classes of the level while minimal */
+	struct list_head	sort_node;	/* a recount's order, or entries to free */
+	u64			linked_gen;	/* the level's @masks_gen it came in at */
+	bool			minimal;
+	bool			dormant;
+	unsigned long		mask[];	/* configured, then live: two cpumasks */
+};
+#define conc_class_mask(c)	((struct cpumask *)(c)->mask)
+#define conc_class_live(c)	((struct cpumask *)((char *)(c)->mask + cpumask_size()))
 struct tg_concurrency {
 	raw_spinlock_t		lock;
 	atomic_t __percpu	*present;
@@ -515,8 +545,19 @@ struct tg_concurrency {
 	unsigned int		nr_used;
 	unsigned int		nr_evicting;	/* slots being evicted, counted in nr_used */
 
-	/* Requested masks of the subtree's tasks, under @lock */
+	/*
+	 * Requested masks of the subtree's tasks, under @lock; @masks is
+	 * also read under RCU, its changes in @masks_seq.
+	 */
 	struct list_head	masks;
+	seqcount_raw_spinlock_t	masks_seq;
+	unsigned int		nr_masks;
+	struct rb_root		index;		/* the same, by hash then mask */
+	struct list_head	classes;	/* the minimal ones, by conc_class::min_node */
+	u64			masks_gen;	/* bumped when an entry comes or goes */
+	u64			width_gen;	/* @masks_gen of @width and @width_apart */
+	unsigned int		width, width_apart;
+	u64			laminar_gen;	/* a @masks_gen with the masks laminar */
 	unsigned int		unhit;		/* classes no used CPU hits: headroom kept for them */
 	bool			merged;		/* @masks counted above too, conc_chain_unlock() */
 
@@ -2733,12 +2774,28 @@ extern const u32		sched_prio_to_wmult[40];
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 struct conc_resv;
+/* The concurrency limit's part of an affinity change, see conc_prepare_affinity(). */
+struct conc_affinity_ctx {
+	/* A slot reserved for the task's new CPU. */
+	struct conc_resv		*resv;
+	/* Class entries preallocated for the new requested mask, one per level. */
+	struct conc_class		**prealloc;
+	int			nr_prealloc;
+	/* With SCA_CC_JUDGED: the task's conc_move_seq and the limit generation judged at. */
+	unsigned int		move_seq;
+	unsigned int		gen;
+	/* Counted as a change in flight, which set-moves wait for. */
+	bool			pending;
+};
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 struct affinity_context {
 	const struct cpumask	*new_mask;
 	struct cpumask		*user_mask;
 	/* Out: the deadline bandwidth the move counts in the new root domain. */
 	u64			dl_bw_moved;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	struct conc_affinity_ctx	conc;
+#endif
 	unsigned int		flags;
 };
 
