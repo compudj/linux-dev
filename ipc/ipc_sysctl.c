@@ -15,6 +15,9 @@
 #include <linux/msg.h>
 #include <linux/slab.h>
 #include <linux/cred.h>
+#include <linux/cpumask.h>
+#include <linux/sched.h>
+#include <linux/sched/cid.h>
 #include "util.h"
 
 static int proc_ipc_dointvec_minmax_orphans(const struct ctl_table *table, int write,
@@ -72,6 +75,11 @@ static int proc_ipc_sem_dointvec(const struct ctl_table *table, int write,
 int ipc_mni = IPCMNI;
 int ipc_mni_shift = IPCMNI_SHIFT;
 int ipc_min_cycle = RADIX_TREE_MAP_SIZE;
+
+static int proc_ipc_ns_cid_max(const struct ctl_table *table, int write,
+			       void *buffer, size_t *lenp, loff_t *ppos);
+static int proc_ipc_ns_cid_cur(const struct ctl_table *table, int write,
+			       void *buffer, size_t *lenp, loff_t *ppos);
 
 static const struct ctl_table ipc_sysctls[] = {
 	{
@@ -178,8 +186,61 @@ static const struct ctl_table ipc_sysctls[] = {
 		.extra2		= SYSCTL_INT_MAX,
 	},
 #endif
+	/*
+	 * .data names the namespace field the handler resolves the namespace
+	 * from, as the entries above do; .maxlen is that of the value shown.
+	 */
+	{
+		.procname	= "ns_cid_max",
+		.data		= &init_ipc_ns.cid,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0444,
+		.proc_handler	= proc_ipc_ns_cid_max,
+	},
+	{
+		.procname	= "ns_cid_cur",
+		.data		= &init_ipc_ns.cid,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0444,
+		.proc_handler	= proc_ipc_ns_cid_cur,
+	},
 };
 
+/*
+ * The concurrency ID bounds of the namespace, read-only: the ceiling,
+ * frozen when the namespace was created, and the current limit target. A
+ * namespace without concurrency IDs reports the number of CPU IDs, since
+ * ns_cid is the CPU number there. See sched-max-concurrency.rst.
+ */
+static int proc_ipc_ns_cid(const struct ctl_table *table, int write,
+			   void *buffer, size_t *lenp, loff_t *ppos, bool max)
+{
+	struct ipc_namespace *ns =
+		container_of((struct ns_cid **)table->data, struct ipc_namespace, cid);
+	struct ctl_table ipc_table;
+	unsigned int val;
+
+	if (write)
+		return -EPERM;
+	if (!ns->cid)
+		val = nr_cpu_ids;
+	else
+		val = max ? ns_cid_max(ns) : ns_cid_cur(ns);
+	memcpy(&ipc_table, table, sizeof(ipc_table));
+	ipc_table.data = &val;
+	ipc_table.maxlen = sizeof(val);
+	return proc_douintvec(&ipc_table, write, buffer, lenp, ppos);
+}
+static int proc_ipc_ns_cid_max(const struct ctl_table *table, int write,
+			       void *buffer, size_t *lenp, loff_t *ppos)
+{
+	return proc_ipc_ns_cid(table, write, buffer, lenp, ppos, true);
+}
+static int proc_ipc_ns_cid_cur(const struct ctl_table *table, int write,
+			       void *buffer, size_t *lenp, loff_t *ppos)
+{
+	return proc_ipc_ns_cid(table, write, buffer, lenp, ppos, false);
+}
 static struct ctl_table_set *set_lookup(struct ctl_table_root *root)
 {
 	return &current->nsproxy->ipc_ns->ipc_set;
@@ -286,6 +347,9 @@ bool setup_ipc_sysctls(struct ipc_namespace *ns)
 			else if (tbl[i].data == &init_ipc_ns.ids[IPC_SHM_IDS].next_id)
 				tbl[i].data = &ns->ids[IPC_SHM_IDS].next_id;
 #endif
+			else if (tbl[i].data == &init_ipc_ns.cid)
+				tbl[i].data = &ns->cid;
+
 			else
 				tbl[i].data = NULL;
 		}

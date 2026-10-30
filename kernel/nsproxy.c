@@ -26,6 +26,7 @@
 #include <linux/file.h>
 #include <linux/syscalls.h>
 #include <linux/cgroup.h>
+#include <linux/sched/cid.h>
 #include <linux/perf_event.h>
 #include <linux/nstree.h>
 
@@ -230,6 +231,11 @@ int unshare_nsproxy_namespaces(unsigned long unshare_flags,
 		flags &= ~(u64)UNSHARE_EMPTY_MNTNS;
 		flags |= CLONE_EMPTY_MNTNS;
 	}
+	/* Same for UNSHARE_IPC_CID (which aliases CLONE_CHILD_SETTID). */
+	if (flags & UNSHARE_IPC_CID) {
+		flags &= ~(u64)UNSHARE_IPC_CID;
+		flags |= CLONE_IPC_CID;
+	}
 
 	*new_nsp = create_new_namespaces(flags, current, user_ns,
 					 new_fs ? new_fs : current->fs);
@@ -250,6 +256,9 @@ void switch_task_namespaces(struct task_struct *p, struct nsproxy *new)
 
 	if (new)
 		nsproxy_ns_active_get(new);
+
+	/* Membership of the IPC namespace's cid domain follows nsproxy. */
+	sched_cid_switch_ns(p, new);
 
 	task_lock(p);
 	ns = p->nsproxy;
@@ -347,6 +356,8 @@ static void put_nsset(struct nsset *nsset)
 	 */
 	if (nsset->fs && (flags & CLONE_NEWNS) && (flags & ~CLONE_NEWNS))
 		free_fs_struct(nsset->fs);
+	/* Committed, or not: no cid domain admission is pending any more. */
+	sched_cid_setns_done(current);
 	if (nsset->nsproxy)
 		nsproxy_free(nsset->nsproxy);
 }

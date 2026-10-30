@@ -192,9 +192,14 @@ struct rseq_abi {
 	struct rseq_abi_slice_ctrl slice_ctrl;
 
 	/*
-	 * Place holder to push the size above 32 bytes.
+	 * Restartable sequences ns_cid field. Updated by the kernel. Read by
+	 * user-space with single-copy atomicity semantics. Contains the
+	 * current thread's cross-process concurrency ID: an ID unique among
+	 * the running tasks of an IPC namespace created with CLONE_IPC_CID,
+	 * the CPU number elsewhere. Only valid for registrations larger than
+	 * the original 32 bytes.
 	 */
-	__u8 __reserved;
+	__u32 ns_cid;
 
 	/*
 	 * Flexible array member at end of structure, after last feature field.

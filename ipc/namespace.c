@@ -16,6 +16,7 @@
 #include <linux/user_namespace.h>
 #include <linux/proc_ns.h>
 #include <linux/nstree.h>
+#include <linux/sched/cid.h>
 #include <linux/sched/task.h>
 
 #include "util.h"
@@ -37,7 +38,8 @@ static void dec_ipc_namespaces(struct ucounts *ucounts)
 }
 
 static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
-					   struct ipc_namespace *old_ns)
+					   struct ipc_namespace *old_ns,
+					   bool cid)
 {
 	struct ipc_namespace *ns;
 	struct ucounts *ucounts;
@@ -81,9 +83,19 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 	if (!setup_ipc_sysctls(ns))
 		goto fail_mq_sysctls;
 
+	/* Concurrency IDs: a creation-time choice, see sched-max-concurrency.rst */
+	if (cid) {
+		ns->cid = ns_cid_create(ns);
+		if (IS_ERR(ns->cid)) {
+			err = PTR_ERR(ns->cid);
+			ns->cid = NULL;
+			goto fail_ipc;
+		}
+	}
+
 	err = msg_init_ns(ns);
 	if (err)
-		goto fail_ipc;
+		goto fail_cid;
 
 	sem_init_ns(ns);
 	shm_init_ns(ns);
@@ -91,6 +103,8 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 
 	return ns;
 
+fail_cid:
+	ns_cid_destroy(ns->cid);
 fail_ipc:
 	retire_ipc_sysctls(ns);
 fail_mq_sysctls:
@@ -113,7 +127,7 @@ struct ipc_namespace *copy_ipcs(u64 flags,
 {
 	if (!(flags & CLONE_NEWIPC))
 		return get_ipc_ns(ns);
-	return create_ipc_ns(user_ns, ns);
+	return create_ipc_ns(user_ns, ns, flags & CLONE_IPC_CID);
 }
 
 /*
@@ -157,6 +171,7 @@ static void free_ipc_ns(struct ipc_namespace *ns)
 	sem_exit_ns(ns);
 	msg_exit_ns(ns);
 	shm_exit_ns(ns);
+	ns_cid_destroy(ns->cid);
 
 	retire_mq_sysctls(ns);
 	retire_ipc_sysctls(ns);
@@ -234,9 +249,21 @@ static int ipcns_install(struct nsset *nsset, struct ns_common *new)
 {
 	struct nsproxy *nsproxy = nsset->nsproxy;
 	struct ipc_namespace *ns = to_ipc_ns(new);
+	int err;
+
 	if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN) ||
 	    !ns_capable(nsset->cred->user_ns, CAP_SYS_ADMIN))
 		return -EPERM;
+
+	/*
+	 * A namespace with concurrency IDs admits a task from within the
+	 * cgroup subtree its ceiling was frozen on, see
+	 * sched-max-concurrency.rst. The task joins the domain when the
+	 * namespaces are switched.
+	 */
+	err = sched_cid_setns(current, ns);
+	if (err)
+		return err;
 
 	put_ipc_ns(nsproxy->ipc_ns);
 	nsproxy->ipc_ns = get_ipc_ns(ns);

@@ -40,6 +40,7 @@
 #define CLONE_NNP		(1ULL << 35) /* Set no_new_privs on child. */
 #define CLONE_PIDFD_AUTOKILL	(1ULL << 36) /* Kill child when clone pidfd closes. */
 #define CLONE_EMPTY_MNTNS	(1ULL << 37) /* Create an empty mount namespace. */
+#define CLONE_IPC_CID		(1ULL << 38) /* The new IPC namespace maintains concurrency IDs (needs CLONE_NEWIPC). */
 
 /*
  * cloning flags intersect with CSIGNAL so can be used with unshare and clone3
@@ -52,6 +53,8 @@
  * unshare syscall:
  */
 #define UNSHARE_EMPTY_MNTNS 0x00100000 /* Unshare an empty mount namespace. */
+/* The new IPC namespace maintains concurrency IDs (needs CLONE_NEWIPC); aliases CLONE_CHILD_SETTID. */
+#define UNSHARE_IPC_CID 0x01000000
 
 #ifndef __ASSEMBLY__
 /**

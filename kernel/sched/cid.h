@@ -11,10 +11,11 @@
 #ifdef CONFIG_SCHED_MM_CID
 /*
  * The concurrency ID engine, written against a cid domain: the mm of a
- * process (mm_cid). A domain hands out IDs to the tasks of its users that
- * run at the same time, either owned by the task for its lifetime
- * (per-task mode, few users) or owned by the CPU while a user runs on it
- * (per-CPU mode).
+ * process (mm_cid) or the IPC namespace of a task (ns_cid), see
+ * Documentation/scheduler/sched-max-concurrency.rst. A domain hands out
+ * IDs below its bound to the tasks of its users that run at the same
+ * time, either owned by the task for its lifetime (per-task mode, few
+ * users) or owned by the CPU while a user runs on it (per-CPU mode).
  */
 static __always_inline bool cid_on_cpu(unsigned int cid)
 {
@@ -52,7 +53,7 @@ static __always_inline bool cid_on_task(unsigned int cid)
 	return cid < MM_CID_TRANSIT;
 }
 
-/* The mm a domain is embedded in. */
+/* The mm a domain of the mm kind is embedded in. */
 static inline struct mm_struct *cid_domain_mm(struct cid_domain *dom)
 {
 	return container_of(dom, struct mm_struct, mm_cid);
@@ -61,19 +62,23 @@ static inline struct mm_struct *cid_domain_mm(struct cid_domain *dom)
 /* The per-task user state of @t in @dom. */
 static __always_inline struct cid_user *cid_task_user(struct cid_domain *dom, struct task_struct *t)
 {
-	return &t->mm_cid;
+	return dom->kind == CID_DOMAIN_MM ? &t->mm_cid : &t->ns_cid;
 }
 
 /* The task a user state belongs to. */
 static inline struct task_struct *cid_user_task(struct cid_domain *dom, struct cid_user *u)
 {
-	return container_of(u, struct task_struct, mm_cid);
+	if (dom->kind == CID_DOMAIN_MM)
+		return container_of(u, struct task_struct, mm_cid);
+	return container_of(u, struct task_struct, ns_cid);
 }
 
 /* Is @t an active user of @dom? */
 static __always_inline bool cid_task_in_domain(struct task_struct *t, struct cid_domain *dom)
 {
-	return t->mm == cid_domain_mm(dom) && t->mm_cid.active;
+	if (dom->kind == CID_DOMAIN_MM)
+		return t->mm == cid_domain_mm(dom) && t->mm_cid.active;
+	return t->ns_dom == dom && t->ns_cid.active;
 }
 
 static __always_inline void cid_drop(struct cid_domain *dom, unsigned int cid)
@@ -342,7 +347,7 @@ static __always_inline void __cid_schedout(struct cid_domain *dom, struct task_s
 
 static __always_inline void mm_cid_schedin(struct task_struct *next)
 {
-	if (!next->mm_cid.active)
+	if (!next->mm_cid.active || conc_task_unplaced(next))
 		return;
 	__cid_schedin(&next->mm->mm_cid, next, &next->mm_cid);
 }
@@ -356,10 +361,32 @@ static __always_inline void mm_cid_schedout(struct task_struct *prev)
 	conc_debug_cid_kept(&prev->mm->mm_cid, prev);
 }
 
+/* The namespace domain, only for tasks whose domain is bounded (ns_dom set). */
+static __always_inline void ns_cid_schedin(struct task_struct *next)
+{
+	struct cid_domain *dom = READ_ONCE(next->ns_dom);
+
+	if (likely(!dom) || !next->ns_cid.active || conc_task_unplaced(next))
+		return;
+	__cid_schedin(dom, next, &next->ns_cid);
+}
+
+static __always_inline void ns_cid_schedout(struct task_struct *prev)
+{
+	struct cid_domain *dom = READ_ONCE(prev->ns_dom);
+
+	if (likely(!dom) || prev->ns_cid.cid == MM_CID_UNSET)
+		return;
+	__cid_schedout(dom, prev, &prev->ns_cid);
+	conc_debug_cid_kept(dom, prev);
+}
+
 static inline void mm_cid_switch_to(struct task_struct *prev, struct task_struct *next)
 {
 	mm_cid_schedout(prev);
+	ns_cid_schedout(prev);
 	mm_cid_schedin(next);
+	ns_cid_schedin(next);
 }
 
 /* Called from outside cid.c. */
@@ -367,7 +394,7 @@ void __init cid_init_cpus(void);
 void cid_update_cpus_allowed(struct cid_domain *dom, const struct cpumask *affmsk);
 void mm_update_cpus_allowed(struct mm_struct *mm, const struct cpumask *affmsk);
 
-void sched_mm_cid_fork(struct task_struct *t);
+void sched_cid_fork(struct task_struct *t);
 void cid_apply_bound(struct cid_domain *dom);
 
 #else /* !CONFIG_SCHED_MM_CID */
@@ -376,7 +403,7 @@ static inline void mm_cid_switch_to(struct task_struct *prev, struct task_struct
 static inline void cid_update_cpus_allowed(struct cid_domain *dom, const struct cpumask *affmsk) { }
 static inline void mm_update_cpus_allowed(struct mm_struct *mm, const struct cpumask *affmsk) { }
 
-static inline void sched_mm_cid_fork(struct task_struct *t) { }
+static inline void sched_cid_fork(struct task_struct *t) { }
 #endif /* !CONFIG_SCHED_MM_CID */
 
 #endif /* _KERNEL_SCHED_CID_H */

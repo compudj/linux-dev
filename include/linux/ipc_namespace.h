@@ -14,6 +14,7 @@
 #include <linux/percpu_counter.h>
 
 struct user_namespace;
+struct ns_cid;
 
 struct ipc_ids {
 	int in_use;
@@ -76,6 +77,9 @@ struct ipc_namespace {
 	struct ucounts *ucounts;
 
 	struct llist_node mnt_llist;
+
+	/* Concurrency IDs, when created with CLONE_IPC_CID */
+	struct ns_cid *cid;
 
 	struct ns_common ns;
 } __randomize_layout;
