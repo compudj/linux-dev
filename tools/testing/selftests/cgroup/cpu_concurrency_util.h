@@ -14,6 +14,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/prctl.h>
 #include <sys/rseq.h>
@@ -53,6 +54,8 @@ struct spinner {
 	int nap_us;		/* sleep that long after every sample */
 	int first_nap_us;	/* and that long before the first one */
 	unsigned long samples;	/* how many samples it took so far */
+	int avoid;		/* if set, count the samples on CPU avoid - 1 */
+	unsigned long avoid_hits;
 };
 
 struct spin_param {
@@ -94,10 +97,15 @@ int count_cpus_seen(struct spinner *s, int n);
 int spinner_only_on(const struct spinner *s, int cpu);
 long long max_mm_cid_seen(struct spinner *s, int n);
 int spin_and_check(const char *cgroup, void *arg);
+int write_cpu_online(int cpu, int online);
 void cpus_record_online(void);
 int cpus_restore(void);
 void kernel_state_record(struct kernel_state *ks);
 int conc_stat_read(const char *cg, struct conc_stat *st);
+void conc_trace_start(void);
+void conc_trace_stop(void);
+void conc_trace_clear(void);
+int conc_trace_find(const char *text, const char *text2);
 int kernel_state_check(struct kernel_state *ks, const char *name);
 
 #endif /* CPU_CONCURRENCY_UTIL_H */

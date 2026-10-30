@@ -119,6 +119,8 @@ void *spin(void *arg)
 
 		if (cpu >= 0 && cpu < CPU_SETSIZE)
 			s->cpus_seen[cpu / 64] |= 1UL << (cpu % 64);
+		if (cpu + 1 == __atomic_load_n(&s->avoid, __ATOMIC_RELAXED))
+			__atomic_fetch_add(&s->avoid_hits, 1, __ATOMIC_RELAXED);
 		__atomic_fetch_add(&s->samples, 1, __ATOMIC_RELAXED);
 		if (has_cid) {
 			/* Unsigned: an ID left unset reads 0x80000000. */
@@ -252,6 +254,19 @@ int spin_and_check(const char *cgroup, void *arg)
 		return 3;
 	}
 	return 0;
+}
+
+/*
+ * Set CPU @cpu online or offline through sysfs. Return 0, or -1 when the
+ * write fails.
+ */
+int write_cpu_online(int cpu, int online)
+{
+	char path[PATH_MAX];
+	char buf[2] = { online ? '1' : '0', '\n' };
+
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/online", cpu);
+	return write_text(path, buf, 2) == 2 ? 0 : -1;
 }
 
 /*
@@ -471,3 +486,92 @@ int conc_stat_read(const char *cg, struct conc_stat *st)
 	return found == (1U << ARRAY_SIZE(keys)) - 1 ? 0 : -1;
 }
 
+/*
+ * The directory of tracefs while the events of the limit are enabled, or
+ * an empty string. See conc_trace_start().
+ */
+static char conc_trace_dir[64];
+
+static int conc_trace_write(const char *file, int flags, const char *val)
+{
+	char path[128];
+	ssize_t n;
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/%s", conc_trace_dir, file);
+	fd = open(path, O_WRONLY | flags);
+	if (fd < 0)
+		return -1;
+	n = write(fd, val, strlen(val));
+	close(fd);
+	return n == (ssize_t)strlen(val) ? 0 : -1;
+}
+
+/*
+ * Enable the events sched_conc_refuse and sched_conc_rotate. Mount tracefs
+ * at /sys/kernel/tracing if it is not mounted. Without tracefs or without
+ * the events, print a note: conc_trace_find() then checks nothing.
+ */
+void conc_trace_start(void)
+{
+	static const char * const dirs[] = { "/sys/kernel/tracing", "/sys/kernel/debug/tracing" };
+	int i;
+
+	mount("tracefs", dirs[0], "tracefs", 0, NULL);
+	for (i = 0; i < 2; i++) {
+		snprintf(conc_trace_dir, sizeof(conc_trace_dir), "%s", dirs[i]);
+		if (!conc_trace_write("events/sched/sched_conc_refuse/enable", 0, "1") &&
+		    !conc_trace_write("events/sched/sched_conc_rotate/enable", 0, "1") &&
+		    !conc_trace_write("tracing_on", 0, "1"))
+			return;
+	}
+	conc_trace_dir[0] = 0;
+	ksft_print_msg("no tracefs: the events of the limit are not checked\n");
+}
+
+void conc_trace_stop(void)
+{
+	if (!conc_trace_dir[0])
+		return;
+	conc_trace_write("events/sched/sched_conc_refuse/enable", 0, "0");
+	conc_trace_write("events/sched/sched_conc_rotate/enable", 0, "0");
+	conc_trace_dir[0] = 0;
+}
+
+/* Empty the trace buffer. */
+void conc_trace_clear(void)
+{
+	if (conc_trace_dir[0])
+		conc_trace_write("trace", O_TRUNC, "\n");
+}
+
+/*
+ * Return 0 if a line of the trace buffer holds @text and @text2, or if the
+ * events are not enabled. Else print the buffer and return -1.
+ */
+int conc_trace_find(const char *text, const char *text2)
+{
+	char path[128], line[512];
+	int found = 0;
+	FILE *f;
+
+	if (!conc_trace_dir[0])
+		return 0;
+	snprintf(path, sizeof(path), "%s/trace", conc_trace_dir);
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+	while (!found && fgets(line, sizeof(line), f))
+		found = strstr(line, text) && strstr(line, text2);
+	if (!found) {
+		fprintf(stderr, "no event with \"%s\" and \"%s\". The trace buffer:\n", text,
+			text2);
+		rewind(f);
+		while (fgets(line, sizeof(line), f)) {
+			if (line[0] != '#')
+				fprintf(stderr, "  %s", line);
+		}
+	}
+	fclose(f);
+	return found ? 0 : -1;
+}

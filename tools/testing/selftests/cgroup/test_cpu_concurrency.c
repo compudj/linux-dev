@@ -634,6 +634,127 @@ cleanup:
 }
 
 /*
+ * test_concurrency_hotplug() runs this in a cgroup limited to 1. Four
+ * spinners start. One has the mask "all but CPU 0", since CPU 0 cannot
+ * go offline. A CPU which the spinners use goes offline for 300 ms and
+ * comes back. The cgroup must move to another CPU as a whole. The
+ * effective value must stay 1 and no spinner may read an mm_cid above 0.
+ * While the CPU is offline, each spinner must take samples, and none on
+ * that CPU. One such sample is allowed for each spinner: it may have read
+ * its CPU just before the unplug moved it.
+ * Skipped when the CPU cannot go offline through sysfs.
+ */
+
+static int hotplug_under_load(const char *cgroup, void *arg)
+{
+	struct spinner s[4] = { };
+	unsigned long before[4];
+	cpu_set_t not0;
+	int i, cpu = -1, ret = 0;
+
+	for (i = 0; i < 4; i++) {
+		clock_gettime(CLOCK_MONOTONIC, &s[i].until);
+		s[i].until.tv_sec += 2;
+		s[i].max_mm_cid = -1;
+		if (pthread_create(&s[i].thread, NULL, spin, &s[i]))
+			return 1;
+	}
+	/*
+	 * CPU 0 cannot go offline. Give one spinner a mask without it, so
+	 * that the cgroup does not stay on CPU 0.
+	 */
+	stress_all_cpus(&not0);
+	CPU_CLR(0, &not0);
+	pthread_setaffinity_np(s[0].thread, sizeof(not0), &not0);
+	usleep(100000);
+	for (i = 0; i < 4; i++)
+		memset(s[i].cpus_seen, 0, sizeof(s[i].cpus_seen));
+	usleep(200000);
+
+	/* A CPU the spinners use, other than CPU 0. */
+	for (i = 1; i < get_nprocs() && cpu < 0; i++) {
+		int j;
+
+		for (j = 0; j < 4; j++) {
+			if (s[j].cpus_seen[i / 64] & (1UL << (i % 64))) {
+				cpu = i;
+				break;
+			}
+		}
+	}
+	if (cpu < 0) {
+		ret = 2;
+		goto join;
+	}
+	if (write_cpu_online(cpu, 0)) {
+		ret = skip("CPU %d cannot go offline", cpu);
+		goto join;
+	}
+	for (i = 0; i < 4; i++) {
+		before[i] = __atomic_load_n(&s[i].samples, __ATOMIC_RELAXED);
+		__atomic_store_n(&s[i].avoid, cpu + 1, __ATOMIC_RELAXED);
+	}
+	usleep(300000);
+	if (cg_read_strcmp(cgroup, "cpu.concurrency.effective", "1 max\n")) {
+		fprintf(stderr, "effective limit changed across hotplug\n");
+		ret = 3;
+	}
+	for (i = 0; i < 4 && !ret; i++) {
+		unsigned long hits = __atomic_load_n(&s[i].avoid_hits, __ATOMIC_RELAXED);
+
+		if (__atomic_load_n(&s[i].samples, __ATOMIC_RELAXED) == before[i]) {
+			fprintf(stderr, "spinner %d did not run with CPU %d offline\n", i, cpu);
+			ret = 6;
+		} else if (hits > 1) {
+			fprintf(stderr, "spinner %d took %lu samples on CPU %d, which is offline\n",
+				i, hits, cpu);
+			ret = 7;
+		}
+		__atomic_store_n(&s[i].avoid, 0, __ATOMIC_RELAXED);
+	}
+	write_cpu_online(cpu, 1);
+join:
+	for (i = 0; i < 4; i++)
+		pthread_join(s[i].thread, NULL);
+	if (ret)
+		return ret;
+	if (rseq_has_mm_cid() && max_mm_cid_seen(s, 4) >= 1) {
+		fprintf(stderr, "mm_cid %lld seen across hotplug, limit 1\n",
+			max_mm_cid_seen(s, 4));
+		/* 4 is KSFT_SKIP: the caller would report a skip. */
+		return 5;
+	}
+	return 0;
+}
+
+static int test_concurrency_hotplug(const char *root)
+{
+	int ret = KSFT_FAIL, r;
+	char *cg;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+
+	cg = cg_name(root, "cc_test_hotplug");
+	if (!cg)
+		goto cleanup;
+	if (cg_create(cg))
+		goto cleanup;
+	if (cg_write(cg, "cpu.concurrency.max", "1"))
+		goto cleanup;
+
+	r = cg_run(cg, hotplug_under_load, NULL);
+	if (r == KSFT_SKIP)
+		ret = KSFT_SKIP;
+	else if (!r)
+		ret = KSFT_PASS;
+cleanup:
+	cg_destroy(cg);
+	free(cg);
+	return ret;
+}
+
+/*
  * test_concurrency_sleepers() runs this in a cgroup limited to 2. Start
  * two sleepers. While they sleep, pin each to one of the last two CPUs.
  * Then start three spinners, which can run on every CPU. The sleepers
@@ -751,6 +872,142 @@ cleanup:
 }
 
 /*
+ * A sleeper confined by its cpuset, with spinners confined to the other
+ * CPUs. Nothing here calls sched_setaffinity(2).
+ *
+ * Cgroups: the parent, with cpu.concurrency.max 2, and its threaded
+ * children a and b. The cpuset of a is the last CPU. The cpuset of b is
+ * every other CPU. One process has four threads, which run for 1 s:
+ *  - the sleeper stays in a. It sleeps 1 ms after each sample;
+ *  - three spinners move to b.
+ * Two slots serve them: one on the last CPU for the sleeper, and one for
+ * the spinners.
+ *
+ * Checked at the end:
+ *  - no thread read an mm_cid of 2 or more;
+ *  - the effective value of the parent still reads 2;
+ *  - the sleeper ran on the last CPU alone, and took SLEEPER_SAMPLES
+ *    samples at least, see sleepers_and_spinners();
+ *  - nr_rotations of the parent is still 0.
+ */
+struct cpuset_class_param {
+	char *b;
+};
+
+static int cpuset_sleeper(const char *cgroup, void *arg)
+{
+	struct cpuset_class_param *p = arg;
+	struct spinner s[4] = { };
+	struct timespec until;
+	char buf[32];
+	long long max;
+	int i;
+
+	clock_gettime(CLOCK_MONOTONIC, &until);
+	until.tv_sec += 1;
+	/* The sleeper stays here, in the one-CPU cpuset. */
+	s[0].until = until;
+	s[0].max_mm_cid = -1;
+	s[0].nap_us = 1000;
+	if (pthread_create(&s[0].thread, NULL, spin, &s[0]))
+		return 1;
+	while (!__atomic_load_n(&s[0].tid, __ATOMIC_ACQUIRE))
+		usleep(1000);
+	/* The spinners go to the sibling, with the other CPUs. */
+	for (i = 1; i < 4; i++) {
+		s[i].until = until;
+		s[i].max_mm_cid = -1;
+		if (pthread_create(&s[i].thread, NULL, spin, &s[i]))
+			return 1;
+		while (!__atomic_load_n(&s[i].tid, __ATOMIC_ACQUIRE))
+			usleep(1000);
+		snprintf(buf, sizeof(buf), "%d", (int)s[i].tid);
+		if (cg_write(p->b, "cgroup.threads", buf)) {
+			fprintf(stderr, "moving a spinner to the sibling failed\n");
+			return 2;
+		}
+	}
+	for (i = 0; i < 4; i++)
+		pthread_join(s[i].thread, NULL);
+
+	max = max_mm_cid_seen(s, 4);
+	if (rseq_has_mm_cid() && max >= 2) {
+		fprintf(stderr, "mm_cid %lld seen, limit 2\n", max);
+		return 4;
+	}
+	if (s[0].samples < SLEEPER_SAMPLES || !spinner_only_on(&s[0], get_nprocs() - 1)) {
+		fprintf(stderr, "the sleeper took %lu samples, on the last CPU only: %s\n",
+			s[0].samples, spinner_only_on(&s[0], get_nprocs() - 1) ? "yes" : "no");
+		return 5;
+	}
+	return 0;
+}
+
+static int test_concurrency_cpuset_class(const char *root)
+{
+	struct cpuset_class_param param = { };
+	char *parent = NULL, *a = NULL;
+	struct conc_stat st = { };
+	char buf[64];
+	int ret = KSFT_FAIL, n = get_nprocs();
+
+	if (need_cpus(4))
+		return KSFT_SKIP;
+
+	parent = cg_name(root, "cc_test_cpuset_class");
+	if (!parent)
+		goto cleanup;
+	a = cg_name(parent, "a");
+	param.b = cg_name(parent, "b");
+	if (!a || !param.b)
+		goto cleanup;
+	if (cg_create(parent))
+		goto cleanup;
+	if (cg_write(parent, "cgroup.subtree_control", "+cpu +cpuset"))
+		goto cleanup;
+	if (cg_create(a) || cg_create(param.b))
+		goto cleanup;
+	if (cg_write(a, "cgroup.type", "threaded") ||
+	    cg_write(param.b, "cgroup.type", "threaded")) {
+		ret = skip("no threaded cgroups");
+		goto cleanup;
+	}
+	snprintf(buf, sizeof(buf), "%d", n - 1);
+	if (cg_write(a, "cpuset.cpus", buf))
+		goto cleanup;
+	snprintf(buf, sizeof(buf), "0-%d", n - 2);
+	if (cg_write(param.b, "cpuset.cpus", buf))
+		goto cleanup;
+	if (cg_write(parent, "cpu.concurrency.max", "2"))
+		goto cleanup;
+
+	if (cg_run(a, cpuset_sleeper, &param))
+		goto cleanup;
+	if (cg_read_strcmp(parent, "cpu.concurrency.effective", "2 max\n")) {
+		fprintf(stderr, "effective limit left 2\n");
+		goto cleanup;
+	}
+	if (conc_stat_read(parent, &st) || st.nr_rotations) {
+		fprintf(stderr, "nr_rotations is %lld, the threads fit in two slots\n",
+			st.nr_rotations);
+		goto cleanup;
+	}
+
+	ret = KSFT_PASS;
+cleanup:
+	if (a)
+		cg_destroy(a);
+	if (param.b)
+		cg_destroy(param.b);
+	if (parent)
+		cg_destroy(parent);
+	free(a);
+	free(param.b);
+	free(parent);
+	return ret;
+}
+
+/*
  * The ceiling. The steps of test_concurrency_hard(), in order:
  *  - the root has cpu.concurrency.child_ceiling;
  *  - child, later, one and two are created while the parent's
@@ -863,11 +1120,665 @@ cleanup:
 	return ret;
 }
 
+/*
+ * test_concurrency_dormant() runs dormant_run() in a cgroup limited to
+ * 1. A thread pins itself to the last CPU, runs there for 50 ms, then
+ * sleeps on a pipe. Two unpinned workers spin and nap. The last CPU goes
+ * offline for a second and comes back. Then the sleeper is woken.
+ *  - The unplug must not widen the mask of the sleeper. A sleeping task
+ *    keeps its affinity, as it does without a limit.
+ *    select_fallback_rq() widens it only if the task wakes up while the
+ *    CPU is away.
+ *  - The workers must not be held while the CPU is offline. No CPU can
+ *    serve the mask of the sleeper then.
+ *  - Once the CPU is back, the sleeper must run within 3 s of its
+ *    wakeup, with its mask of one CPU. The workers must still run.
+ * Skipped when the CPU cannot go offline through sysfs.
+ */
+struct dormant_sleeper {
+	int cpu;
+	int pipefd[2];
+	int ran_on;		/* where it ran after its wakeup, -1 before */
+	cpu_set_t after;	/* its mask then */
+};
+
+struct dormant_worker {
+	pthread_t thread;
+	volatile unsigned long rounds;
+	volatile int stop;
+};
+
+static void *dormant_sleeper_fn(void *arg)
+{
+	struct dormant_sleeper *d = arg;
+	cpu_set_t set;
+	char c;
+
+	CPU_ZERO(&set);
+	CPU_SET(d->cpu, &set);
+	if (sched_setaffinity(0, sizeof(set), &set))
+		return NULL;
+	/* Run there for a moment, then sleep until told. */
+	spin_ns(50000000);
+	if (read(d->pipefd[0], &c, 1) != 1)
+		return NULL;
+	sched_getaffinity(0, sizeof(d->after), &d->after);
+	__atomic_store_n(&d->ran_on, sched_getcpu(), __ATOMIC_RELEASE);
+	return NULL;
+}
+
+static void *dormant_worker_fn(void *arg)
+{
+	struct dormant_worker *w = arg;
+
+	while (!w->stop) {
+		spin_ns(3000000);
+		usleep(500);
+		w->rounds++;
+	}
+	return NULL;
+}
+
+/* Return true if both workers completed a round within @ms. */
+static int dormant_workers_run(struct dormant_worker *w, int ms)
+{
+	unsigned long r0 = w[0].rounds, r1 = w[1].rounds;
+
+	usleep(ms * 1000);
+	return w[0].rounds != r0 && w[1].rounds != r1;
+}
+
+/* Exit codes other than the KSFT ones (KSFT_SKIP is 4). */
+static int dormant_run(const char *cgroup, void *arg)
+{
+	struct dormant_sleeper d = { .cpu = get_nprocs() - 1, .ran_on = -1 };
+	struct dormant_worker w[2] = { };
+	pthread_t sleeper;
+	int i, ret = 0;
+
+	if (pipe(d.pipefd) || pthread_create(&sleeper, NULL, dormant_sleeper_fn, &d))
+		return 1;
+	usleep(100000);
+	for (i = 0; i < 2; i++)
+		if (pthread_create(&w[i].thread, NULL, dormant_worker_fn, &w[i]))
+			return 1;
+	usleep(300000);
+	if (write_cpu_online(d.cpu, 0)) {
+		ret = skip("CPU %d cannot go offline", d.cpu);
+		goto wake;
+	}
+	if (!dormant_workers_run(w, 1000)) {
+		fprintf(stderr, "workers held while cpu%d is offline\n", d.cpu);
+		ret = 2;
+	}
+	write_cpu_online(d.cpu, 1);
+	usleep(200000);
+wake:
+	if (write(d.pipefd[1], "x", 1) != 1)
+		return 1;
+	for (i = 0; i < 300 && __atomic_load_n(&d.ran_on, __ATOMIC_ACQUIRE) < 0; i++)
+		usleep(10000);
+	if (ret == KSFT_SKIP)
+		goto out;
+	if (d.ran_on < 0) {
+		fprintf(stderr, "sleeper did not run within 3 s of its wakeup\n");
+		ret = 3;
+		goto out;
+	}
+	if (CPU_COUNT(&d.after) != 1 || !CPU_ISSET(d.cpu, &d.after)) {
+		fprintf(stderr, "sleeper pinned to cpu%d woke with %d CPUs in its mask\n",
+			d.cpu, CPU_COUNT(&d.after));
+		ret = 6;
+	}
+	if (!dormant_workers_run(w, 300)) {
+		fprintf(stderr, "workers held after cpu%d came back\n", d.cpu);
+		ret = 5;
+	}
+out:
+	for (i = 0; i < 2; i++) {
+		w[i].stop = 1;
+		pthread_join(w[i].thread, NULL);
+	}
+	if (d.ran_on >= 0)
+		pthread_join(sleeper, NULL);
+	return ret;
+}
+
+static int test_concurrency_dormant(const char *root)
+{
+	int ret = KSFT_FAIL, r;
+	char *cg;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	cg = cg_name(root, "cc_test_dormant");
+	if (!cg)
+		goto cleanup;
+	if (cg_create(cg))
+		goto cleanup;
+	if (cg_write(cg, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	r = cg_run(cg, dormant_run, NULL);
+	if (r == KSFT_SKIP)
+		ret = KSFT_SKIP;
+	else if (!r)
+		ret = KSFT_PASS;
+cleanup:
+	cg_destroy(cg);
+	free(cg);
+	return ret;
+}
+
+#ifndef SCHED_DEADLINE
+#define SCHED_DEADLINE	6
+#endif /* !SCHED_DEADLINE */
+
+static int set_deadline(pid_t pid, __u64 runtime_us, __u64 period_us)
+{
+	struct sched_attr attr = {
+		.size = sizeof(attr),
+		.sched_policy = SCHED_DEADLINE,
+		.sched_runtime = runtime_us * 1000,
+		.sched_deadline = period_us * 1000,
+		.sched_period = period_us * 1000,
+	};
+
+	return syscall(__NR_sched_setattr, pid, &attr, 0) ? -errno : 0;
+}
+
 static int busy_forever(const char *cgroup, void *arg)
 {
 	for (;;)
 		;
 	return 0;
+}
+
+static int deadline_task(const char *cgroup, void *arg)
+{
+	unsigned long *ran = arg;
+
+	if (set_deadline(0, 2000, 10000))
+		return skip("SCHED_DEADLINE admission refused");
+	for (;;) {
+		spin_ns(1000000);
+		__atomic_fetch_add(ran, 1, __ATOMIC_RELAXED);
+		usleep(3000);
+	}
+	return 0;
+}
+
+#define RT_RUNTIME	"/proc/sys/kernel/sched_rt_runtime_us"
+
+/*
+ * Read sched_rt_runtime_us as text into @buf. read_sysctl() returns -1 on
+ * error, and -1 is also the value for "admission off".
+ */
+static int rt_runtime_read(char *buf, size_t len)
+{
+	int fd = open(RT_RUNTIME, O_RDONLY);
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, len - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = 0;
+	return 0;
+}
+
+static int rt_runtime_write(const char *val)
+{
+	int fd = open(RT_RUNTIME, O_WRONLY);
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = write(fd, val, strlen(val));
+	close(fd);
+	return n == (ssize_t)strlen(val) ? 0 : -1;
+}
+
+static const char *refusal(int err)
+{
+	return err ? strerror(-err) : "accepted";
+}
+
+/*
+ * Check the sched_conc_refuse event of a refusal. It must name the judged
+ * task @pid, the operation @op, the reason @why and the error @err.
+ * Return 0 if the trace buffer has it, or if the events cannot be used.
+ */
+static int refusal_traced(pid_t pid, const char *op, const char *why, int err)
+{
+	char text[256];
+
+	snprintf(text, sizeof(text), "pid=%d op=%s why=%s err=%d", (int)pid, op, why, err);
+	return conc_trace_find(text, "sched_conc_refuse:");
+}
+
+/*
+ * No SCHED_DEADLINE task is allowed in a limited subtree. The deadline
+ * class admits bandwidth against every CPU of the root domain. A limit
+ * leaves a task fewer CPUs, as an affinity narrower than the root domain
+ * would.
+ * lim has the limit 1 and x spins in it. free has the child sub. d is a
+ * SCHED_DEADLINE task in sub.
+ *  - x cannot become SCHED_DEADLINE (EPERM).
+ *  - d cannot move into lim (EBUSY).
+ *  - A limit of 1 cannot be written to free (EBUSY). Its
+ *    cpu.concurrency.max still reads "max".
+ *  - Once d has left SCHED_DEADLINE, the limit and the move are
+ *    accepted.
+ * Each refusal must show in the sched_conc_refuse event with its task,
+ * its operation, its reason and its error. This is checked when tracefs
+ * can be used.
+ * Skipped with deadline admission off, where nothing is refused, and
+ * without the privilege or the bandwidth for SCHED_DEADLINE.
+ */
+static int test_concurrency_deadline(const char *root)
+{
+	struct sched_param other = { .sched_priority = 0 };
+	char *lim = NULL, *free_cg = NULL, *sub = NULL, rt[32];
+	int ret = KSFT_FAIL, status, err;
+	unsigned long ran = 0;
+	pid_t x = -1, d = -1;
+
+	if (rt_runtime_read(rt, sizeof(rt)))
+		return skip("no %s", RT_RUNTIME);
+	if (atol(rt) < 0)
+		return skip("deadline admission control is off");
+	lim = cg_name(root, "cc_test_dl_lim");
+	free_cg = cg_name(root, "cc_test_dl_free");
+	sub = free_cg ? cg_name(free_cg, "sub") : NULL;
+	if (!lim || !free_cg || !sub || cg_create(lim) || cg_create(free_cg) ||
+	    cg_write(free_cg, "cgroup.subtree_control", "+cpu") || cg_create(sub))
+		goto cleanup;
+	if (cg_write(lim, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	x = cg_run_nowait(lim, busy_forever, NULL);
+	d = cg_run_nowait(sub, deadline_task, &ran);
+	if (x < 0 || d < 0)
+		goto cleanup;
+	usleep(200000);
+	if (waitpid(d, &status, WNOHANG) == d) {
+		d = -1;
+		if (WIFEXITED(status) && WEXITSTATUS(status) == KSFT_SKIP)
+			ret = KSFT_SKIP;
+		goto cleanup;
+	}
+
+	conc_trace_start();
+	conc_trace_clear();
+	err = set_deadline(x, 2000, 10000);
+	if (err != -EPERM) {
+		fprintf(stderr, "a task under a limit made SCHED_DEADLINE: %s, not EPERM\n",
+			refusal(err));
+		goto cleanup;
+	}
+	if (refusal_traced(x, "sched_setattr", "SCHED_DEADLINE under a limit", -EPERM))
+		goto cleanup;
+	err = cg_enter(lim, d);
+	if (err != -EBUSY) {
+		fprintf(stderr, "a SCHED_DEADLINE task moved under a limit: %s, not EBUSY\n",
+			refusal(err));
+		goto cleanup;
+	}
+	if (refusal_traced(d, "cgroup migration", "a SCHED_DEADLINE task", -EBUSY))
+		goto cleanup;
+	err = cg_write(free_cg, "cpu.concurrency.max", "1");
+	if (err != -EBUSY) {
+		fprintf(stderr, "a limit started over a SCHED_DEADLINE task: %s, not EBUSY\n",
+			refusal(err));
+		goto cleanup;
+	}
+	if (refusal_traced(d, "cpu.concurrency.max", "a SCHED_DEADLINE task", -EBUSY))
+		goto cleanup;
+	if (cg_read_strcmp(free_cg, "cpu.concurrency.max", "max\n")) {
+		fprintf(stderr, "the refused limit over a SCHED_DEADLINE task was set\n");
+		goto cleanup;
+	}
+
+	/* Out of SCHED_DEADLINE, it may be limited and move. */
+	if (sched_setscheduler(d, SCHED_OTHER, &other))
+		goto cleanup;
+	if (cg_write(free_cg, "cpu.concurrency.max", "1")) {
+		fprintf(stderr, "a limit over a task out of SCHED_DEADLINE refused\n");
+		goto cleanup;
+	}
+	if (cg_enter(lim, d)) {
+		fprintf(stderr, "a task out of SCHED_DEADLINE refused under a limit\n");
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	conc_trace_stop();
+	if (d > 0) {
+		kill(d, SIGKILL);
+		sched_setscheduler(d, SCHED_OTHER, &other);
+		waitpid(d, NULL, 0);
+	}
+	if (x > 0) {
+		/* Made SCHED_DEADLINE where the refusal is missing. */
+		kill(x, SIGKILL);
+		sched_setscheduler(x, SCHED_OTHER, &other);
+		waitpid(x, NULL, 0);
+	}
+	if (sub)
+		cg_destroy(sub);
+	if (free_cg)
+		cg_destroy(free_cg);
+	if (lim)
+		cg_destroy(lim);
+	free(sub);
+	free(free_cg);
+	free(lim);
+	return ret;
+}
+
+/*
+ * test_concurrency_deadline_unadmitted() runs this with deadline
+ * admission off. full has the limit 1, and a task spins on its one CPU.
+ * dl is a SCHED_DEADLINE task in src. 60 times, dl is moved into full,
+ * then back to src. In full it arrives on another CPU and finds no slot.
+ * It is held at its return to user space, then placed on full's CPU.
+ * Every third round its policy is set to SCHED_OTHER and back while it
+ * is in full.
+ * The deadline class keeps bandwidth per runqueue. It warns when the
+ * bandwidth does not follow such a move. The kernel must not warn, and dl
+ * must still run at the end. This needs "sched/deadline: Do
+ * not lose a throttled task switched out and back". Without it, a task
+ * which is throttled when its policy is switched away is never
+ * replenished if it is switched back before its 0-lag time.
+ * main() fails the case when the kernel warns while it runs.
+ * Skipped without the privilege for SCHED_DEADLINE.
+ */
+static int deadline_moves(const char *root)
+{
+	struct sched_param other = { .sched_priority = 0 };
+	char *full = NULL, *src = NULL;
+	int ret = KSFT_FAIL, i, status, err;
+	unsigned long *ran, seen;
+	pid_t busy = -1, dl = -1;
+
+	if (need_cpus(2))
+		return KSFT_SKIP;
+	ran = mmap(NULL, sizeof(*ran), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (ran == MAP_FAILED)
+		return KSFT_FAIL;
+	full = cg_name(root, "cc_test_dl_full");
+	src = cg_name(root, "cc_test_dl_src");
+	if (!full || !src || cg_create(full) || cg_create(src))
+		goto cleanup;
+	if (cg_write(full, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	busy = cg_run_nowait(full, busy_forever, NULL);
+	dl = cg_run_nowait(src, deadline_task, ran);
+	if (busy < 0 || dl < 0)
+		goto cleanup;
+	usleep(200000);
+	if (waitpid(dl, &status, WNOHANG) == dl) {
+		dl = -1;
+		if (WIFEXITED(status) && WEXITSTATUS(status) == KSFT_SKIP)
+			ret = KSFT_SKIP;
+		goto cleanup;
+	}
+	for (i = 0; i < 60; i++) {
+		if (cg_enter(full, dl))
+			goto cleanup;
+		if (i % 3 == 1) {
+			sched_setscheduler(dl, SCHED_OTHER, &other);
+			err = set_deadline(dl, 2000, 10000);
+			if (err) {
+				fprintf(stderr, "switch back to SCHED_DEADLINE refused: %s\n",
+					strerror(-err));
+				goto cleanup;
+			}
+		}
+		usleep(30000 + (i % 7) * 10000);
+		if (cg_enter(src, dl))
+			goto cleanup;
+		usleep(20000 + (i % 5) * 10000);
+	}
+	/* It runs 1ms every 4ms, throttled 10ms at most: give it a second. */
+	seen = __atomic_load_n(ran, __ATOMIC_RELAXED);
+	for (i = 0; i < 100 && __atomic_load_n(ran, __ATOMIC_RELAXED) == seen; i++)
+		usleep(10000);
+	if (__atomic_load_n(ran, __ATOMIC_RELAXED) == seen) {
+		fprintf(stderr, "the deadline task never ran again after its policy switches\n");
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (dl > 0) {
+		kill(dl, SIGKILL);
+		/*
+		 * Set to SCHED_OTHER, a task left throttled is requeued and
+		 * can die.
+		 */
+		sched_setscheduler(dl, SCHED_OTHER, &other);
+		waitpid(dl, NULL, 0);
+	}
+	if (busy > 0) {
+		kill(busy, SIGKILL);
+		waitpid(busy, NULL, 0);
+	}
+	if (full)
+		cg_destroy(full);
+	if (src)
+		cg_destroy(src);
+	free(full);
+	free(src);
+	munmap(ran, sizeof(*ran));
+	return ret;
+}
+
+static int test_concurrency_deadline_unadmitted(const char *root)
+{
+	char saved[32];
+	int ret;
+
+	if (rt_runtime_read(saved, sizeof(saved)))
+		return skip("no %s", RT_RUNTIME);
+	if (rt_runtime_write("-1"))
+		return skip("deadline admission control cannot be turned off");
+	ret = deadline_moves(root);
+	if (rt_runtime_write(saved)) {
+		fprintf(stderr, "%s not restored to %s", RT_RUNTIME, saved);
+		ret = KSFT_FAIL;
+	}
+	return ret;
+}
+
+/*
+ * A partition root with a limit is a deadline domain. Its deadline tasks
+ * are admitted against the limit, not against its number of CPUs. Each
+ * CPU keeps the share of its fair server.
+ * P is a partition root on the last 4 CPUs, with the limit 2 and two
+ * children, a and c. Five tasks sleep in a: t0 to t3 and f. A deadline
+ * task below takes 50% of a CPU. The steps:
+ *  - t0, t1 and t2 become SCHED_DEADLINE: admitted (1.5 CPUs);
+ *  - t3 fails with EBUSY (2.0 CPUs). With the limit raised to 3 it is
+ *    admitted;
+ *  - the limit cannot go back to 2 (EBUSY);
+ *  - f is pinned to the last CPU of P: accepted;
+ *  - t0 moves to c. A limit of 1 on c fails with EBUSY;
+ *  - P cannot become a member again (EBUSY);
+ *  - t3 leaves the policy. The limit of 2 is then accepted;
+ *  - t0, t1 and t2 leave the policy. f is unpinned and pinned to the
+ *    last CPU again. t1 then becomes SCHED_DEADLINE again: admitted
+ *    beside the pinned fair task.
+ * The results hold for a fair server share from 0 to 20%. The case is
+ * skipped:
+ *  - with fewer than 6 CPUs;
+ *  - with deadline admission off;
+ *  - without a partition root;
+ *  - when P takes no deadline task before it has a limit.
+ */
+static int sleep_forever(const char *cgroup, void *arg);
+static int dl_admitted_in(const char *cg);
+
+#define DL_DOM_TASKS	4
+
+static int test_concurrency_deadline_domain(const char *root)
+{
+	struct sched_param other = { .sched_priority = 0 };
+	int ret = KSFT_FAIL, n = get_nprocs(), i, err;
+	char *P = NULL, *a = NULL, *c = NULL, rt[32], buf[32];
+	pid_t t[DL_DOM_TASKS], f = -1;
+	cpu_set_t set, all;
+
+	for (i = 0; i < DL_DOM_TASKS; i++)
+		t[i] = -1;
+	if (need_cpus(6))
+		return KSFT_SKIP;
+	if (rt_runtime_read(rt, sizeof(rt)) || atol(rt) < 0)
+		return skip("deadline admission control is off");
+	P = cg_name(root, "cc_test_dl_dom");
+	a = P ? cg_name(P, "a") : NULL;
+	c = P ? cg_name(P, "c") : NULL;
+	if (!P || !a || !c || cg_create(P))
+		goto cleanup;
+	snprintf(buf, sizeof(buf), "%d-%d", n - 4, n - 1);
+	if (cg_write(P, "cpuset.cpus", buf) || cg_write(P, "cpuset.cpus.partition", "root") ||
+	    cg_read_strcmp(P, "cpuset.cpus.partition", "root\n")) {
+		ret = skip("no partition root on CPUs %s", buf);
+		goto cleanup;
+	}
+	if (cg_write(P, "cgroup.subtree_control", "+cpuset +cpu") || cg_create(a) ||
+	    cg_create(c))
+		goto cleanup;
+	/*
+	 * Skip only when P takes no deadline task before it has a limit.
+	 * Under the limit, a refusal of the first task is a failure.
+	 */
+	err = dl_admitted_in(a);
+	if (err) {
+		ret = skip("no SCHED_DEADLINE task in a partition root without a limit: %s",
+			   strerror(-err));
+		goto cleanup;
+	}
+	if (cg_write(P, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	for (i = 0; i < DL_DOM_TASKS; i++) {
+		t[i] = cg_run_nowait(a, sleep_forever, NULL);
+		if (t[i] < 0)
+			goto cleanup;
+	}
+	f = cg_run_nowait(a, sleep_forever, NULL);
+	if (f < 0)
+		goto cleanup;
+	usleep(100000);
+
+	/* Against 2 CPUs, not 4. */
+	for (i = 0; i < 3; i++) {
+		err = set_deadline(t[i], 5000, 10000);
+		if (err) {
+			fprintf(stderr, "deadline task %d of the domain refused: %s\n",
+				i, strerror(-err));
+			goto cleanup;
+		}
+	}
+	err = set_deadline(t[3], 5000, 10000);
+	if (err != -EBUSY) {
+		fprintf(stderr, "2.0 CPUs of deadline tasks under a limit of 2: %s, not EBUSY\n",
+			refusal(err));
+		goto cleanup;
+	}
+	if (cg_write(P, "cpu.concurrency.max", "3") || set_deadline(t[3], 5000, 10000)) {
+		fprintf(stderr, "2.0 CPUs of deadline tasks refused under a limit of 3\n");
+		goto cleanup;
+	}
+	err = cg_write(P, "cpu.concurrency.max", "2");
+	if (err != -EBUSY || cg_read_strcmp(P, "cpu.concurrency.max", "3\n")) {
+		fprintf(stderr, "a limit lowered under the deadline bandwidth: %s, not EBUSY\n",
+			refusal(err));
+		goto cleanup;
+	}
+
+	/*
+	 * While P holds deadline tasks: a fair task may be pinned, no limit
+	 * starts over one of them, and P stays a partition root.
+	 */
+	CPU_ZERO(&set);
+	CPU_SET(n - 1, &set);
+	err = sched_setaffinity(f, sizeof(set), &set) ? -errno : 0;
+	if (err) {
+		fprintf(stderr, "a fair task pinned to one CPU of a deadline domain: %s\n",
+			refusal(err));
+		goto cleanup;
+	}
+	err = cg_enter(c, t[0]);
+	if (err) {
+		fprintf(stderr, "a deadline task refused within its domain: %s\n", refusal(err));
+		goto cleanup;
+	}
+	err = cg_write(c, "cpu.concurrency.max", "1");
+	if (err != -EBUSY) {
+		fprintf(stderr, "a limit over a deadline task in its domain: %s, not EBUSY\n",
+			refusal(err));
+		goto cleanup;
+	}
+	err = cg_write(P, "cpuset.cpus.partition", "member");
+	if (err != -EBUSY) {
+		fprintf(stderr, "a deadline domain made a member: %s, not EBUSY\n", refusal(err));
+		goto cleanup;
+	}
+
+	/* One leaves the policy: the limit may drop to 2 (1.5 CPUs). */
+	if (sched_setscheduler(t[3], SCHED_OTHER, &other) ||
+	    cg_write(P, "cpu.concurrency.max", "2")) {
+		fprintf(stderr, "a limit refused over 1.5 CPUs of deadline tasks\n");
+		goto cleanup;
+	}
+
+	/*
+	 * No deadline task is left. Pin f again, then admit a deadline task
+	 * beside it.
+	 */
+	for (i = 0; i < 3; i++) {
+		if (sched_setscheduler(t[i], SCHED_OTHER, &other))
+			goto cleanup;
+	}
+	usleep(50000);
+	stress_all_cpus(&all);
+	if (sched_setaffinity(f, sizeof(all), &all) || sched_setaffinity(f, sizeof(set), &set)) {
+		fprintf(stderr, "a fair task pinned with no deadline task: %s\n", strerror(errno));
+		goto cleanup;
+	}
+	err = set_deadline(t[1], 5000, 10000);
+	if (err) {
+		fprintf(stderr, "a deadline task beside a pinned fair task: %s\n", refusal(err));
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	for (i = 0; i < DL_DOM_TASKS; i++) {
+		if (t[i] > 0) {
+			kill(t[i], SIGKILL);
+			sched_setscheduler(t[i], SCHED_OTHER, &other);
+			waitpid(t[i], NULL, 0);
+		}
+	}
+	if (f > 0) {
+		kill(f, SIGKILL);
+		waitpid(f, NULL, 0);
+	}
+	if (P) {
+		cg_write(P, "cpu.concurrency.max", "max");
+		cg_write(P, "cpuset.cpus.partition", "member");
+	}
+	if (a)
+		cg_destroy(a);
+	if (c)
+		cg_destroy(c);
+	if (P)
+		cg_destroy(P);
+	free(a);
+	free(c);
+	free(P);
+	return ret;
 }
 
 /*
@@ -904,6 +1815,129 @@ static int stat_cpu(pid_t pid)
 	for (field = 2; field < 39 && p; field++)
 		p = strchr(p + 1, ' ');
 	return p ? atoi(p + 1) : -1;
+}
+
+/* Parse a cpulist such as "1-2,5" into @set. Return 0, or -1 on error. */
+static int parse_cpulist(const char *list, cpu_set_t *set)
+{
+	const char *p = list;
+	char *end;
+
+	CPU_ZERO(set);
+	while (*p && *p != '\n') {
+		long a = strtol(p, &end, 10), b = a;
+
+		if (end == p)
+			return -1;
+		p = end;
+		if (*p == '-') {
+			b = strtol(p + 1, &end, 10);
+			p = end;
+		}
+		for (; a <= b; a++)
+			CPU_SET(a, set);
+		if (*p == ',')
+			p++;
+	}
+	return 0;
+}
+
+static int test_concurrency_isolated(const char *root)
+{
+	int ret = KSFT_FAIL, n = get_nprocs(), c0 = -1, iso = -1, hk = -1, cpu, fd, i;
+	cpu_set_t isolated, set;
+	char *g = NULL, buf[256];
+	pid_t x = -1;
+	ssize_t len;
+
+	fd = open("/sys/devices/system/cpu/isolated", O_RDONLY);
+	if (fd < 0)
+		return skip("no /sys/devices/system/cpu/isolated");
+	len = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	buf[len > 0 ? len : 0] = 0;
+	if (parse_cpulist(buf, &isolated))
+		return skip("unreadable isolated CPUs: %s", buf);
+	for (i = 0; i < n && c0 < 0; i++)
+		if (!CPU_ISSET(i, &isolated))
+			c0 = i;
+	for (i = 0; i < n && iso < 0; i++)
+		if (CPU_ISSET(i, &isolated))
+			iso = i;
+	for (i = iso + 1; iso >= 0 && i < n && hk < 0; i++)
+		if (!CPU_ISSET(i, &isolated) && i != c0)
+			hk = i;
+	if (c0 < 0 || iso < 0 || hk < 0)
+		return skip("no isolated CPU below a second housekeeping CPU (isolcpus=domain)");
+
+	g = cg_name(root, "cc_test_isolated");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	x = cg_run_nowait(g, busy_forever, NULL);
+	if (x < 0)
+		goto cleanup;
+	CPU_ZERO(&set);
+	CPU_SET(c0, &set);
+	if (sched_setaffinity(x, sizeof(set), &set))
+		goto cleanup;
+	usleep(200000);
+
+	CPU_ZERO(&set);
+	CPU_SET(iso, &set);
+	CPU_SET(hk, &set);
+	if (sched_setaffinity(x, sizeof(set), &set)) {
+		fprintf(stderr, "the mask {%d,%d} refused: %s\n", iso, hk, strerror(errno));
+		goto cleanup;
+	}
+	usleep(300000);
+	cpu = stat_cpu(x);
+	if (cpu != hk) {
+		fprintf(stderr, "given {%d,%d}, %d isolated, the group moved to CPU %d, not %d\n",
+			iso, hk, iso, cpu, hk);
+		goto cleanup;
+	}
+
+	CPU_ZERO(&set);
+	CPU_SET(iso, &set);
+	if (sched_setaffinity(x, sizeof(set), &set)) {
+		fprintf(stderr, "the mask {%d} refused: %s\n", iso, strerror(errno));
+		goto cleanup;
+	}
+	usleep(300000);
+	cpu = stat_cpu(x);
+	if (cpu != iso) {
+		fprintf(stderr, "given {%d} alone, the group runs on CPU %d\n", iso, cpu);
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (x > 0) {
+		kill(x, SIGKILL);
+		waitpid(x, NULL, 0);
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+static int sleep_forever(const char *cgroup, void *arg)
+{
+	for (;;)
+		pause();
+	return 0;
+}
+
+static int expect_write(const char *cg, const char *file, char *val, int want,
+			const char *what)
+{
+	int err = cg_write(cg, file, val);
+
+	if (err == want)
+		return 0;
+	fprintf(stderr, "%s: %s, not %s\n", what, err ? strerror(-err) : "accepted",
+		want ? strerror(-want) : "accepted");
+	return -1;
 }
 
 /*
@@ -1120,6 +2154,199 @@ static long proc_cpu_ms(pid_t pid)
 }
 
 /*
+ * Send SIGKILL to @pid and reap it. Return 0 if it died within @ms, else
+ * -ETIMEDOUT.
+ */
+static int kill_within(pid_t pid, int ms)
+{
+	int i;
+
+	kill(pid, SIGKILL);
+	for (i = 0; i < ms / 10; i++) {
+		if (waitpid(pid, NULL, WNOHANG) == pid)
+			return 0;
+		usleep(10000);
+	}
+	return -ETIMEDOUT;
+}
+
+/*
+ * The removal of a partition root widens the cpuset of a limited cgroup
+ * beside it.
+ *
+ * Cgroups: po, a partition root on CPUs 1 to n-1, and its children:
+ *  - p, a partition root on CPUs n-2 and n-1. It is empty;
+ *  - a, which names CPU n-3. x spins in it;
+ *  - b, which names the CPUs of p. They are taken, so b runs on the CPUs
+ *    of po without them. z spins and s sleeps in b.
+ * The steps, all done by the test:
+ *  1. Write 1 to cpu.concurrency.max of po.
+ *  2. Make p a member, then a partition root again.
+ *  3. Remove p. b gets the CPUs n-2 and n-1 which it names. x and z then
+ *     have no CPU in common, and share the one slot of po.
+ *
+ * Checked:
+ *  - every write of steps 1 and 2 and the removal are accepted;
+ *  - 300 ms after the removal, cpu.concurrency.effective of po reads 1;
+ *  - x and z both get CPU time during the next second: ten rotation
+ *    periods;
+ *  - z and s each die within 1 s of SIGKILL.
+ */
+static int test_concurrency_partition_rmdir(const char *root)
+{
+	char *po = NULL, *p = NULL, *a = NULL, *b = NULL, buf[64], pcpus[64];
+	int ret = KSFT_FAIL, n = get_nprocs(), last = n - 1;
+	pid_t x = -1, z = -1, s = -1;
+	long x0, x1, z0, z1;
+
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	po = cg_name(root, "cc_test_prmdir");
+	p = cg_name(po, "p");
+	a = cg_name(po, "a");
+	b = cg_name(po, "b");
+	if (!po || !p || !a || !b || cg_create(po))
+		goto cleanup;
+	snprintf(buf, sizeof(buf), "1-%d", last);
+	if (cg_write(po, "cpuset.cpus", buf) || cg_write(po, "cpuset.cpus.partition", "root")) {
+		ret = skip("no partition root on CPUs %s", buf);
+		goto cleanup;
+	}
+	if (cg_write(po, "cgroup.subtree_control", "+cpuset") ||
+	    cg_create(p) || cg_create(a) || cg_create(b))
+		goto cleanup;
+	snprintf(pcpus, sizeof(pcpus), "%d-%d", last - 1, last);
+	if (cg_write(p, "cpuset.cpus", pcpus) || cg_write(p, "cpuset.cpus.partition", "root")) {
+		ret = skip("no partition root on CPUs %s", pcpus);
+		goto cleanup;
+	}
+	snprintf(buf, sizeof(buf), "%d", last - 2);
+	if (cg_write(b, "cpuset.cpus", pcpus) || cg_write(a, "cpuset.cpus", buf))
+		goto cleanup;
+
+	x = cg_run_nowait(a, busy_forever, NULL);
+	z = cg_run_nowait(b, busy_forever, NULL);
+	s = cg_run_nowait(b, sleep_forever, NULL);
+	if (x < 0 || z < 0 || s < 0)
+		goto cleanup;
+	usleep(100000);
+
+	if (expect_write(po, "cpu.concurrency.max", "1", 0, "a limit over b, naming p's CPUs") ||
+	    expect_write(p, "cpuset.cpus.partition", "member", 0, "p back to member") ||
+	    expect_write(p, "cpuset.cpus.partition", "root", 0, "p a partition root again"))
+		goto cleanup;
+	if (cg_destroy(p)) {
+		fprintf(stderr, "rmdir of the empty partition root p failed\n");
+		goto cleanup;
+	}
+	usleep(300000);
+	if (cg_read(po, "cpu.concurrency.effective", buf, sizeof(buf)) ||
+	    strncmp(buf, "1 ", 2)) {
+		fprintf(stderr, "after the rmdir, po's effective limit is \"%.*s\", not 1\n",
+			(int)strcspn(buf, "\n"), buf);
+		goto cleanup;
+	}
+	x0 = proc_cpu_ms(x);
+	z0 = proc_cpu_ms(z);
+	usleep(1000000);
+	x1 = proc_cpu_ms(x);
+	z1 = proc_cpu_ms(z);
+	if (x1 <= x0 || z1 <= z0) {
+		fprintf(stderr, "after the rmdir, in 1 s x ran %ld ms, z %ld ms\n",
+			x1 - x0, z1 - z0);
+		goto cleanup;
+	}
+	if (kill_within(z, 1000)) {
+		fprintf(stderr, "z, spinning, not dead 1 s after SIGKILL\n");
+		goto cleanup;
+	}
+	z = -1;
+	if (kill_within(s, 1000)) {
+		fprintf(stderr, "s, asleep, not dead 1 s after SIGKILL\n");
+		goto cleanup;
+	}
+	s = -1;
+	ret = KSFT_PASS;
+cleanup:
+	if (po)
+		cg_write(po, "cpu.concurrency.max", "max");
+	if (x > 0) {
+		kill(x, SIGKILL);
+		waitpid(x, NULL, 0);
+	}
+	if (z > 0) {
+		kill(z, SIGKILL);
+		waitpid(z, NULL, 0);
+	}
+	if (s > 0) {
+		kill(s, SIGKILL);
+		waitpid(s, NULL, 0);
+	}
+	if (p) {
+		cg_write(p, "cpuset.cpus.partition", "member");
+		cg_destroy(p);
+	}
+	if (a)
+		cg_destroy(a);
+	if (b)
+		cg_destroy(b);
+	if (po) {
+		cg_write(po, "cpuset.cpus.partition", "member");
+		cg_destroy(po);
+	}
+	free(b);
+	free(a);
+	free(p);
+	free(po);
+	return ret;
+}
+
+/*
+ * Enabling the cpu controller on existing cgroups gives each one the
+ * ceiling in its parent's cpu.concurrency.child_ceiling.
+ * p names CPU 0 and has a cpu.concurrency.child_ceiling of 1. Its child
+ * x names the last CPU, which p does not have. "+cpu" is written to
+ * cgroup.subtree_control of p. The write must be accepted, and x must
+ * read the ceiling 1.
+ */
+static int test_concurrency_child_hard_enable(const char *root)
+{
+	char *p = NULL, *x = NULL, buf[32];
+	int ret = KSFT_FAIL, n = get_nprocs();
+
+	if (need_cpus(2))
+		return KSFT_SKIP;
+	p = cg_name(root, "cc_test_child_hard_enable");
+	if (!p)
+		goto cleanup;
+	x = cg_name(p, "x");
+	if (!x || cg_create(p) || cg_write(p, "cgroup.subtree_control", "+cpuset") ||
+	    cg_create(x))
+		goto cleanup;
+	snprintf(buf, sizeof(buf), "%d", n - 1);
+	if (cg_write(p, "cpuset.cpus", "0") || cg_write(x, "cpuset.cpus", buf) ||
+	    cg_write(p, "cpu.concurrency.child_ceiling", "1"))
+		goto cleanup;
+	if (expect_write(p, "cgroup.subtree_control", "+cpu", 0,
+			 "the cpu controller over x, naming a CPU p does not have"))
+		goto cleanup;
+	if (cg_read_strcmp(x, "cpu.concurrency.max", "max\n") ||
+	    cg_read_strcmp(x, "cpu.concurrency.ceiling", "1\n")) {
+		fprintf(stderr, "x did not take the hard value 1 when the cpu controller came\n");
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (x)
+		cg_destroy(x);
+	if (p)
+		cg_destroy(p);
+	free(x);
+	free(p);
+	return ret;
+}
+
+/*
  * Pin @pid to CPUs @from to @to. @want is the expected errno, or 0 for a
  * success. Return 0 when the result is @want. Else print @what with the
  * result and return -1.
@@ -1139,6 +2366,32 @@ static int expect_pin(pid_t pid, int from, int to, int want, const char *what)
 	fprintf(stderr, "%s: %s, not %s\n", what, err ? strerror(err) : "accepted",
 		want ? strerror(want) : "accepted");
 	return -1;
+}
+
+/*
+ * Copy the value of @field of /proc/<pid>/status into @buf, without its
+ * newline. Return @buf, or NULL when the field is not found.
+ */
+static char *proc_status(pid_t pid, const char *field, char *buf, size_t len)
+{
+	char path[64], line[256], *val = NULL;
+	size_t n = strlen(field);
+	FILE *f;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+	f = fopen(path, "r");
+	if (!f)
+		return NULL;
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, field, n) || line[n] != ':')
+			continue;
+		snprintf(buf, len, "%s", line + n + 1 + strspn(line + n + 1, " \t"));
+		buf[strcspn(buf, "\n")] = 0;
+		val = buf;
+		break;
+	}
+	fclose(f);
+	return val;
 }
 
 /*
@@ -1234,6 +2487,61 @@ cleanup:
 }
 
 /*
+ * An affinity change to an offline CPU is refused at once. g has the
+ * limit 1. x spins in it. CPU c, the last one, goes offline. x is pinned
+ * to {c} 50 times. Each call must fail with EINVAL, and return within
+ * 1 s. The refusal needs no room, so it waits for nothing. A kernel which
+ * tries to make room for the offline CPU sleeps for seconds in each call.
+ */
+static int test_concurrency_offline_affinity(const char *root)
+{
+	int ret = KSFT_FAIL, n = get_nprocs(), c = n - 1, offline = 0, i;
+	struct timespec t0;
+	long long ms;
+	pid_t x = -1;
+	char *g = NULL;
+
+	if (need_cpus(2))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_offline_aff");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	x = cg_run_nowait(g, busy_forever, NULL);
+	if (x < 0)
+		goto cleanup;
+	usleep(100000);
+	if (write_cpu_online(c, 0)) {
+		ret = skip("CPU %d cannot go offline", c);
+		goto cleanup;
+	}
+	offline = 1;
+	for (i = 0; i < 50; i++) {
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		if (expect_pin(x, c, c, EINVAL, "x pinned to an offline CPU"))
+			goto cleanup;
+		ms = ns_since(&t0) / 1000000;
+		if (ms >= 1000) {
+			fprintf(stderr, "refused change %d took %lld ms\n", i, ms);
+			goto cleanup;
+		}
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (offline)
+		write_cpu_online(c, 1);
+	if (g)
+		cg_write(g, "cpu.concurrency.max", "max");
+	if (x > 0) {
+		kill(x, SIGKILL);
+		waitpid(x, NULL, 0);
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+/*
  * A cpuset write moves the tasks of a limited cgroup into its new CPUs,
  * also when one of the new CPUs is offline. CPU 2 is offline during the
  * test. Two trees:
@@ -1251,6 +2559,228 @@ cleanup:
  * Skipped with fewer than 6 CPUs, or when CPU 2 cannot go offline.
  */
 static int procs_stuck(const pid_t *pid, int n, int ms);
+
+static int test_concurrency_setmove_mask(const char *root)
+{
+	static const int w1m[] = { 5, -1 }, w2m[] = { 3, -1 };
+	char *g = NULL, *p = NULL, *a = NULL, *b = NULL;
+	pid_t t1 = -1, t2 = -1, w1 = -1, w2 = -1, pid[4];
+	int ret = KSFT_FAIL, offline = 0, err, i;
+
+	if (need_cpus(6))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_smm_g");
+	p = cg_name(root, "cc_test_smm_p");
+	a = cg_name(p, "a");
+	b = cg_name(p, "b");
+	if (!g || !p || !a || !b || cg_create(g) || cg_create(p) ||
+	    cg_write(p, "cgroup.subtree_control", "+cpu +cpuset") || cg_create(a) ||
+	    cg_create(b))
+		goto cleanup;
+	if (cg_write(g, "cpuset.cpus", "1-2") || cg_write(g, "cpu.concurrency.max", "1") ||
+	    cg_write(a, "cpuset.cpus", "1") || cg_write(b, "cpuset.cpus", "3-5") ||
+	    cg_write(p, "cpu.concurrency.max", "3"))
+		goto cleanup;
+	t1 = cg_run_nowait(g, busy_forever, NULL);
+	t2 = cg_run_nowait(a, busy_forever, NULL);
+	w1 = cg_run_nowait(b, busy_forever, NULL);
+	w2 = cg_run_nowait(b, busy_forever, NULL);
+	if (t1 < 0 || t2 < 0 || w1 < 0 || w2 < 0)
+		goto cleanup;
+	err = pin_cpus(w1, w1m);
+	if (!err)
+		err = pin_cpus(w2, w2m);
+	if (err) {
+		fprintf(stderr, "pinning before the test: %s\n", strerror(err));
+		goto cleanup;
+	}
+	usleep(100000);
+	if (write_cpu_online(2, 0)) {
+		ret = skip("CPU 2 cannot go offline");
+		goto cleanup;
+	}
+	offline = 1;
+	usleep(50000);
+
+	if (expect_write(g, "cpuset.cpus", "2-4", 0, "g's cpuset to 2-4"))
+		goto cleanup;
+	/* The write moves t1 before it returns. Allow 2 s for the stopper. */
+	for (i = 0; i < 200 && stat_cpu(t1) != 3 && stat_cpu(t1) != 4; i++)
+		usleep(10000);
+	if (i == 200) {
+		fprintf(stderr, "t1 is on CPU %d after g's cpuset became 2-4, CPU 2 offline\n",
+			stat_cpu(t1));
+		goto cleanup;
+	}
+
+	if (expect_write(a, "cpuset.cpus", "2,5", 0, "a's cpuset to {2,5}"))
+		goto cleanup;
+	for (i = 0; i < 200 && stat_cpu(t2) != 5; i++)
+		usleep(10000);
+	if (i == 200) {
+		fprintf(stderr, "t2 is on CPU %d after a's cpuset became {2,5}, CPU 2 offline\n",
+			stat_cpu(t2));
+		goto cleanup;
+	}
+	pid[0] = t1;
+	pid[1] = t2;
+	pid[2] = w1;
+	pid[3] = w2;
+	i = procs_stuck(pid, 4, 2000);
+	if (i >= 0) {
+		fprintf(stderr, "spinner %d got no CPU time in 2 s after the cpuset writes\n", i);
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (offline)
+		write_cpu_online(2, 1);
+	if (g)
+		cg_write(g, "cpu.concurrency.max", "max");
+	if (p)
+		cg_write(p, "cpu.concurrency.max", "max");
+	if (t1 > 0) {
+		kill(t1, SIGKILL);
+		waitpid(t1, NULL, 0);
+	}
+	if (t2 > 0) {
+		kill(t2, SIGKILL);
+		waitpid(t2, NULL, 0);
+	}
+	if (w1 > 0) {
+		kill(w1, SIGKILL);
+		waitpid(w1, NULL, 0);
+	}
+	if (w2 > 0) {
+		kill(w2, SIGKILL);
+		waitpid(w2, NULL, 0);
+	}
+	if (a)
+		cg_destroy(a);
+	if (b)
+		cg_destroy(b);
+	if (p)
+		cg_destroy(p);
+	if (g)
+		cg_destroy(g);
+	free(a);
+	free(b);
+	free(p);
+	free(g);
+	return ret;
+}
+
+/*
+ * Making room for a set-move by another set-move. p has the limit 2 and
+ * three children, each with one spinning task:
+ *  - U in u, pinned to {0};
+ *  - S in s, pinned to {1}, then to {0-3};
+ *  - T in t, pinned to {0}.
+ * p uses CPUs 0 and 1. T is then pinned to {4}. Two slots still serve
+ * the three tasks: one on CPU 4 for T, and one on CPU 0 for U and S. t's
+ * presence must move from CPU 0 to CPU 4. p does not use CPU 4 and has
+ * no room for it, because U stays on CPU 0. p must give up CPU 1. S
+ * cannot join another CPU of its own cgroup, so s is set-moved to CPU 0,
+ * inside the first set-move.
+ * The pin must succeed. T must end on CPU 4, S and U on CPU 0, within
+ * 1 s. nr_rotations of p must still be 0.
+ */
+static int test_concurrency_headroom_setmove(const char *root)
+{
+	static const int zero[] = { 0, -1 }, one[] = { 1, -1 }, four[] = { 4, -1 },
+			 low[] = { 0, 1, 2, 3, -1 };
+	char *p = NULL, *cu = NULL, *cs = NULL, *ct = NULL;
+	int ret = KSFT_FAIL, err, i, cpu_t = -1, cpu_s = -1, cpu_u = -1;
+	pid_t u = -1, s = -1, t = -1;
+	struct conc_stat st = { };
+
+	if (need_cpus(5))
+		return KSFT_SKIP;
+	p = cg_name(root, "cc_test_hsm");
+	cu = cg_name(p, "u");
+	cs = cg_name(p, "s");
+	ct = cg_name(p, "t");
+	if (!p || !cu || !cs || !ct || cg_create(p) ||
+	    cg_write(p, "cgroup.subtree_control", "+cpu") || cg_create(cu) ||
+	    cg_create(cs) || cg_create(ct) || cg_write(p, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	u = cg_run_nowait(cu, busy_forever, NULL);
+	s = cg_run_nowait(cs, busy_forever, NULL);
+	t = cg_run_nowait(ct, busy_forever, NULL);
+	if (u < 0 || s < 0 || t < 0)
+		goto cleanup;
+	err = pin_cpus(u, zero);
+	if (!err)
+		err = pin_cpus(s, one);
+	if (!err)
+		err = pin_cpus(t, zero);
+	if (!err) {
+		usleep(100000);
+		err = pin_cpus(s, low);
+	}
+	if (err) {
+		fprintf(stderr, "pinning before the test: %s\n", strerror(err));
+		goto cleanup;
+	}
+	usleep(100000);
+	if (stat_cpu(s) != 1 || stat_cpu(t) != 0 || stat_cpu(u) != 0) {
+		fprintf(stderr, "before the change: s on %d, t on %d, u on %d; want 1, 0, 0\n",
+			stat_cpu(s), stat_cpu(t), stat_cpu(u));
+		goto cleanup;
+	}
+	err = pin_cpus(t, four);
+	if (err) {
+		fprintf(stderr, "t's task pinned to {4}: %s, not accepted\n", strerror(err));
+		goto cleanup;
+	}
+	for (i = 0; i < 100; i++) {
+		cpu_t = stat_cpu(t);
+		cpu_s = stat_cpu(s);
+		cpu_u = stat_cpu(u);
+		if (cpu_t == 4 && cpu_s == 0 && cpu_u == 0)
+			break;
+		usleep(10000);
+	}
+	if (i == 100) {
+		fprintf(stderr, "after the change: t on %d, s on %d, u on %d; want 4, 0, 0\n",
+			cpu_t, cpu_s, cpu_u);
+		goto cleanup;
+	}
+	if (conc_stat_read(p, &st) || st.nr_rotations) {
+		fprintf(stderr, "nr_rotations is %lld, the tasks fit in two slots\n",
+			st.nr_rotations);
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (p)
+		cg_write(p, "cpu.concurrency.max", "max");
+	if (u > 0) {
+		kill(u, SIGKILL);
+		waitpid(u, NULL, 0);
+	}
+	if (s > 0) {
+		kill(s, SIGKILL);
+		waitpid(s, NULL, 0);
+	}
+	if (t > 0) {
+		kill(t, SIGKILL);
+		waitpid(t, NULL, 0);
+	}
+	if (cu)
+		cg_destroy(cu);
+	if (cs)
+		cg_destroy(cs);
+	if (ct)
+		cg_destroy(ct);
+	if (p)
+		cg_destroy(p);
+	free(cu);
+	free(cs);
+	free(ct);
+	free(p);
+	return ret;
+}
 
 /*
  * A thread changes cgroup while another thread changes its affinity.
@@ -2207,6 +3737,193 @@ static int wait_in_cgroup(const char *cg, pid_t pid)
 	return -1;
 }
 
+/*
+ * Start a sleeping task in @cg and make it SCHED_DEADLINE, 1 ms every
+ * 100 ms. Return 0 if it was admitted, or the error of sched_setattr().
+ * Return -ECHILD if the task could not be started. The task is gone when
+ * this returns.
+ *
+ * A test of a deadline domain calls this before it writes the limit. An
+ * error then tells that the machine does not take a deadline task in this
+ * partition root at all. The same error after the limit is written is a
+ * failure of the limit.
+ */
+static int dl_admitted_in(const char *cg)
+{
+	struct sched_param other = { .sched_priority = 0 };
+	pid_t pid;
+	int err;
+
+	pid = cg_run_nowait(cg, sleep_forever, NULL);
+	if (pid < 0)
+		return -ECHILD;
+	err = wait_in_cgroup(cg, pid) ? -ECHILD : set_deadline(pid, 1000, 100000);
+	/* Give the bandwidth back before the task dies. */
+	sched_setscheduler(pid, SCHED_OTHER, &other);
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+	return err;
+}
+
+/*
+ * Call sched_setaffinity(@pid, @set) from a child process. Return 0, or
+ * the errno of the call. Return -ETIMEDOUT if the call has not returned
+ * after @ms. The child is then left behind: SIGKILL does not end a task
+ * which sleeps on a mutex.
+ */
+static int setaffinity_within(pid_t pid, const cpu_set_t *set, int ms)
+{
+	int st, i;
+	pid_t c;
+
+	c = fork();
+	if (c < 0)
+		return -ECHILD;
+	if (!c)
+		_exit(sched_setaffinity(pid, sizeof(*set), set) ? errno : 0);
+	for (i = 0; i < ms; i++) {
+		if (waitpid(c, &st, WNOHANG) == c)
+			return WIFEXITED(st) ? WEXITSTATUS(st) : -ECHILD;
+		usleep(1000);
+	}
+	kill(c, SIGKILL);
+	return -ETIMEDOUT;
+}
+
+#define DL_AFF_TIMEOUT_MS	10000
+
+/*
+ * Apply @set to @pid with setaffinity_within(). @want is the expected
+ * errno, or 0 for a success. Return 0 when the result is @want and
+ * Cpus_allowed_list of @pid then reads @list. Else print @what with the
+ * result and return -1.
+ *
+ * A call which does not return leaves cpuset_mutex locked. No cgroup can
+ * then be removed and no later case can run. So the whole run ends there.
+ */
+static int expect_dl_pin(pid_t pid, const cpu_set_t *set, int want, const char *list,
+			 const char *what)
+{
+	int err = setaffinity_within(pid, set, DL_AFF_TIMEOUT_MS);
+	char buf[64] = "";
+
+	if (err == -ETIMEDOUT)
+		ksft_exit_fail_msg("%s: sched_setaffinity() did not return within %d ms\n",
+				   what, DL_AFF_TIMEOUT_MS);
+	if (err != want) {
+		fprintf(stderr, "%s: %s, not %s\n", what,
+			err < 0 ? "failed" : err ? strerror(err) : "accepted",
+			want ? strerror(want) : "accepted");
+		return -1;
+	}
+	if (!proc_status(pid, "Cpus_allowed_list", buf, sizeof(buf)) || strcmp(buf, list)) {
+		fprintf(stderr, "%s: Cpus_allowed_list is \"%s\" after it, not %s\n", what, buf,
+			list);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * sched_setaffinity(2) on a task of a deadline domain returns, with the
+ * documented result. The call takes cpuset_mutex for a deadline task. A
+ * kernel which takes it a second time on the way never returns.
+ *
+ * P is a partition root on the last two CPUs, L-1 and L, with the limit 1.
+ * d and f sleep in P. d is SCHED_DEADLINE, 10 ms every 100 ms. f is a fair
+ * task. A child of the test makes each call, so that the test can see a
+ * call which does not return:
+ *  - d gets {L-1,L}, the CPUs of P: accepted;
+ *  - d gets {L}: EBUSY. A deadline task may not get a mask narrower than
+ *    its root domain, with or without a limit;
+ *  - f gets {L}: accepted;
+ *  - f gets {L-1,L}: accepted;
+ *  - d gets every CPU: accepted.
+ * After each call Cpus_allowed_list of the task must read "L-1-L", or "L"
+ * for f pinned to {L}.
+ *
+ * Each call must return within 10 s. It waits for cpuset_mutex, for
+ * conc_mutex, and for the affinity changes judged before it. Nothing else
+ * runs here, so 10 s only pass when the call is stuck.
+ *
+ * Skipped:
+ *  - with fewer than 3 CPUs;
+ *  - with deadline admission off;
+ *  - without a partition root;
+ *  - when P takes no deadline task before it has a limit.
+ */
+static int test_concurrency_dl_setaffinity_in_domain(const char *root)
+{
+	struct sched_param other = { .sched_priority = 0 };
+	int ret = KSFT_FAIL, n = get_nprocs(), L = n - 1, err;
+	cpu_set_t both, last, all;
+	char *P = NULL, rt[32], cpus[32], one[32];
+	pid_t d = -1, f = -1;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	if (rt_runtime_read(rt, sizeof(rt)) || atol(rt) < 0)
+		return skip("deadline admission control is off");
+	P = cg_name(root, "cc_test_dl_aff");
+	if (!P || cg_create(P))
+		goto cleanup;
+	snprintf(one, sizeof(one), "%d", L);
+	snprintf(cpus, sizeof(cpus), "%d-%d", L - 1, L);
+	if (cg_write(P, "cpuset.cpus", cpus) || cg_write(P, "cpuset.cpus.partition", "root") ||
+	    cg_read_strcmp(P, "cpuset.cpus.partition", "root\n")) {
+		ret = skip("no partition root on CPUs %s", cpus);
+		goto cleanup;
+	}
+	err = dl_admitted_in(P);
+	if (err) {
+		ret = skip("no SCHED_DEADLINE task in a partition root without a limit: %s",
+			   strerror(-err));
+		goto cleanup;
+	}
+	if (cg_write(P, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	d = cg_run_nowait(P, sleep_forever, NULL);
+	f = cg_run_nowait(P, sleep_forever, NULL);
+	if (d < 0 || f < 0 || wait_in_cgroup(P, d) || wait_in_cgroup(P, f))
+		goto cleanup;
+	err = set_deadline(d, 10000, 100000);
+	if (err) {
+		fprintf(stderr, "a deadline task of 0.1 CPU refused in a deadline domain: %s\n",
+			strerror(-err));
+		goto cleanup;
+	}
+	CPU_ZERO(&both);
+	CPU_SET(L - 1, &both);
+	CPU_SET(L, &both);
+	CPU_ZERO(&last);
+	CPU_SET(L, &last);
+	stress_all_cpus(&all);
+	if (expect_dl_pin(d, &both, 0, cpus, "the deadline task pinned to the CPUs of P") ||
+	    expect_dl_pin(d, &last, EBUSY, cpus, "the deadline task pinned to one CPU of P") ||
+	    expect_dl_pin(f, &last, 0, one, "a fair task pinned to one CPU of P") ||
+	    expect_dl_pin(f, &both, 0, cpus, "a fair task pinned to the CPUs of P") ||
+	    expect_dl_pin(d, &all, 0, cpus, "the deadline task pinned to every CPU"))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (d > 0) {
+		kill(d, SIGKILL);
+		sched_setscheduler(d, SCHED_OTHER, &other);
+		waitpid(d, NULL, 0);
+	}
+	if (f > 0) {
+		kill(f, SIGKILL);
+		waitpid(f, NULL, 0);
+	}
+	if (P) {
+		cg_write(P, "cpu.concurrency.max", "max");
+		cg_write(P, "cpuset.cpus.partition", "member");
+		cg_destroy(P);
+	}
+	free(P);
+	return ret;
+}
+
 /* Return the state letter of @pid in /proc/<pid>/stat, or 0. */
 static char proc_state(pid_t pid)
 {
@@ -2243,6 +3960,152 @@ static int procs_stuck(const pid_t *pid, int n, int ms)
 }
 
 /*
+ * Sample the CPUs of the @n processes of @pid every 10 ms, @samples times.
+ * Return 0 if they were on @limit CPUs at most. Return the number of CPUs
+ * found if three samples in a row had more.
+ *
+ * One sample reads the CPUs one after the other. A set-move between two
+ * reads can show a task on its old CPU and another on the new one. Three
+ * samples in a row are 20 ms apart, and a set-move does not last that
+ * long.
+ */
+static int procs_cpus_above(const pid_t *pid, int n, int limit, int samples)
+{
+	int i, k, row = 0;
+
+	for (k = 0; k < samples; k++) {
+		cpu_set_t seen;
+
+		CPU_ZERO(&seen);
+		for (i = 0; i < n; i++) {
+			int cpu = stat_cpu(pid[i]);
+
+			if (cpu >= 0)
+				CPU_SET(cpu, &seen);
+		}
+		row = CPU_COUNT(&seen) > limit ? row + 1 : 0;
+		if (row == 3)
+			return CPU_COUNT(&seen);
+		usleep(10000);
+	}
+	return 0;
+}
+
+/*
+ * Check the three spinners of test_concurrency_offline_pinned_running()
+ * @when: "after the unplug" or "after the replug". @c is the CPU which s1
+ * was pinned to. Return 0 if all the checks listed there hold.
+ */
+static int offline_pinned_check(const char *g, const pid_t *pid, int c, int c_online,
+				const char *when)
+{
+	cpu_set_t allowed;
+	char buf[128] = "";
+	int i, cpu;
+
+	i = procs_stuck(pid, 3, 2000);
+	if (i >= 0) {
+		fprintf(stderr, "%s: s%d got no CPU time in 2 s\n", when, i + 1);
+		return -1;
+	}
+	if (!proc_status(pid[0], "Cpus_allowed_list", buf, sizeof(buf)) ||
+	    parse_cpulist(buf, &allowed) || (CPU_COUNT(&allowed) == 1 && CPU_ISSET(c, &allowed))) {
+		fprintf(stderr, "%s: Cpus_allowed_list of s1 is \"%s\"\n", when, buf);
+		return -1;
+	}
+	cpu = stat_cpu(pid[0]);
+	if (cpu < 0 || !CPU_ISSET(cpu, &allowed) || (!c_online && cpu == c)) {
+		fprintf(stderr, "%s: s1 is on CPU %d, its mask is %s\n", when, cpu, buf);
+		return -1;
+	}
+	i = procs_cpus_above(pid, 3, 2, 50);
+	if (i) {
+		fprintf(stderr, "%s: the spinners are on %d CPUs, limit 2\n", when, i);
+		return -1;
+	}
+	if (cg_read_strcmp(g, "cpu.concurrency.effective", "2 max\n")) {
+		fprintf(stderr, "%s: the effective limit is not 2\n", when);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * A running task loses its only CPU to hotplug, under a limit. g has the
+ * limit 2. s1, s2 and s3 spin in g. s1 is pinned to {c}, the last CPU.
+ * s2 and s3 can run on every CPU. So g uses c and one other CPU.
+ *  - The test waits until s1 is on c.
+ *  - c goes offline.
+ *  - c comes back online.
+ * The kernel must give s1 a wider mask when c goes, as it does without a
+ * limit. After each of the last two steps:
+ *  - each spinner gets CPU time within 2 s. Three spinners share two
+ *    CPUs, so each one runs every few milliseconds;
+ *  - Cpus_allowed_list of s1 is no longer "c" alone, and s1 is on a CPU
+ *    of that list, which is not c while c is offline;
+ *  - the three spinners are on two CPUs at most, see procs_cpus_above();
+ *  - cpu.concurrency.effective of g reads "2 max".
+ * Skipped with fewer than 3 CPUs, or when c cannot go offline.
+ */
+static int test_concurrency_offline_pinned_running(const char *root)
+{
+	int ret = KSFT_FAIL, n = get_nprocs(), c = n - 1, offline = 0, i;
+	pid_t pid[3] = { -1, -1, -1 };
+	char *g = NULL;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_offpin");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	for (i = 0; i < 3; i++) {
+		pid[i] = cg_run_nowait(g, busy_forever, NULL);
+		if (pid[i] < 0 || wait_in_cgroup(g, pid[i]))
+			goto cleanup;
+	}
+	if (expect_pin(pid[0], c, c, 0, "s1 pinned to the last CPU"))
+		goto cleanup;
+	/* The pin moves a running task at once. Allow 2 s for the stopper. */
+	for (i = 0; i < 200 && stat_cpu(pid[0]) != c; i++)
+		usleep(10000);
+	if (stat_cpu(pid[0]) != c || procs_stuck(pid, 3, 2000) >= 0) {
+		fprintf(stderr, "before the unplug: s1 on CPU %d, not %d, or a spinner stuck\n",
+			stat_cpu(pid[0]), c);
+		goto cleanup;
+	}
+	if (write_cpu_online(c, 0)) {
+		ret = skip("CPU %d cannot go offline", c);
+		goto cleanup;
+	}
+	offline = 1;
+	if (offline_pinned_check(g, pid, c, 0, "after the unplug"))
+		goto cleanup;
+	if (write_cpu_online(c, 1)) {
+		fprintf(stderr, "CPU %d does not come back online\n", c);
+		goto cleanup;
+	}
+	offline = 0;
+	if (offline_pinned_check(g, pid, c, 1, "after the replug"))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (offline)
+		write_cpu_online(c, 1);
+	for (i = 0; i < 3; i++) {
+		if (pid[i] > 0) {
+			kill(pid[i], SIGKILL);
+			waitpid(pid[i], NULL, 0);
+		}
+	}
+	if (g) {
+		cg_write(g, "cpu.concurrency.max", "max");
+		cg_destroy(g);
+	}
+	free(g);
+	return ret;
+}
+
+/*
  * Wait until the @n processes of @pid are all on one CPU of @allowed, for
  * three samples in a row, 10 ms apart. Return that CPU. Return -1 and
  * print where they are, with @when, if this has not happened after @ms.
@@ -2268,6 +4131,192 @@ static int procs_on_one_cpu(const pid_t *pid, int n, const cpu_set_t *allowed, i
 		fprintf(stderr, " %d", stat_cpu(pid[i]));
 	fprintf(stderr, "\n");
 	return -1;
+}
+
+#define BW_TASKS	4
+#define BW_THROTTLED	3
+
+/*
+ * Wait until the first BW_THROTTLED spinners of
+ * test_concurrency_bandwidth_under_limit() are throttled: for 30 ms, all
+ * are runnable and none uses CPU time. They use the quota of a period in
+ * its first 30 ms, and are throttled for the rest of it. Return 0, or -1
+ * if this is not seen in 2 s.
+ *
+ * nr_throttled of cpu.stat does not tell the moment. It grows at the end
+ * of a period, when the quota is refilled and the tasks run again.
+ */
+static int wait_throttled(const pid_t *pid)
+{
+	long before[BW_THROTTLED];
+	int i, t, ran;
+
+	for (t = 0; t < 2000; t += 30) {
+		for (i = 0; i < BW_THROTTLED; i++)
+			before[i] = proc_cpu_ms(pid[i]);
+		usleep(30000);
+		ran = 0;
+		for (i = 0; i < BW_THROTTLED; i++)
+			ran |= proc_cpu_ms(pid[i]) != before[i] || proc_state(pid[i]) != 'R';
+		if (!ran)
+			return 0;
+	}
+	fprintf(stderr, "the spinners under the quota were not all throttled at once in 2 s\n");
+	return -1;
+}
+
+/*
+ * Check the spinners of test_concurrency_bandwidth_under_limit() after
+ * the step @when. They must all be on one CPU of @allowed within 2 s, and
+ * each must get CPU time within 3 s. A spinner under the quota runs about
+ * 7 ms in a period of 100 ms, and the CPU time is read in units of 10 ms.
+ * So it shows CPU time after two periods. cpu.concurrency.effective of @g
+ * must read "1 max". Return the CPU, or -1.
+ */
+static int bandwidth_check(const char *g, const pid_t *pid, const cpu_set_t *allowed,
+			   const char *when)
+{
+	int cpu, i;
+
+	cpu = procs_on_one_cpu(pid, BW_TASKS, allowed, 2000, when);
+	if (cpu < 0)
+		return -1;
+	i = procs_stuck(pid, BW_TASKS, 3000);
+	if (i >= 0) {
+		fprintf(stderr, "%s: spinner %d got no CPU time in 3 s\n", when, i);
+		return -1;
+	}
+	if (cg_read_strcmp(g, "cpu.concurrency.effective", "1 max\n")) {
+		fprintf(stderr, "%s: the effective limit is not 1\n", when);
+		return -1;
+	}
+	return cpu;
+}
+
+/*
+ * cpu.max below a concurrency limit. A task throttled by cpu.max is off
+ * the runqueue until the quota is refilled. A set-move must take it along
+ * with the tasks which run.
+ *
+ * g has the cpuset 1-3 and the limit 2. It has two children:
+ *  - q has a quota of 20 ms in a period of 100 ms;
+ *  - r has no quota.
+ * The steps:
+ *  - spin_and_check() runs four threads in q for 500 ms. They use two
+ *    CPUs at most, and read no mm_cid of 2 or more.
+ *  - Three processes then spin in q, and one in r. Those of q use the
+ *    quota in 30 ms at most, so they are throttled for most of each
+ *    period. The one of r always runs, so g always uses a CPU.
+ *  - The limit 1 is written to g. The four must end on one CPU, u.
+ *  - g's cpuset.cpus is written without u. The four must end on one CPU
+ *    of the new cpuset, v.
+ *  - v goes offline. The four must end on the one CPU left to g.
+ *  - "max" is written to cpu.max of q. The four must stay on that CPU,
+ *    and each must get CPU time within 2 s.
+ * The test makes each of the three changes while the spinners of q are
+ * throttled, see wait_throttled(). After each one, bandwidth_check() must
+ * hold. A throttled task which a set-move left behind shows on another
+ * CPU than the others.
+ * Skipped with fewer than 4 CPUs, without cpu.max, or when v cannot go
+ * offline.
+ */
+static int test_concurrency_bandwidth_under_limit(const char *root)
+{
+	struct spin_param sp = { .nthreads = 4, .limit = 2, .duration_ms = 500 };
+	int ret = KSFT_FAIL, i, u, v, w, offline = -1;
+	char *g = NULL, *q = NULL, *r = NULL, buf[32];
+	pid_t pid[BW_TASKS];
+	cpu_set_t allowed;
+
+	for (i = 0; i < BW_TASKS; i++)
+		pid[i] = -1;
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_bw");
+	q = g ? cg_name(g, "q") : NULL;
+	r = g ? cg_name(g, "r") : NULL;
+	if (!g || !q || !r || cg_create(g) || cg_write(g, "cgroup.subtree_control", "+cpu") ||
+	    cg_create(q) || cg_create(r))
+		goto cleanup;
+	if (cg_write(q, "cpu.max", "20000 100000")) {
+		ret = skip("no cpu.max");
+		goto cleanup;
+	}
+	if (cg_write(g, "cpuset.cpus", "1-3") || cg_write(g, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	i = cg_run(q, spin_and_check, &sp);
+	if (i) {
+		fprintf(stderr, "four threads under the limit and the quota: check %d failed\n", i);
+		goto cleanup;
+	}
+	for (i = 0; i < BW_TASKS; i++) {
+		const char *cg = i < BW_THROTTLED ? q : r;
+
+		pid[i] = cg_run_nowait(cg, busy_forever, NULL);
+		if (pid[i] < 0 || wait_in_cgroup(cg, pid[i]))
+			goto cleanup;
+	}
+
+	parse_cpulist("1-3", &allowed);
+	if (wait_throttled(pid) ||
+	    expect_write(g, "cpu.concurrency.max", "1", 0, "the limit 1 over throttled tasks"))
+		goto cleanup;
+	u = bandwidth_check(g, pid, &allowed, "after the limit 1");
+	if (u < 0)
+		goto cleanup;
+
+	CPU_CLR(u, &allowed);
+	snprintf(buf, sizeof(buf), "%d,%d", u == 1 ? 2 : 1, u == 3 ? 2 : 3);
+	if (wait_throttled(pid) ||
+	    expect_write(g, "cpuset.cpus", buf, 0, "g's cpuset without the CPU in use"))
+		goto cleanup;
+	v = bandwidth_check(g, pid, &allowed, "after the cpuset write");
+	if (v < 0)
+		goto cleanup;
+
+	CPU_CLR(v, &allowed);
+	if (wait_throttled(pid))
+		goto cleanup;
+	if (write_cpu_online(v, 0)) {
+		ret = skip("CPU %d cannot go offline", v);
+		goto cleanup;
+	}
+	offline = v;
+	w = bandwidth_check(g, pid, &allowed, "after the unplug");
+	if (w < 0)
+		goto cleanup;
+
+	if (expect_write(q, "cpu.max", "max", 0, "the quota removed"))
+		goto cleanup;
+	i = procs_stuck(pid, BW_TASKS, 2000);
+	if (i >= 0) {
+		fprintf(stderr, "without the quota: spinner %d got no CPU time in 2 s\n", i);
+		goto cleanup;
+	}
+	if (bandwidth_check(g, pid, &allowed, "without the quota") != w)
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (offline >= 0)
+		write_cpu_online(offline, 1);
+	for (i = 0; i < BW_TASKS; i++) {
+		if (pid[i] > 0) {
+			kill(pid[i], SIGKILL);
+			waitpid(pid[i], NULL, 0);
+		}
+	}
+	if (g)
+		cg_write(g, "cpu.concurrency.max", "max");
+	if (q)
+		cg_destroy(q);
+	if (r)
+		cg_destroy(r);
+	if (g)
+		cg_destroy(g);
+	free(q);
+	free(r);
+	free(g);
+	return ret;
 }
 
 /* A task of test_concurrency_rt_setmove(). */
@@ -2614,6 +4663,96 @@ cleanup:
 	return ret;
 }
 
+/*
+ * The only CPU of a held task goes offline. held_setup() leaves b held,
+ * pinned to {y}, with the placement work stalled. The steps:
+ *  - a child of the test takes y offline. The test waits 400 ms for it,
+ *    and prints whether the unplug ended while the stall was on;
+ *  - the stall ends.
+ * b has no CPU left in its mask. The kernel must widen the mask, as it
+ * does for a task which runs when its CPU goes. Within 2 s of the end of
+ * the stall:
+ *  - a and b get CPU time, and are on the same CPU, which is not y;
+ *  - Cpus_allowed_list of b is no longer "y" alone;
+ *  - cpu.concurrency.effective of g reads "1 max".
+ * Skipped with fewer than 4 CPUs, when y cannot go offline, or as
+ * held_setup() says.
+ *
+ * Delay injection: the unplug pushes b off y itself, as it pushes every
+ * queued task (balance_push()). conc_try_place() also handles a held task
+ * whose mask has no active CPU. It only meets one if the placement work
+ * runs after sched_cpu_deactivate() made y inactive and before
+ * balance_push() moved b. That needs a delay in sched_cpu_deactivate()
+ * after set_cpu_active(), and no stall. This case does not reach that
+ * window.
+ */
+static int test_concurrency_held_offline(const char *root)
+{
+	int ret, i, st, done = 0, offline = -1;
+	struct held_setup hs;
+	char buf[128] = "";
+	cpu_set_t allowed;
+	pid_t pid[2], c;
+
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	ret = held_setup(&hs, root, "cc_test_held_off");
+	if (ret != KSFT_PASS)
+		goto cleanup;
+	ret = KSFT_FAIL;
+	c = fork();
+	if (c < 0)
+		goto cleanup;
+	if (!c)
+		_exit(write_cpu_online(hs.y, 0) ? 1 : 0);
+	offline = hs.y;
+	for (i = 0; i < 40 && !done; i++) {
+		done = waitpid(c, &st, WNOHANG) == c;
+		if (!done)
+			usleep(10000);
+	}
+	ksft_print_msg("the unplug of the CPU of a held task %s while the placement work was stalled\n",
+		       done ? "ended" : "did not end in 400 ms");
+	stall_stop(&hs.st);
+	hs.stalled = 0;
+	if (!done)
+		waitpid(c, &st, 0);
+	if (!WIFEXITED(st) || WEXITSTATUS(st)) {
+		offline = -1;
+		ret = skip("CPU %d cannot go offline", hs.y);
+		goto cleanup;
+	}
+	pid[0] = hs.a;
+	pid[1] = hs.b;
+	i = procs_stuck(pid, 2, 2000);
+	if (i >= 0) {
+		fprintf(stderr, "%s got no CPU time in 2 s after the unplug and the stall\n",
+			i ? "b" : "a");
+		goto cleanup;
+	}
+	stress_all_cpus(&allowed);
+	CPU_CLR(hs.y, &allowed);
+	if (procs_on_one_cpu(pid, 2, &allowed, 2000, "after the unplug and the stall") < 0)
+		goto cleanup;
+	if (!proc_status(hs.b, "Cpus_allowed_list", buf, sizeof(buf)) ||
+	    parse_cpulist(buf, &allowed) ||
+	    (CPU_COUNT(&allowed) == 1 && CPU_ISSET(hs.y, &allowed))) {
+		fprintf(stderr, "Cpus_allowed_list of b is \"%s\" after CPU %d went offline\n", buf,
+			hs.y);
+		goto cleanup;
+	}
+	if (cg_read_strcmp(hs.g, "cpu.concurrency.effective", "1 max\n")) {
+		fprintf(stderr, "the effective limit is not 1 after the unplug\n");
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	held_cleanup(&hs);
+	if (offline >= 0)
+		write_cpu_online(offline, 1);
+	return ret;
+}
+
 #define RT_SM_SPINNERS	3
 
 /*
@@ -2952,18 +5091,34 @@ struct cc_test {
 	T(test_concurrency_bound),
 	T(test_concurrency_decrease),
 	T(test_concurrency_move),
+	T(test_concurrency_hotplug),
 	T(test_concurrency_hard),
 	T(test_concurrency_sleepers),
+	T(test_concurrency_cpuset_class),
+	T(test_concurrency_dormant),
+	T(test_concurrency_deadline),
+	T(test_concurrency_deadline_unadmitted),
+	T(test_concurrency_deadline_domain),
+	T(test_concurrency_isolated),
 	T(test_concurrency_late_child),
 	T(test_concurrency_child_slot),
+	T(test_concurrency_partition_rmdir),
+	T(test_concurrency_child_hard_enable),
 	T(test_concurrency_fork_affinity),
+	T(test_concurrency_offline_affinity),
+	T(test_concurrency_setmove_mask),
+	T(test_concurrency_headroom_setmove),
 	T(test_concurrency_clone_into),
 	T(test_concurrency_self_move),
 	T(test_concurrency_vhost),
 	T(test_concurrency_toggle),
 	T(test_concurrency_smt_spread),
+	T(test_concurrency_dl_setaffinity_in_domain),
+	T(test_concurrency_offline_pinned_running),
+	T(test_concurrency_bandwidth_under_limit),
 	T(test_concurrency_rt_setmove),
 	T(test_concurrency_held_kill),
+	T(test_concurrency_held_offline),
 };
 
 #undef T
