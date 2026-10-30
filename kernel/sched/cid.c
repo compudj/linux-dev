@@ -287,14 +287,25 @@ static inline void cid_complete_transit(struct cid_domain *dom, unsigned int mod
 	WRITE_ONCE(dom->mode, mode);
 }
 
-static inline void cid_transit_to_task(struct cid_user *u, struct cid_pcpu *pcp)
+/*
+ * Transfer the ID which the CPU of @pcp owns to @u, the user which runs
+ * there. Return false if @u does not use that ID.
+ *
+ * A user which runs with a hold pending took no ID at its schedule in, see
+ * conc_task_unplaced(). Its record can still read a CPU-owned ID from an
+ * earlier run. That value is stale: the ID belongs to the CPU where the
+ * user ran then, or it was dropped.
+ */
+static inline bool cid_transit_to_task(struct cid_user *u, struct cid_pcpu *pcp)
 {
-	if (cid_on_cpu(u->cid)) {
-		unsigned int cid = cpu_cid_to_cid(u->cid);
+	unsigned int cid;
 
-		u->cid = cid_to_transit_cid(cid);
-		cid_pcpu_write(pcp, u->cid);
-	}
+	if (!cid_on_cpu(u->cid) || u->cid != pcp->cid)
+		return false;
+	cid = cpu_cid_to_cid(u->cid);
+	u->cid = cid_to_transit_cid(cid);
+	cid_pcpu_write(pcp, u->cid);
+	return true;
 }
 
 static void cid_fixup_cpus_to_tasks(struct cid_domain *dom)
@@ -313,12 +324,11 @@ static void cid_fixup_cpus_to_tasks(struct cid_domain *dom)
 		/* Is the CID still owned by the CPU? */
 		if (cid_on_cpu(pcp->cid)) {
 			/*
-			 * If rq->curr is a user of the domain, transfer it with
-			 * the transition bit set. Otherwise drop it.
+			 * If rq->curr is a user of the domain and uses the
+			 * CID, transfer it with the transition bit set.
+			 * Otherwise drop it.
 			 */
-			if (cu)
-				cid_transit_to_task(cu, pcp);
-			else
+			if (!cu || !cid_transit_to_task(cu, pcp))
 				cid_drop_on_cpu(dom, pcp);
 
 		} else if (cu) {
@@ -332,11 +342,11 @@ static void cid_fixup_cpus_to_tasks(struct cid_domain *dom)
 			 * leaves the task active with no owned CID. Setting the
 			 * transition bit on MM_CID_UNSET would later feed
 			 * clear_bit() an out-of-bounds bit number via
-			 * __cid_schedout(), so exclude it. A CPU-owned
-			 * (MM_CID_ONCPU) CID is handled by the cid_on_cpu()
-			 * branch above and never reaches here.
+			 * __cid_schedout(), so exclude it. Exclude a CPU-owned
+			 * (MM_CID_ONCPU) CID too: the CPU does not own it, so
+			 * it is stale, see cid_transit_to_task().
 			 */
-			if (cid != MM_CID_UNSET && !cid_in_transit(cid)) {
+			if (cid_on_task(cid)) {
 				cid = cid_to_transit_cid(cid);
 				cu->cid = cid;
 				cid_pcpu_write(pcp, cid);

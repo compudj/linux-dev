@@ -340,6 +340,8 @@ void sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags)
 
 static int sched_task_is_throttled(struct task_struct *p, int cpu)
 {
+	if (conc_task_held(p))
+		return 1;
 	if (p->sched_class->task_is_throttled)
 		return p->sched_class->task_is_throttled(p, cpu);
 
@@ -2226,6 +2228,21 @@ inline bool dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 	 * and mark the task ->sched_delayed.
 	 */
 	uclamp_rq_dec(rq, p);
+	if (conc_task_held(p)) {
+		/*
+		 * A held task is out of its class already. A sleep ends the
+		 * hold, see conc_held_blocks().
+		 */
+		if (flags & DEQUEUE_SLEEP) {
+			conc_held_blocks(rq, p);
+			return true;
+		}
+		/*
+		 * For any other dequeue, return the task to its class
+		 * first, see conc_unhold().
+		 */
+		conc_unhold(rq, p, true);
+	}
 	return p->sched_class->dequeue_task(rq, p, flags);
 }
 
@@ -2243,6 +2260,15 @@ void activate_task(struct rq *rq, struct task_struct *p, int flags)
 void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
 {
 	WARN_ON_ONCE(flags & DEQUEUE_SLEEP);
+
+	/*
+	 * A held task is out of its class. Return it there first, as a
+	 * wakeup on this runqueue, while it is still queued for the core.
+	 * The class then sees a plain wakeup and the dequeue below, see
+	 * conc_unhold().
+	 */
+	if (conc_task_held(p))
+		conc_unhold(rq, p, true);
 
 	WRITE_ONCE(p->on_rq, TASK_ON_RQ_MIGRATING);
 	ASSERT_EXCLUSIVE_WRITER(p->on_rq);
@@ -2304,6 +2330,12 @@ void wakeup_preempt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct task_struct *donor = rq->donor;
 
+	/*
+	 * A held task is not in its class, see conc_hold(). There is
+	 * nothing to preempt for.
+	 */
+	if (conc_task_held(p))
+		return;
 	if (p->sched_class == rq->next_class) {
 		rq->next_class->wakeup_preempt(rq, p, flags);
 
@@ -4049,6 +4081,11 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
 			enqueue_task(rq, p, ENQUEUE_NOCLOCK | ENQUEUE_DELAYED);
 		if (proxy_needs_return(rq, p))
 			return 0;
+		/*
+		 * proxy_migrate_task() released the slot of a donor. A donor
+		 * which is back on its own CPU runs here as itself again.
+		 */
+		conc_task_reclaim(p, cpu_of(rq));
 	}
 	if (!task_on_cpu(rq, p)) {
 		/*
@@ -4773,6 +4810,7 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->cid_wait			= 0;
 	p->conc_held			= 0;
 	p->conc_resv_cpu			= -1;
+	INIT_LIST_HEAD(&p->conc_hold_node);
 #endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -7239,6 +7277,21 @@ find_proxy_task(struct rq *rq, struct task_struct *donor, struct rq_flags *rf)
 		 */
 		if (!task_on_rq_queued(owner) || task_cpu(owner) != this_cpu)
 			return NULL;
+
+		/*
+		 * The owner is held by a concurrency limit, see
+		 * conc_hold(). It is queued for the core but dequeued from
+		 * its class. It must not run until the placement work
+		 * returns it to its class. The lock of this runqueue keeps
+		 * it held. Treat it as an owner which cannot run: the donor
+		 * waits for the lock, as it does without proxy execution.
+		 */
+		if (conc_task_held(owner)) {
+			if (curr_in_chain)
+				return proxy_resched_idle(rq);
+			__clear_task_blocked_on(p, NULL);
+			goto deactivate;
+		}
 
 		if (owner == p) {
 			/*

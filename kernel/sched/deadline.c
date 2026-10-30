@@ -1538,8 +1538,11 @@ static enum hrtimer_restart dl_task_timer(struct hrtimer *timer)
 	 *
 	 * We can be both throttled and !queued. Replenish the counter
 	 * but do not enqueue -- wait for our wakeup to do that.
+	 *
+	 * A task held by the concurrency limit of its cgroup is dequeued
+	 * from its class until it is placed. Treat it as not queued.
 	 */
-	if (!task_on_rq_queued(p)) {
+	if (!task_on_rq_queued(p) || conc_task_held(p)) {
 		replenish_dl_entity(dl_se);
 		goto unlock;
 	}

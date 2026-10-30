@@ -17,18 +17,7 @@ static inline bool conc_claim_late(struct task_group *tg, int cpu)
 }
 
 /* Filled in by a later patch. */
-static inline void conc_hold_kick(void)
-{
-}
-
-/* Filled in by a later patch. */
-static inline bool conc_hold_request(struct task_struct *p, u8 why)
-{
-	return false;
-}
-
-/* Filled in by a later patch. */
-static inline bool conc_task_held(struct task_struct *p)
+static inline int conc_make_reachable(struct task_group *tg, const struct cpumask *mask)
 {
 	return false;
 }
@@ -125,6 +114,21 @@ static inline enum conc_claim_result conc_claim(struct task_group *tg, int cpu, 
 
 extern atomic_t conc_nr_held;
 
+extern void conc_hold_kick(void);
+extern void conc_held_blocks(struct rq *rq, struct task_struct *p);
+extern void conc_unhold(struct rq *rq, struct task_struct *p, bool rehold);
+
+/*
+ * Return true if @p is held, see conc_hold(). The caller holds
+ * task_rq(p)->lock. The static key is tested first. The key is turned off
+ * only after every held task was placed, so no task is held while the key
+ * is off.
+ */
+static inline bool conc_task_held(struct task_struct *p)
+{
+	return static_branch_unlikely(&sched_conc_enabled) && unlikely(p->conc_held);
+}
+
 /*
  * Return true if @p is about to be held, see conc_hold_request(). Such a
  * task takes no concurrency ID. If the static key goes off while a request
@@ -191,6 +195,8 @@ static inline void conc_task_release(struct task_struct *p, int cpu)
 
 /* Why a task is to be held at its next return to user space. */
 #define CONC_HOLD_UNPLACED	1	/* it runs without a slot */
+#define CONC_HOLD_EVICT		2	/* its slot is being emptied */
+extern bool conc_hold_request(struct task_struct *p, u8 why);
 
 /*
  * Move the slot of @p from @src to @dst. Return false when the limit
@@ -236,7 +242,7 @@ static inline bool conc_task_move(struct task_struct *p, int src, int dst, bool 
  */
 static inline int conc_task_claim_dst(struct task_struct *p, int dst)
 {
-	if (!conc_task_active(p))
+	if (!conc_task_active(p) || conc_task_held(p))
 		return 0;
 	switch (conc_claim(task_group(p), dst, false, p)) {
 	case CONC_REFUSED:
@@ -256,9 +262,26 @@ static inline void conc_task_unclaim_dst(struct task_struct *p, int dst, int cla
 
 static inline void conc_task_commit_move(struct task_struct *p, int src, int claimed)
 {
+	/* A held task holds no slot. It moves as it is. */
+	if (conc_task_active(p) && conc_task_held(p))
+		return;
 	conc_task_release(p, src);
 	if (claimed > 0)
 		p->conc_accounted = 1;
+}
+
+/*
+ * Claim a slot on @cpu for @p, which is queued there without one. If the
+ * limit refuses, ask for a hold. The caller holds p->pi_lock and the
+ * runqueue lock.
+ */
+static inline void conc_task_reclaim(struct task_struct *p, int cpu)
+{
+	if (!static_branch_unlikely(&sched_conc_enabled) || p->conc_accounted ||
+	    conc_task_held(p))
+		return;
+	if (!conc_task_claim(p, cpu))
+		conc_hold_request(p, CONC_HOLD_UNPLACED);
 }
 
 extern void __init conc_init_root(void);
@@ -329,6 +352,14 @@ static inline int conc_task_claim_dst(struct task_struct *p, int dst) { return 0
 static inline void conc_task_unclaim_dst(struct task_struct *p, int dst, int claimed) { }
 
 static inline void conc_task_commit_move(struct task_struct *p, int src, int claimed) { }
+
+static inline void conc_task_reclaim(struct task_struct *p, int cpu) { }
+
+static inline bool conc_task_held(struct task_struct *p) { return false; }
+
+static inline void conc_held_blocks(struct rq *rq, struct task_struct *p) { }
+
+static inline void conc_unhold(struct rq *rq, struct task_struct *p, bool rehold) { }
 
 static __always_inline bool conc_task_unplaced(struct task_struct *p) { return false; }
 

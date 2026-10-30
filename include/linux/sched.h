@@ -989,9 +989,10 @@ struct task_struct {
 	 */
 	u8				conc_accounted;
 	/*
-	 * Running without a slot (CONC_HOLD_UNPLACED), or on one that is being
-	 * emptied (CONC_HOLD_EVICT): held off the CPUs at the next return to
-	 * user space, see conc_hold_request(). Takes no concurrency ID.
+	 * Set when the task runs without a slot (CONC_HOLD_UNPLACED), or on
+	 * a slot which is being emptied (CONC_HOLD_EVICT). The task is held
+	 * at its next return to user space, see conc_hold_request() and
+	 * conc_hold_resume(). It takes no concurrency ID meanwhile.
 	 */
 	u8				conc_hold_pending;
 	/*
@@ -1008,6 +1009,7 @@ struct task_struct {
 	u8				conc_held;
 	/* The CPU of a slot reserved for this task's arrival, -1 when none. */
 	int				conc_resv_cpu;
+	struct list_head		conc_hold_node;
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
 #ifdef CONFIG_PREEMPT_RCU
@@ -2599,18 +2601,24 @@ extern void migrate_enable(void);
 DEFINE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
+extern void conc_fatal_signal(struct task_struct *t);
+extern void conc_hold_resume(void);
 extern void sched_cid_resume(void);
 
 /*
- * From resume_user_mode_work(): the task found no concurrency ID free
- * below a bound at its schedule in, and takes or waits for one now.
+ * Called from resume_user_mode_work(). First hold the task if a hold of the
+ * concurrency limit is pending. Then, if the task found no free concurrency
+ * ID below its bound when it was scheduled in, take one or wait for one.
  */
 static inline void sched_conc_resume_user_mode(void)
 {
+	if (unlikely(READ_ONCE(current->conc_hold_pending)))
+		conc_hold_resume();
 	if (unlikely(READ_ONCE(current->cid_wait)))
 		sched_cid_resume();
 }
 #else /* !CONFIG_SCHED_MAX_CONCURRENCY */
 static inline void sched_conc_resume_user_mode(void) { }
+static inline void conc_fatal_signal(struct task_struct *t) { }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 #endif

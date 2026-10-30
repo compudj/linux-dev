@@ -13,7 +13,7 @@
 #include <linux/stop_machine.h>
 #include <linux/ipc_namespace.h>
 #include <linux/nsproxy.h>
-#include <linux/task_work.h>
+#include <linux/resume_user_mode.h>
 #include "sched.h"
 #include "smp.h"
 #include <trace/events/sched.h>
@@ -60,6 +60,7 @@ struct conc_resv {
  * p->pi_lock and rq->lock, never the other way.
  */
 DEFINE_STATIC_KEY_FALSE(sched_conc_enabled);
+static DECLARE_SWAIT_QUEUE_HEAD(conc_held_wq);	/* woken from conc_held_wake_work */
 DEFINE_PER_CPU(const struct cpumask *, conc_select_cpus);
 static DEFINE_PER_CPU(cpumask_var_t, conc_select_mask);
 static DEFINE_PER_CPU(cpumask_var_t, conc_entitled_mask);
@@ -104,7 +105,78 @@ static struct task_group *conc_pin_task_group(struct task_struct *p);
 
 static void conc_notify_tree(struct task_group *top);
 
+
+/*
+ * Holding
+ *
+ * A task which finds no CPU within its group's bound does not run
+ * user-space code beyond it.
+ *
+ * The task finds no slot during a wakeup, a migration or a group change. It
+ * may hold locks there, conc_mutex among them, so it cannot stop. It runs
+ * the kernel-mode part without a slot and takes no concurrency ID, see
+ * conc_task_unplaced(). It is held at its next return to user space. The
+ * per-task throttle of CFS bandwidth parks tasks in the same way.
+ *
+ * A held task is:
+ *  - dequeued from its class, in TASK_RUNNING;
+ *  - still queued for the core: p->on_rq, PSI, uclamp and the load it
+ *    migrates with are unchanged;
+ *  - on conc_held_list until a slot of its mask frees.
+ *
+ * The class sees a sleep at the hold and a wakeup at the placement. It sees
+ * nothing else:
+ *  - a held task which blocks is a plain sleeper, see conc_held_blocks();
+ *  - the core returns the task to its class before it migrates it or
+ *    changes its class, priority or group. A new hold is requested, see
+ *    conc_unhold().
+ *
+ * Kernel threads never return to user space. They are never held and run
+ * without a slot.
+ *
+ * CONC_HOLD_EVICT uses the same hold for the tasks of a slot which is being
+ * emptied.
+ *
+ * SIGKILL ends a hold, or prevents one. The task goes to do_exit() with or
+ * without a slot. Its hold stays pending, so that it takes no ID on the
+ * way, see conc_fatal_signal().
+ *
+ * Placement
+ *
+ * conc_hold_work_fn() places the held tasks with a selection as for a
+ * wakeup. conc_hold_kick() queues it after an event which can make room:
+ *  - a slot empties or is removed;
+ *  - a reservation is settled;
+ *  - a set-move or a retry ran;
+ *  - the mask or the group of a held task changed;
+ *  - a CPU went online or offline.
+ *
+ * For a held task the selection never returns a CPU without a slot. The
+ * task stays held when nothing within the bound fits.
+ */
+static LIST_HEAD(conc_held_list);
+static DEFINE_RAW_SPINLOCK(conc_hold_lock);
 atomic_t conc_nr_held;
+
+static void conc_hold_work_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(conc_hold_work, conc_hold_work_fn);
+
+static void conc_hold_irq_work_fn(struct irq_work *work);
+static struct irq_work conc_hold_irq_work = IRQ_WORK_INIT_HARD(conc_hold_irq_work_fn);
+
+/*
+ * Wake the waiter on conc_held_wq when the last held task is let go. The
+ * static key is turned off only once no task is held.
+ *
+ * An irq_work is used because the hold ends under the pi_lock and the
+ * runqueue lock of the held task. The wakeup takes the same locks of the
+ * waiter, which may be on the same runqueue.
+ */
+static void conc_held_wake_fn(struct irq_work *work)
+{
+	swake_up_one(&conc_held_wq);
+}
+static struct irq_work conc_held_wake_work = IRQ_WORK_INIT_HARD(conc_held_wake_fn);
 
 static inline bool conc_cpu_usable(int cpu)
 {
@@ -1545,6 +1617,18 @@ static __maybe_unused int conc_resv_cpu(struct conc_resv *resv)
 	return resv->cpu;
 }
 
+static void conc_hold_irq_work_fn(struct irq_work *work)
+{
+	mod_delayed_work(system_dfl_wq, &conc_hold_work, 0);
+}
+
+/* Run the placement work after an event which may let a held task in. */
+void conc_hold_kick(void)
+{
+	if (atomic_read(&conc_nr_held))
+		irq_work_queue(&conc_hold_irq_work);
+}
+
 #ifndef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
 static inline void conc_debug_hold_start(struct task_struct *p) { }
 
@@ -1554,21 +1638,442 @@ static inline void conc_debug_hold_end(struct task_struct *p, const char *how) {
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 
 /*
+ * Ask for @p to be held at its next return to user space, for @why. Return
+ * false if @p cannot be held. The caller holds p->pi_lock.
+ *
+ * The hold runs from resume_user_mode_work(), see conc_hold_resume(). No
+ * lock is held there. The over-high throttling of memcg waits in the same
+ * place. A task work is not used: task_work_run() has callers which hold
+ * locks, such as the SQPOLL thread of io_uring under its ring's lock.
+ *
+ * A task which cannot be held runs on without a slot and takes no
+ * concurrency ID:
+ *  - A kernel thread never returns to user space.
+ *  - An io_uring worker (PF_IO_WORKER) is not held. The SQPOLL thread runs
+ *    the work of that return under its ring's lock when it tears the ring
+ *    down.
+ *  - An exiting task (PF_EXITING) never returns to user space. do_exit()
+ *    calls sched_mm_cid_exit() before exit_signals() sets the flag, so the
+ *    task has left its ID domains.
+ *
+ * A kernel thread, an io_uring worker and a vhost worker are users of no ID
+ * domain, see sched_mm_cid_fork().
+ *
+ * A vhost worker is held. It runs the work of that return at the top of its
+ * loop, where nothing is locked.
+ */
+bool conc_hold_request(struct task_struct *p, u8 why)
+{
+	lockdep_assert_held(&p->pi_lock);
+	if (p->conc_hold_pending) {
+		p->conc_hold_pending |= why;
+		return true;
+	}
+	if (p->flags & (PF_KTHREAD | PF_IO_WORKER | PF_EXITING))
+		return false;
+	p->conc_hold_pending = why;
+	/*
+	 * The store above and set_notify_resume() are fully ordered against
+	 * resume_user_mode_work(), which clears the flag before it reads
+	 * conc_hold_pending.
+	 */
+	set_notify_resume(p);
+	return true;
+}
+
+/*
  * @p is current. Take the IDs which it did not take while a hold was
  * pending. These IDs are given outside a context switch. The exit to user
  * space writes changed IDs only after a context switch, and clears the
  * change otherwise. So force the rseq update here.
+ *
+ * Skip a domain in which @p owns a transit ID. A mode switch gave it to
+ * @p while it runs, see cid_transit_to_cpu(). A schedule in never finds
+ * such an ID on the task: the schedule out before it converts it. Running
+ * one over it would allocate a second ID, or lose the first one when no
+ * other ID is free.
  */
-static __maybe_unused void conc_cid_refresh(struct task_struct *p)
+static void conc_cid_refresh(struct task_struct *p)
 {
 #ifdef CONFIG_SCHED_MM_CID
-	mm_cid_schedin(p);
+	if (!cid_in_transit(p->mm_cid.cid))
+		mm_cid_schedin(p);
 	rseq_force_update();
 #endif
 }
 
+/*
+ * Hold @p, which is current. The caller holds task_rq_lock().
+ *
+ * Dequeue @p from its class. It stays queued for the core, in TASK_RUNNING.
+ * It is not asleep, so a wakeup does not touch it. The placement work
+ * enqueues it again.
+ */
+static void conc_hold(struct rq *rq, struct task_struct *p)
+{
+	lockdep_assert_held(&p->pi_lock);
+	lockdep_assert_rq_held(rq);
+	WARN_ON_ONCE(p != current || p->conc_held || !task_on_rq_queued(p));
+
+	/*
+	 * Dequeue from the class only. The accounting of the core stays,
+	 * see dequeue_task().
+	 */
+	WARN_ON_ONCE(!p->sched_class->dequeue_task(rq, p, DEQUEUE_SLEEP | DEQUEUE_SPECIAL |
+						     DEQUEUE_NOCLOCK));
+	conc_task_release(p, cpu_of(rq));
+	p->conc_held = 1;
+	conc_debug_hold_start(p);
+	get_task_struct(p);
+	atomic_inc(&conc_nr_held);
+	/*
+	 * The placement work may have listed it already, see
+	 * conc_hold_work_fn().
+	 */
+	scoped_guard(raw_spinlock, &conc_hold_lock) {
+		if (list_empty(&p->conc_hold_node))
+			list_add_tail(&p->conc_hold_node, &conc_held_list);
+	}
+	/* Room may exist already, elsewhere in its mask. */
+	conc_hold_kick();
+	resched_curr(rq);
+}
+
+/*
+ * End the hold of @p because it blocks. Called from dequeue_task() with
+ * DEQUEUE_SLEEP, under the runqueue lock. @p is a plain sleeper from here
+ * on. Its wakeup places it.
+ */
+void conc_held_blocks(struct rq *rq, struct task_struct *p)
+{
+	lockdep_assert_rq_held(rq);
+	p->conc_held = 0;
+	conc_debug_hold_stop(p);
+	conc_debug_hold_end(p, "blocked");
+	scoped_guard(raw_spinlock, &conc_hold_lock)
+		list_del_init(&p->conc_hold_node);
+	if (atomic_dec_and_test(&conc_nr_held))
+		irq_work_queue(&conc_held_wake_work);
+	put_task_struct(p);
+}
+
+/*
+ * End the hold of @p. Enqueue it in its class on its runqueue, as a wakeup.
+ * The caller holds the runqueue lock.
+ *
+ * The class saw a sleep at the hold. A wakeup on the same runqueue keeps
+ * the bookkeeping of the class right (deadline bandwidth and timers, load
+ * tracking). What the core does next is then done to a queued task: a
+ * migration, or a class change with switched_from() and switched_to().
+ *
+ * With @rehold, a new hold is requested and @p goes on without a slot until
+ * its return to user space.
+ *
+ * Callers:
+ *  - dequeue_task() with @rehold, for every dequeue which is not a sleep;
+ *  - deactivate_task() with @rehold;
+ *  - conc_try_place() without @rehold, when it has a slot for @p;
+ *  - conc_try_place() with @rehold, for a task with SIGKILL pending.
+ */
+void conc_unhold(struct rq *rq, struct task_struct *p, bool rehold)
+{
+	int on_rq = p->on_rq;
+
+	lockdep_assert_rq_held(rq);
+	/*
+	 * @p must be queued for the core, so that the class sees a wakeup,
+	 * see deactivate_task().
+	 */
+	WARN_ON_ONCE(on_rq != TASK_ON_RQ_QUEUED);
+	p->conc_held = 0;
+	conc_debug_hold_stop(p);
+	p->sched_class->enqueue_task(rq, p, ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK);
+	/*
+	 * A wakeup or a migration reschedules the target CPU. A change made
+	 * in place does not: a priority change, or a cpuset widened by a
+	 * CPU coming online. An idle CPU would then never pick the task. So
+	 * reschedule here.
+	 */
+	if (!task_current(rq, p))
+		resched_curr(rq);
+	scoped_guard(raw_spinlock, &conc_hold_lock)
+		list_del_init(&p->conc_hold_node);
+	if (atomic_dec_and_test(&conc_nr_held))
+		irq_work_queue(&conc_held_wake_work);
+	if (rehold)
+		conc_hold_request(p, CONC_HOLD_UNPLACED);
+	else
+		conc_debug_hold_end(p, "placed");
+	put_task_struct(p);
+}
+
+/*
+ * Hold current if a hold is pending, see conc_hold_request().
+ *
+ * Called from resume_user_mode_work(), before the rseq update which writes
+ * the concurrency IDs. A vhost worker calls it at the top of its loop.
+ *
+ * A task which is held schedules out here and comes back when it is placed.
+ * The rest of the work, the rseq update included, then runs with the IDs it
+ * took. If the task was moved instead, a new hold was requested with the
+ * same notification. The exit to user space checks it again.
+ */
+void conc_hold_resume(void)
+{
+	struct task_struct *p = current;
+	u8 why;
+
+	if (p->flags & PF_EXITING) {
+		if (IS_ENABLED(CONFIG_SCHED_MAX_CONCURRENCY_DEBUG)) {
+			scoped_guard(task_rq_lock, p)
+				conc_debug_hold_end(p, "exiting");
+		}
+		return;
+	}
+	scoped_guard(task_rq_lock, p) {
+		why = p->conc_hold_pending;
+		if (!why)
+			return;
+		/* Never held with SIGKILL pending, see conc_fatal_signal(). */
+		if (fatal_signal_pending(p)) {
+			conc_debug_hold_end(p, "killed");
+			return;
+		}
+		p->conc_hold_pending = 0;
+		/*
+		 * Do not hold @p in two cases. Its group does not count any
+		 * more: a limit was removed, and the key may be off. This
+		 * applies to a hold for an eviction too. Or @p has a slot, or
+		 * can claim one on its CPU: a load balancer move, a group
+		 * change or a set-move may have placed it. The second case
+		 * does not apply when that CPU is being emptied
+		 * (CONC_HOLD_EVICT).
+		 */
+		if (!conc_task_active(p) ||
+		    (!(why & CONC_HOLD_EVICT) &&
+		     (p->conc_accounted || conc_task_claim(p, task_cpu(p))))) {
+			conc_debug_hold_end(p, "placed at its return");
+			conc_cid_refresh(p);
+			return;
+		}
+		update_rq_clock(scope.rq);
+		conc_hold(scope.rq, p);
+	}
+	/*
+	 * @p is out of its class. Schedule out until it is placed, or until
+	 * a move ends the hold.
+	 */
+	if (READ_ONCE(p->conc_held))
+		schedule();
+}
+
+/**
+ * conc_fatal_signal - let a held task with SIGKILL pending go
+ * @t: the task. Called from signal_wake_up_state() under its siglock.
+ *
+ * A held task is not asleep, so the wakeup of the signal does not reach it.
+ * It would only die once a slot frees.
+ *
+ * A task with SIGKILL pending is never held, see conc_hold_resume(). A task
+ * which is already held is let go: the placement work returns it to its
+ * class without a slot, see conc_try_place().
+ *
+ * In both cases the hold stays pending, so the task takes no concurrency
+ * ID, see conc_task_unplaced(). The exit to user space delivers the signal
+ * before the task leaves the kernel. On architectures without the generic
+ * entry code, the rseq update can run before that.
+ * rseq_slowpath_update_usr() skips a task with SIGKILL pending. do_exit()
+ * then removes the task from its ID domains.
+ *
+ * Until it exits, the task may run on a CPU beyond the bound, without an
+ * ID.
+ *
+ * p->pi_lock orders this against the hold. Either conc_hold_resume() sees
+ * SIGKILL pending, or this function sees conc_held set.
+ */
+void conc_fatal_signal(struct task_struct *t)
+{
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return;
+	guard(raw_spinlock_irqsave)(&t->pi_lock);
+	if (t->conc_held && fatal_signal_pending(t))
+		conc_hold_kick();
+}
+
+/*
+ * Try to place held task @p.
+ *
+ * Select a CPU as for a wakeup, under p->pi_lock only, as try_to_wake_up()
+ * does. The runqueue lock is not held then, because the selection may take
+ * it to change the task's mask (a fallback widening, see
+ * conc_select_account()). Then take the runqueue lock and move the task as
+ * move_queued_task() does.
+ *
+ * Return 1 if @p was placed or is not held any more. Return 0 if it stays
+ * held. Return -EAGAIN if it is still on its CPU, about to schedule out.
+ */
+static int conc_try_place(struct task_struct *p)
+{
+	int wake_flags = WF_TTWU, cpu, ret;
+	struct rq_flags rf;
+	struct rq *rq;
+
+	guard(raw_spinlock_irqsave)(&p->pi_lock);
+
+	if (!p->conc_held)
+		return 1;
+	/* Pairs with the release of p->on_cpu in finish_task(). */
+	if (smp_load_acquire(&p->on_cpu))
+		return -EAGAIN;
+	/*
+	 * SIGKILL is pending, see conc_fatal_signal(). Let @p go where it
+	 * is, without a slot. If its CPU went offline while it was held,
+	 * move it to a fallback CPU, as balance_push() would have done.
+	 *
+	 * A held task is out of its class. It does not move under its
+	 * runqueue lock alone, so task_cpu() is stable here.
+	 */
+	if (fatal_signal_pending(p)) {
+		cpu = cpu_active(task_cpu(p)) ? -1 : select_fallback_rq(task_cpu(p), p);
+		rq = __task_rq_lock(p, &rf);
+		if (p->conc_held) {
+			update_rq_clock(rq);
+			conc_unhold(rq, p, true);
+			if (cpu >= 0 && !cpu_active(cpu_of(rq)))
+				rq = __migrate_task(rq, &rf, p, cpu, true);
+			else
+				wakeup_preempt(rq, p, 0);
+		}
+		rq_unlock(rq, &rf);
+		return 1;
+	}
+	/*
+	 * The last active CPU of @p's mask went offline while @p was held.
+	 *
+	 * Nothing else widens @p. balance_push() pushes the tasks which are
+	 * queued in a class on the CPU going offline. A held task is not in
+	 * its class, and it may be on another runqueue. The hotplug pass of
+	 * its cpuset comes later, and gives a task of the top cpuset no
+	 * CPU.
+	 *
+	 * So do what select_fallback_rq() does for a queued task: widen the
+	 * mask. The change of the mask ends the hold and requests a new
+	 * one, see conc_unhold(). Then move @p off the inactive runqueue,
+	 * without a slot if needed. @p is held again at its return to user
+	 * space and placed by its new mask.
+	 *
+	 * @p may already run when the runqueue lock is taken again.
+	 * __migrate_task() does not move a running task. balance_push()
+	 * moves it then.
+	 */
+	if (!cpumask_intersects(p->cpus_ptr, cpu_active_mask)) {
+		cpu = select_fallback_rq(task_cpu(p), p);
+		rq = __task_rq_lock(p, &rf);
+		if (task_on_rq_queued(p) && !p->conc_held && !cpu_active(cpu_of(rq)) &&
+		    !task_on_cpu(rq, p)) {
+			update_rq_clock(rq);
+			rq = __migrate_task(rq, &rf, p, cpu, true);
+		}
+		rq_unlock(rq, &rf);
+		return 1;
+	}
+	cpu = select_task_rq(p, task_cpu(p), &wake_flags);
+	if (cpu < 0)
+		return 0;
+
+	rq = __task_rq_lock(p, &rf);
+	if (!p->conc_held) {
+		/*
+		 * @p is not held any more. Either it blocked, and its
+		 * wakeup will place it: give the slot back. Or the widening
+		 * of the selection ended its hold, and no slot was claimed.
+		 */
+		conc_task_release(p, cpu);
+		ret = 1;
+		goto out;
+	}
+	update_rq_clock(rq);
+	/* Wake @p up where it is. Then move it as move_queued_task() does. */
+	conc_unhold(rq, p, false);
+	if (cpu != cpu_of(rq)) {
+		deactivate_task(rq, p, DEQUEUE_NOCLOCK);
+		set_task_cpu(p, cpu);
+		rq_unlock(rq, &rf);
+		rq = cpu_rq(cpu);
+		rq_lock(rq, &rf);
+		update_rq_clock(rq);
+		activate_task(rq, p, ENQUEUE_NOCLOCK);
+		wake_flags |= WF_MIGRATED;
+	}
+	wakeup_preempt(rq, p, wake_flags);
+	ret = 1;
+out:
+	rq_unlock(rq, &rf);
+	return ret;
+}
+
+static void conc_hold_work_fn(struct work_struct *work)
+{
+	bool again = false;
+	int todo;
+
+	for (todo = atomic_read(&conc_nr_held); todo > 0; todo--) {
+		struct task_struct *p = NULL;
+		cpumask_var_t mask;
+		int ret;
+
+		scoped_guard(raw_spinlock_irq, &conc_hold_lock) {
+			p = list_first_entry_or_null(&conc_held_list, struct task_struct,
+						     conc_hold_node);
+			if (p) {
+				list_del_init(&p->conc_hold_node);
+				get_task_struct(p);
+			}
+		}
+		if (!p)
+			break;
+		ret = conc_try_place(p);
+		if (!ret && alloc_cpumask_var(&mask, GFP_KERNEL)) {
+			struct task_group *tg = conc_pin_task_group(p);
+
+			/*
+			 * Nothing fits: make a CPU of its mask reachable, as an
+			 * affinity change does for a sleeper, and try once more.
+			 */
+			if (tg) {
+				scoped_guard(raw_spinlock_irq, &p->pi_lock)
+					cpumask_copy(mask, p->cpus_ptr);
+				mutex_lock(&conc_mutex);
+				conc_make_reachable(tg, mask);
+				mutex_unlock(&conc_mutex);
+				ret = conc_try_place(p);
+				css_put(&tg->css);
+			}
+			free_cpumask_var(mask);
+		}
+		if (ret <= 0) {
+			/*
+			 * The task is still held, or was held again: a
+			 * migration ended its hold and it was held at its next
+			 * return to user space. In the second case conc_hold()
+			 * may have put it on the list already. Add it only if
+			 * it is not on the list.
+			 */
+			scoped_guard(raw_spinlock_irq, &conc_hold_lock) {
+				if (READ_ONCE(p->conc_held) && list_empty(&p->conc_hold_node))
+					list_add_tail(&p->conc_hold_node, &conc_held_list);
+			}
+			if (ret < 0)
+				again = true;
+		}
+		put_task_struct(p);
+	}
+	if (again)
+		mod_delayed_work(system_dfl_wq, &conc_hold_work, 1);
+}
+
 /* Return the group of @p with a reference, or NULL if it does not count. */
-static __maybe_unused struct task_group *conc_pin_task_group(struct task_struct *p)
+static struct task_group *conc_pin_task_group(struct task_struct *p)
 {
 	struct task_group *tg;
 
