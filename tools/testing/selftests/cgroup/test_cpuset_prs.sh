@@ -260,6 +260,10 @@ TEST_MATRIX=(
 	"$SETUP_A123_PARTITIONS    .    T:O1=0  O2=0   O1=1    .     0 A1:1|A2:|A3:3 A1:P1|A2:P1|A3:P1"
 	"$SETUP_A123_PARTITIONS    .    T:O1=0  O2=0   O2=1    .     0 A1:2-3|A2:2-3|A3:3 A1:P1|A2:P-1|A3:P-1"
 
+	# A partition root revalidated while some of its CPUs are still offline
+	# keeps them from the top cpuset when they come back online.
+	"  C2-3:P1   .      .      .    T:O2=0  O3=0   O2=1  O3=1:C3-4 0 A1:2-3|B1:4 A1:P1"
+
 	#  old-A1 old-A2 old-A3 old-B1 new-A1 new-A2 new-A3 new-B1 fail ECPUs Pstate ISOLCPUS
 	#  ------ ------ ------ ------ ------ ------ ------ ------ ---- ----- ------ --------
 	#
