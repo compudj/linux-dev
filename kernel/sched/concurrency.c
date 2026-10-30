@@ -791,6 +791,24 @@ static bool conc_task_mask_behind(struct task_struct *p)
 }
 
 /*
+ * Return true if every active CPU of @p's mask is going offline. The unplug
+ * will widen the mask of such a task. Kernel threads and tasks with
+ * migration disabled are excluded.
+ */
+static bool conc_task_pinned_offlining(struct task_struct *p)
+{
+	int c;
+
+	if (p->flags & PF_KTHREAD || is_migration_disabled(p))
+		return false;
+	for_each_cpu_and(c, p->cpus_ptr, cpu_active_mask) {
+		if (!cpumask_test_cpu(c, &conc_offlining_cpus))
+			return false;
+	}
+	return true;
+}
+
+/*
  * Mark @p as the holder of the slot claimed for it on @cpu.
  *
  * A task being woken up or forked is not queued. p->pi_lock keeps every
@@ -4536,6 +4554,170 @@ static void conc_retry(struct task_group *tg)
 	mutex_unlock(&conc_mutex);
 }
 
+/* Return true if @mask has an active CPU other than @cpu. */
+static bool conc_other_active_cpu(const struct cpumask *mask, int cpu)
+{
+	return cpumask_any_and_but(mask, cpu_active_mask, cpu) < nr_cpu_ids;
+}
+
+/*
+ * Widen the masks of the tasks of @tg's subtree which are queued on @cpu
+ * and have no other active CPU in their mask. Give them now the mask which
+ * select_fallback_rq() would give them when balance_push() pushes them.
+ * They can then move with their group.
+ *
+ * A sleeping task keeps its mask, as it does without a limit.
+ * select_fallback_rq() widens it only if it wakes up before the CPU comes
+ * back. During suspend it does not wake up.
+ */
+static void conc_widen_pinned(struct task_group *tg, int cpu)
+{
+	struct cgroup_subsys_state *css;
+
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &tg->css) {
+		struct css_task_iter it;
+		struct task_struct *t;
+
+		if (!cpumask_test_cpu(cpu, css_tg(css)->conc.used) || !css_tryget_online(css))
+			continue;
+		rcu_read_unlock();
+		css_task_iter_start(css, 0, &it);
+		while ((t = css_task_iter_next(&it))) {
+			bool widened = false;
+
+			if (task_cpu(t) != cpu || t->flags & PF_KTHREAD)
+				continue;
+			scoped_guard(raw_spinlock_irq, &t->pi_lock) {
+				/*
+				 * Skip a sleeping task. p->pi_lock keeps a
+				 * wakeup from queueing it meanwhile. Skip a
+				 * task with migration disabled: it is pinned
+				 * for a short time only, and balance_push()
+				 * leaves it alone too. @cpu is still active, so
+				 * leave it out when looking for another active
+				 * CPU in the mask.
+				 */
+				if (!READ_ONCE(t->on_rq) || is_migration_disabled(t) ||
+				    conc_other_active_cpu(&t->cpus_mask, cpu))
+					break;
+				if (!cpuset_cpus_allowed_fallback(t) ||
+				    !conc_other_active_cpu(t->cpus_ptr, cpu))
+					set_cpus_allowed_force(t, task_cpu_fallback_mask(t));
+				widened = true;
+			}
+			if (widened && t->mm && printk_ratelimit())
+				printk_deferred("process %d (%s) no longer affine to cpu%d\n",
+						task_pid_nr(t), t->comm, cpu);
+		}
+		css_task_iter_end(&it);
+		rcu_read_lock();
+		css_put(css);
+	}
+	rcu_read_unlock();
+}
+
+/*
+ * Move the limited groups off @cpu before it goes offline.
+ *
+ * Called from sched_cpu_deactivate() while the CPU is still active, before
+ * balance_push() pushes its tasks away. Evict the CPU from every topmost
+ * counting group: tasks join, are set-moved or are held. A set-move covers
+ * the subtree.
+ *
+ * The eviction can fail, for example for a kernel thread or a task with
+ * migration disabled. Its result is not checked. balance_push() then moves
+ * what is left, without a slot if the limit refuses the destination.
+ *
+ * New slots on the CPU are refused from here until conc_cpu_offline(). The
+ * CPU is still active, so a task which wakes up with no other CPU lands on
+ * it as a late arrival. The set-move takes it along. Otherwise it would run
+ * elsewhere without a slot.
+ */
+void conc_cpu_deactivate(unsigned int cpu)
+{
+	struct task_group *tg;
+
+	cpumask_set_cpu(cpu, &conc_offlining_cpus);
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return;
+	/*
+	 * Wait for the claims which started before the CPU was set in
+	 * conc_offlining_cpus. Their slots are then visible in the used
+	 * sets tested below.
+	 */
+	synchronize_rcu_expedited();
+
+	mutex_lock(&conc_mutex);
+	rcu_read_lock();
+	list_for_each_entry_rcu(tg, &task_groups, list) {
+		if (!conc_active(&tg->conc) || !cpumask_test_cpu(cpu, tg->conc.used))
+			continue;
+		if (tg->parent && conc_active(&tg->parent->conc))
+			continue;
+		if (!css_tryget_online(&tg->css))
+			continue;
+		rcu_read_unlock();
+		/* The reference pins the list entry, see sched_release_group(). */
+		conc_widen_pinned(tg, cpu);
+		conc_evict_cpu(tg, cpu, true, true, NULL, NULL, NULL);
+		rcu_read_lock();
+		css_put(&tg->css);
+	}
+	rcu_read_unlock();
+	mutex_unlock(&conc_mutex);
+}
+
+/*
+ * @cpu is online again. Set the state of its SMT core in the unused_cores
+ * mask of every group. The core is unused if the group uses no CPU of it,
+ * and used otherwise.
+ *
+ * conc_used_add() and conc_used_del() update unused_cores with
+ * cpu_smt_mask(). That mask did not hold @cpu for its siblings while @cpu
+ * was offline.
+ */
+static void conc_core_online(int cpu)
+{
+	const struct cpumask *core = cpu_smt_mask(cpu);
+	struct task_group *tg;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(tg, &task_groups, list) {
+		struct tg_concurrency *conc = &tg->conc;
+		unsigned long flags;
+
+		/*
+		 * The group never counted and has no masks. If it allocates
+		 * them now, every core starts unused.
+		 */
+		if (!smp_load_acquire(&conc->present))
+			continue;
+		raw_spin_lock_irqsave(&conc->lock, flags);
+		if (cpumask_intersects(core, conc->used))
+			cpumask_andnot(conc->unused_cores, conc->unused_cores, core);
+		else
+			cpumask_or(conc->unused_cores, conc->unused_cores, core);
+		raw_spin_unlock_irqrestore(&conc->lock, flags);
+	}
+	rcu_read_unlock();
+}
+
+/*
+ * Called when @cpu comes online, or when its deactivation is rolled back.
+ * Slots may be added on it again.
+ */
+void conc_cpu_activate(unsigned int cpu)
+{
+	cpumask_clear_cpu(cpu, &conc_offlining_cpus);
+	/*
+	 * Do this whether or not a group counts now. A used set outlives
+	 * counting.
+	 */
+	conc_core_online(cpu);
+	conc_hold_kick();
+}
+
 /* Is a limit of @top's subtree stalled? Under RCU. */
 static bool conc_subtree_needs_retry(struct task_group *top)
 {
@@ -4546,6 +4728,67 @@ static bool conc_subtree_needs_retry(struct task_group *top)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * Finish the unplug of @cpu. Called from sched_cpu_wait_empty().
+ *
+ * The runqueue is empty, so the slots on the CPU are idle, except for the
+ * cases listed below. Drop the CPU from every used set. Then retry the
+ * groups which the unplug left over their limit.
+ */
+void conc_cpu_offline(unsigned int cpu)
+{
+	struct task_group *tg;
+
+	if (!static_branch_unlikely(&sched_conc_enabled)) {
+		cpumask_clear_cpu(cpu, &conc_offlining_cpus);
+		return;
+	}
+
+	mutex_lock(&conc_mutex);
+	rcu_read_lock();
+	list_for_each_entry_rcu(tg, &task_groups, list) {
+		if (!conc_active(&tg->conc) || !cpumask_test_cpu(cpu, tg->conc.used))
+			continue;
+		if (!css_tryget_online(&tg->css))
+			continue;
+		rcu_read_unlock();
+		/*
+		 * The reference pins the list entry, see
+		 * sched_release_group().
+		 *
+		 * The drain can fail, because a slot can keep an entity:
+		 *  - a throttled deadline task, which its replenishment
+		 *    timer moves later, see dl_task_offline_migration();
+		 *  - a reservation in flight, which conc_resv_finish()
+		 *    settles.
+		 * The slot then stays until its owner leaves it.
+		 */
+		conc_drain_cpu(tg, cpu);
+		rcu_read_lock();
+		css_put(&tg->css);
+	}
+	/*
+	 * Retry the limits which the unplug left over the limit. A retry
+	 * walks the whole subtree of a topmost counting group, so run it once
+	 * per topmost group, after every slot was drained.
+	 */
+	list_for_each_entry_rcu(tg, &task_groups, list) {
+		if (!conc_active(&tg->conc) ||
+		    (tg->parent && conc_active(&tg->parent->conc)))
+			continue;
+		if (!conc_subtree_needs_retry(tg) || !css_tryget_online(&tg->css))
+			continue;
+		rcu_read_unlock();
+		__conc_retry(tg);
+		rcu_read_lock();
+		css_put(&tg->css);
+	}
+	rcu_read_unlock();
+	cpumask_clear_cpu(cpu, &conc_offlining_cpus);
+	mutex_unlock(&conc_mutex);
+	conc_hold_kick();
 }
 
 /* Return the group of @p with a reference, or NULL if it does not count. */
