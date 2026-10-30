@@ -1152,6 +1152,15 @@ void cpuset_update_tasks_cpumask(struct cpuset *cs, struct cpumask *new_cpus)
 	struct task_struct *task;
 	bool top_cs = cs == &top_cpuset;
 
+	/* Concurrency limited groups move into the new mask as a whole first. */
+	if (!top_cs) {
+		conc_cpuset_update(&cs->css, cs->effective_cpus);
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+		/* Registered with the configured CPUs, see cpuset_conc_reregister(). */
+		cs->conc.changed = false;
+#endif
+	}
+
 	css_task_iter_start(&cs->css, 0, &it);
 	while ((task = css_task_iter_next(&it))) {
 		const struct cpumask *possible_mask = task_cpu_possible_mask(task);
@@ -2513,9 +2522,11 @@ static void partition_cpus_change(struct cpuset *cs, struct cpuset *trialcs,
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 static void cpuset_conc_refresh(void);
+static void cpuset_conc_reregister(void);
 static void cpuset_conc_online(struct cpuset *cs);
 #else /* !CONFIG_SCHED_MAX_CONCURRENCY */
 static inline void cpuset_conc_refresh(void) { }
+static inline void cpuset_conc_reregister(void) { }
 static inline void cpuset_conc_online(struct cpuset *cs) { }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 /**
@@ -3107,6 +3118,8 @@ out:
 	notify_partition_change(cs, old_prs);
 	if (force_sd_rebuild)
 		rebuild_sched_domains_locked();
+	cpuset_conc_refresh();
+	cpuset_conc_reregister();
 	free_tmpmasks(&tmpmask);
 	return 0;
 }
@@ -4541,6 +4554,32 @@ static __maybe_unused bool cpuset_conc_held_xcpus(struct cpuset *c)
 {
 	return is_partition_invalid(c) && cpumask_empty(c->exclusive_cpus) &&
 	       !cpumask_empty(c->effective_xcpus);
+}
+/*
+ * Register again, with their configured CPUs, the tasks of the cpusets
+ * cpuset_conc_refresh() changed: a write can change them while it leaves the
+ * effective CPUs alone (an offline CPU added to cpuset.cpus), and then the
+ * update of the tasks' masks does not reach them. cpuset_mutex held.
+ */
+static void cpuset_conc_reregister(void)
+{
+	struct cgroup_subsys_state *pos;
+	struct cpuset *c;
+
+	lockdep_assert_held(&cpuset_mutex);
+	rcu_read_lock();
+	cpuset_for_each_descendant_pre(c, pos, &top_cpuset) {
+		if (!c->conc.changed)
+			continue;
+		c->conc.changed = false;
+		if (c == &top_cpuset || !css_tryget_online(&c->css))
+			continue;
+		rcu_read_unlock();
+		conc_cpuset_update(&c->css, c->effective_cpus);
+		rcu_read_lock();
+		css_put(&c->css);
+	}
+	rcu_read_unlock();
 }
 /* A new cpuset, a member: what its parent grants. Under callback_lock. */
 static void cpuset_conc_online(struct cpuset *cs)

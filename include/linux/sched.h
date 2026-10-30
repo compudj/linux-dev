@@ -832,6 +832,7 @@ struct task_ipi_mask {
 struct task_ipi_mask { };
 #endif
 
+struct conc_class;
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -953,8 +954,12 @@ struct task_struct {
 	u8				conc_accounted;
 	/* Held: out of its class, queued for the core, in TASK_RUNNING, on conc_held_list. */
 	u8				conc_held;
+	/* Its applied mask misses the one it is registered by, see conc_task_set_outside(). */
+	u8				conc_outside;
 	/* The CPU of a slot reserved for this task's arrival, -1 when none. */
 	int				conc_resv_cpu;
+	/* The entry its affinity mask is registered under in its own group. */
+	struct conc_class			*conc_class;
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
 #ifdef CONFIG_PREEMPT_RCU
@@ -2564,4 +2569,9 @@ DEFINE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
 struct cgroup;
 struct cgroup_subsys_state;
 struct cgroup_taskset;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+extern void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus);
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static inline void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus) { }
+#endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 #endif

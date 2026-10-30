@@ -507,6 +507,30 @@ enum conc_claim_result {
 	CONC_CLAIMED	= 1,	/* an entity was added */
 	CONC_INACTIVE	= 2,	/* the group does not count; nothing was added */
 };
+/*
+ * The mask a task of a group's subtree is configured to run on (its
+ * cpuset's CPUs with every CPU online, within its requested mask), with
+ * the number of tasks that have it. Two masks follow: the configured one,
+ * which hotplug never changes and by which a change is admitted (see
+ * conc_masks_width()), and its live part, the CPUs of it that may be used,
+ * by which tasks are placed. The minimal live parts are the group's
+ * affinity classes; equal live parts make one class. A dormant entry is
+ * no class: its live part is empty (every CPU of it offline or going
+ * offline), and its tasks are widened if they wake up meanwhile; or none
+ * of its tasks can run on it, their applied masks lying outside the mask
+ * (see conc_task_set_outside()).
+ */
+struct conc_class {
+	struct list_head	node;
+	struct rcu_head		rcu;
+	unsigned int		tasks;
+	unsigned int		outside;	/* of @tasks, those whose applied mask misses it */
+	bool			minimal;
+	bool			dormant;
+	unsigned long		mask[];	/* configured, then live: two cpumasks */
+};
+#define conc_class_mask(c)	((struct cpumask *)(c)->mask)
+#define conc_class_live(c)	((struct cpumask *)((char *)(c)->mask + cpumask_size()))
 struct tg_concurrency {
 	raw_spinlock_t		lock;
 	atomic_t __percpu	*present;
@@ -2689,11 +2713,27 @@ extern const u32		sched_prio_to_wmult[40];
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 struct conc_resv;
+/* The concurrency limit's part of an affinity change, see conc_prepare_affinity(). */
+struct conc_affinity_ctx {
+	/* A slot reserved for the task's new CPU. */
+	struct conc_resv		*resv;
+	/* Class entries preallocated for the new requested mask, one per level. */
+	struct conc_class		**prealloc;
+	int			nr_prealloc;
+	/* Counted as a change in flight, which set-moves wait for. */
+	bool			pending;
+	/* With SCA_CC_JUDGED: the task's conc_move_seq and the limit generation judged at. */
+	unsigned int		move_seq;
+	unsigned int		gen;
+};
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 struct affinity_context {
 	const struct cpumask	*new_mask;
 	struct cpumask		*user_mask;
 	unsigned int		flags;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	struct conc_affinity_ctx	conc;
+#endif
 };
 
 extern s64 update_curr_common(struct rq *rq);

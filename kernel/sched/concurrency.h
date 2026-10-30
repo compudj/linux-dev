@@ -16,8 +16,9 @@ static inline void conc_bounds_apply(struct task_group *top)
 }
 
 /* Filled in by a later patch. */
-static inline void conc_classes_drop(struct tg_concurrency *conc)
+static inline int conc_evict_cpu(struct task_group *tg, int cpu, bool set_move, bool hold, struct task_struct *mask_task, const struct cpumask *mask, const struct cpumask *within)
 {
+	return -EBUSY;
 }
 
 /* Filled in by a later patch. */
@@ -47,36 +48,9 @@ static inline void conc_slot_removed(struct task_group *tg, int cpu)
 }
 
 /* Filled in by a later patch. */
-static inline bool conc_slot_sole_hitter(struct tg_concurrency *conc, int cpu)
-{
-	return false;
-}
-
-/* Filled in by a later patch. */
 static inline bool conc_task_held(struct task_struct *p)
 {
 	return false;
-}
-
-/* Filled in by a later patch. */
-static inline unsigned int conc_unhit_hits(struct tg_concurrency *conc, int cpu)
-{
-	return 0;
-}
-
-/* Filled in by a later patch. */
-static inline void conc_unhit_slot_added(struct tg_concurrency *conc, int cpu)
-{
-}
-
-/* Filled in by a later patch. */
-static inline void conc_unhit_slot_removed(struct tg_concurrency *conc, int cpu)
-{
-}
-
-/* Filled in by a later patch. */
-static inline void conc_want_headroom(struct tg_concurrency *conc)
-{
 }
 
 /*
@@ -202,6 +176,8 @@ static inline bool conc_task_move(struct task_struct *p, int src, int dst, bool 
 }
 
 extern void __init conc_init_root(void);
+extern void conc_task_mask_changed(struct task_struct *p, struct affinity_context *ctx);
+extern void conc_task_fork(struct task_struct *p);
 struct kernel_clone_args;
 
 /* Called from outside concurrency.c. */
@@ -218,6 +194,10 @@ static inline bool conc_task_claim(struct task_struct *p, int cpu) { return true
 static inline void conc_task_release(struct task_struct *p, int cpu) { }
 
 static inline bool conc_task_move(struct task_struct *p, int src, int dst, bool must) { return true; }
+
+static inline void conc_task_mask_changed(struct task_struct *p, struct affinity_context *ctx) { }
+
+static inline void conc_task_fork(struct task_struct *p) { }
 
 struct kernel_clone_args;
 

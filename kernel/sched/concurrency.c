@@ -18,6 +18,14 @@
 #include "sched.h"
 #include "smp.h"
 #include <trace/events/sched.h>
+/*
+ * Constants
+ */
+
+/* The active groups from @p's up: the most levels whose lists cover @p. */
+#define for_each_conc_level(lvl, p)						\
+	for (lvl = task_group(p); READ_ONCE(lvl->conc.active); lvl = lvl->parent)
+
 /* An ancestor of the top group, outside the moved set, that counts it. */
 struct conc_sm_ancestor {
 	struct task_group	*tg;
@@ -50,9 +58,9 @@ struct conc_resv {
  */
 DEFINE_STATIC_KEY_FALSE(sched_conc_enabled);
 static __maybe_unused DEFINE_PER_CPU(cpumask_var_t, conc_select_mask);
-static __maybe_unused DEFINE_PER_CPU(cpumask_var_t, conc_entitled_mask);
-static __maybe_unused DEFINE_PER_CPU(cpumask_var_t, conc_unhit_mask);
-static __maybe_unused DEFINE_PER_CPU(cpumask_var_t, conc_class_scratch);
+static DEFINE_PER_CPU(cpumask_var_t, conc_entitled_mask);
+static DEFINE_PER_CPU(cpumask_var_t, conc_unhit_mask);
+static DEFINE_PER_CPU(cpumask_var_t, conc_class_scratch);
 
 /* Serializes configuration: limit writes, activation, eviction and retries. */
 static DEFINE_MUTEX(conc_mutex);
@@ -64,10 +72,32 @@ static DEFINE_MUTEX(conc_mutex);
  * it and the late arrivals that follow them.
  */
 static struct cpumask conc_offlining_cpus __read_mostly;
+static int conc_subtree_snapshot(struct task_group *top, struct cgroup_subsys_state ***out, int *nr);
+static void conc_subtree_release(struct cgroup_subsys_state **arr, int n);
 
 static void conc_irq_work(struct irq_work *work);
 static void conc_cleaner_work(struct work_struct *work);
 static int conc_resv_cpu(struct conc_resv *resv);
+
+static void conc_classes_drop(struct tg_concurrency *conc);
+
+static inline bool conc_task_mask_fixed(struct task_struct *t);
+static void conc_task_entitled(struct task_struct *t, struct cpumask *mask);
+
+#ifdef CONFIG_SCHED_MM_CID
+/*
+ * Before the threads of a migration leave their groups: the IDs their
+ * domains cached on CPUs where the source group has an idle slot, or
+ * none, would be orphaned, since the group drains those slots later
+ * without finding the threads there. Drop them now; a thread back on such
+ * a CPU allocates again. A slot with tasks, or in a transient state,
+ * keeps its ID.
+ */
+static struct task_group *conc_pin_task_group(struct task_struct *p);
+#endif /* CONFIG_SCHED_MM_CID */
+
+static unsigned int conc_class_cap(struct tg_concurrency *conc);
+static struct task_group *conc_pin_task_group(struct task_struct *p);
 atomic_t conc_nr_held;
 
 static inline bool conc_cpu_usable(int cpu)
@@ -123,6 +153,260 @@ void __init conc_init_root(void)
 #endif
 }
 
+/* Ask the cleaner to reclaim an idle slot so that the next arrival finds headroom. */
+static inline void conc_want_headroom(struct tg_concurrency *conc)
+{
+	irq_work_queue(&conc->irq_work);
+}
+
+/*
+ * Affinity masks: the masks the tasks of a subtree are configured to run
+ * on (see __conc_task_class_mask()) are kept per group with a task count,
+ * under the group's lock. Changes are admitted by the width of the masks
+ * (see conc_masks_width()); tasks are placed by the classes, the minimal
+ * live parts (see conc_refresh_live()). A mask that restricts nothing is
+ * not kept. Entries are allocated outside the lock, by the process-context
+ * caller of the change, and freed through RCU. A task points at the entry
+ * it is counted under at its own level; the ancestors hold the same mask.
+ * The mask is computed afresh at every registration, so that a task
+ * registered while a cpuset change is reaching the tasks one at a time
+ * gets the new mask, as the ones registered ahead by conc_cpuset_update()
+ * did.
+ */
+static struct conc_class *conc_class_alloc(gfp_t gfp)
+{
+	return kzalloc(sizeof(struct conc_class) + 2 * cpumask_size(), gfp);
+}
+
+/*
+ * Dormant: no CPU of @c may be used now, or none of its tasks can run on
+ * one, every applied mask lying outside its mask (see
+ * conc_task_set_outside()). Either way no task of it takes a slot inside
+ * it, and headroom kept for it would be headroom no task can take.
+ */
+static bool conc_class_is_dormant(struct conc_class *c)
+{
+	return cpumask_empty(conc_class_live(c)) || c->outside == c->tasks;
+}
+
+/* The live part of @c: the CPUs of its mask that may be used now. */
+static void conc_class_set_live(struct conc_class *c)
+{
+	cpumask_and(conc_class_live(c), conc_class_mask(c), cpu_active_mask);
+	cpumask_andnot(conc_class_live(c), conc_class_live(c), &conc_offlining_cpus);
+	c->dormant = conc_class_is_dormant(c);
+}
+
+/*
+ * Does @d keep @o from being a class? A live part strictly inside @o's,
+ * or an equal one already counted as the class: equal live parts make
+ * one class.
+ */
+static bool conc_class_dominates(struct conc_class *d, struct conc_class *o)
+{
+	if (d == o || d->dormant || !cpumask_subset(conc_class_live(d), conc_class_live(o)))
+		return false;
+	return d->minimal || !cpumask_equal(conc_class_live(d), conc_class_live(o));
+}
+
+static bool conc_mask_counts(struct task_struct *p, const struct cpumask *mask)
+{
+	return mask && !cpumask_subset(task_cpu_possible_mask(p), mask);
+}
+
+/* Does @applied, the mask a task runs on, miss @mask, the one it is registered by? */
+static inline bool conc_mask_outside(const struct cpumask *mask, const struct cpumask *applied)
+{
+	return !cpumask_intersects(mask, applied);
+}
+
+/*
+ * Count the classes of @conc and the unhit ones again, from the live parts
+ * and the dormant entries as they are; ask for the headroom they lack.
+ */
+static void conc_classes_recount(struct tg_concurrency *conc)
+{
+	struct conc_class *c, *d;
+
+	lockdep_assert_held(&conc->lock);
+	list_for_each_entry(c, &conc->masks, node)
+		c->minimal = false;
+	conc->unhit = 0;
+	/* In list order: of equal live parts, the first is the class. */
+	list_for_each_entry(c, &conc->masks, node) {
+		bool minimal = !c->dormant;
+
+		list_for_each_entry(d, &conc->masks, node) {
+			if (!minimal)
+				break;
+			if (conc_class_dominates(d, c))
+				minimal = false;
+		}
+		if (!minimal)
+			continue;
+		c->minimal = true;
+		if (!cpumask_intersects(conc_class_live(c), conc->used))
+			conc->unhit++;
+	}
+	if (conc->effective && conc->nr_used + conc->unhit > conc->effective)
+		conc_want_headroom(conc);
+}
+
+/*
+ * The tasks of @c changed. When that puts it to sleep or wakes it up, the
+ * classes are counted again; one going dormant may hand headroom back to
+ * held tasks.
+ */
+static void conc_class_tasks_changed(struct tg_concurrency *conc, struct conc_class *c)
+{
+	bool dormant = conc_class_is_dormant(c);
+
+	lockdep_assert_held(&conc->lock);
+	if (dormant == c->dormant)
+		return;
+	c->dormant = dormant;
+	conc_classes_recount(conc);
+	if (dormant)
+		conc_hold_kick();
+}
+
+/*
+ * Register one task with @mask; @entry is consumed when a new entry is
+ * needed. Returns the entry the task is counted under, NULL when none
+ * could be made.
+ */
+static struct conc_class *__conc_class_add(struct tg_concurrency *conc, const struct cpumask *mask,
+				       struct conc_class *entry, bool outside)
+{
+	struct conc_class *c;
+	bool minimal = true;
+
+	lockdep_assert_held(&conc->lock);
+
+	list_for_each_entry(c, &conc->masks, node) {
+		if (cpumask_equal(conc_class_mask(c), mask)) {
+			c->tasks++;
+			c->outside += outside;
+			conc_class_tasks_changed(conc, c);
+			return c;
+		}
+	}
+	if (!entry)
+		return NULL;
+
+	cpumask_copy(conc_class_mask(entry), mask);
+	entry->tasks = 1;
+	entry->outside = outside;
+	conc_class_set_live(entry);
+	minimal = !entry->dormant;
+	/* A class unless an existing live part is within its own ... */
+	list_for_each_entry(c, &conc->masks, node) {
+		if (minimal && !c->dormant && cpumask_subset(conc_class_live(c), conc_class_live(entry))) {
+			minimal = false;
+			break;
+		}
+	}
+	/* ... in which case the classes its live part is within are no longer. */
+	if (minimal) {
+		list_for_each_entry(c, &conc->masks, node) {
+			if (!c->minimal || !cpumask_subset(conc_class_live(entry), conc_class_live(c)))
+				continue;
+			c->minimal = false;
+			if (!cpumask_intersects(conc_class_live(c), conc->used))
+				conc->unhit--;
+		}
+		if (!cpumask_intersects(conc_class_live(entry), conc->used)) {
+			conc->unhit++;
+			/* Idle slots may have to go for its headroom. */
+			if (conc->effective && conc->nr_used + conc->unhit > conc->effective)
+				conc_want_headroom(conc);
+		}
+	}
+	entry->minimal = minimal;
+	list_add(&entry->node, &conc->masks);
+	return entry;
+}
+
+/*
+ * Unregister one task with @mask, @outside when its applied mask missed
+ * it; returns the entry to free when it was the last.
+ */
+static struct conc_class *__conc_class_del(struct tg_concurrency *conc, const struct cpumask *mask,
+				       bool outside)
+{
+	struct conc_class *c, *o, *d;
+
+	lockdep_assert_held(&conc->lock);
+
+	list_for_each_entry(c, &conc->masks, node) {
+		if (cpumask_equal(conc_class_mask(c), mask))
+			goto found;
+	}
+	return NULL;
+found:
+	if (outside && c->outside)
+		c->outside--;
+	if (--c->tasks) {
+		c->outside = min(c->outside, c->tasks);
+		conc_class_tasks_changed(conc, c);
+		return NULL;
+	}
+	list_del(&c->node);
+	if (!c->minimal)
+		return c;
+	if (!cpumask_intersects(conc_class_live(c), conc->used)) {
+		conc->unhit--;
+		/* The headroom kept for it is free: a held task may fit. */
+		conc_hold_kick();
+	}
+	/* The live parts it was within may be classes now. */
+	list_for_each_entry(o, &conc->masks, node) {
+		bool dominated = false;
+
+		if (o->minimal || o->dormant ||
+		    !cpumask_subset(conc_class_live(c), conc_class_live(o)))
+			continue;
+		list_for_each_entry(d, &conc->masks, node) {
+			if (conc_class_dominates(d, o)) {
+				dominated = true;
+				break;
+			}
+		}
+		if (dominated)
+			continue;
+		o->minimal = true;
+		if (!cpumask_intersects(conc_class_live(o), conc->used))
+			conc->unhit++;
+	}
+	return c;
+}
+
+/* The used set gains @cpu: classes it hits are no longer unhit. */
+static void conc_unhit_slot_added(struct tg_concurrency *conc, int cpu)
+{
+	struct conc_class *c;
+
+	lockdep_assert_held(&conc->lock);
+	list_for_each_entry(c, &conc->masks, node) {
+		if (c->minimal && cpumask_test_cpu(cpu, conc_class_live(c)) &&
+		    !cpumask_intersects(conc_class_live(c), conc->used))
+			conc->unhit--;
+	}
+}
+
+/* The used set loses @cpu: classes only it hit become unhit. */
+static void conc_unhit_slot_removed(struct tg_concurrency *conc, int cpu)
+{
+	struct conc_class *c;
+
+	lockdep_assert_held(&conc->lock);
+	list_for_each_entry(c, &conc->masks, node) {
+		if (c->minimal && cpumask_test_cpu(cpu, conc_class_live(c)) &&
+		    cpumask_weight_and(conc_class_live(c), conc->used) == 1)
+			conc->unhit++;
+	}
+}
+
 /*
  * The used set gains @cpu: the classes it hits are no longer unhit and its
  * SMT core is no longer unused, see conc_spread().
@@ -157,6 +441,23 @@ static void conc_used_del(struct tg_concurrency *conc, int cpu)
 	WRITE_ONCE(conc->nr_used, conc->nr_used - 1);
 }
 
+/* How many of the classes no used CPU hits would @cpu hit? */
+static unsigned int conc_unhit_hits(struct tg_concurrency *conc, int cpu)
+{
+	struct conc_class *c;
+	unsigned int n = 0;
+
+	lockdep_assert_held(&conc->lock);
+	if (!conc->unhit)
+		return 0;
+	list_for_each_entry(c, &conc->masks, node) {
+		if (c->minimal && cpumask_test_cpu(cpu, conc_class_live(c)) &&
+		    !cpumask_intersects(conc_class_live(c), conc->used))
+			n++;
+	}
+	return n;
+}
+
 /*
  * Can @conc add a slot on @cpu within its limit? An unhit class keeps a
  * slot of headroom for its sleeping members, which a slot inside the
@@ -173,6 +474,449 @@ static __maybe_unused bool conc_room_for(struct tg_concurrency *conc, int cpu)
 {
 	guard(raw_spinlock_irqsave)(&conc->lock);
 	return __conc_room_for(conc, cpu);
+}
+
+/*
+ * The CPUs of @p's mask inside the classes that no used CPU of its chain
+ * hits, into the per-CPU scratch mask. A slot added on one of them
+ * serves the sleeping members of that class too. Under p->pi_lock.
+ */
+static __maybe_unused struct cpumask *conc_unhit_cpus(struct task_struct *p)
+{
+	struct cpumask *mask = this_cpu_cpumask_var_ptr(conc_unhit_mask);
+	struct task_group *lvl;
+	struct conc_class *c;
+
+	cpumask_clear(mask);
+	for_each_conc_level(lvl, p) {
+		guard(raw_spinlock)(&lvl->conc.lock);
+		if (!lvl->conc.unhit)
+			continue;
+		list_for_each_entry(c, &lvl->conc.masks, node) {
+			if (c->minimal && !cpumask_intersects(conc_class_live(c), lvl->conc.used))
+				cpumask_or(mask, mask, conc_class_live(c));
+		}
+	}
+	if (cpumask_empty(mask))
+		return NULL;
+	cpumask_and(mask, mask, p->cpus_ptr);
+	cpumask_and(mask, mask, cpu_active_mask);
+	cpumask_andnot(mask, mask, &conc_offlining_cpus);
+	return cpumask_empty(mask) ? NULL : mask;
+}
+
+/* Is @cpu the only used CPU hitting some class? */
+static bool conc_slot_sole_hitter(struct tg_concurrency *conc, int cpu)
+{
+	struct conc_class *c;
+
+	guard(raw_spinlock_irqsave)(&conc->lock);
+	list_for_each_entry(c, &conc->masks, node) {
+		if (c->minimal && cpumask_test_cpu(cpu, conc_class_live(c)) &&
+		    cpumask_weight_and(conc_class_live(c), conc->used) == 1)
+			return true;
+	}
+	return false;
+}
+
+/* Drop every entry: the group stops counting, or goes away. */
+static void conc_classes_drop(struct tg_concurrency *conc)
+{
+	struct conc_class *c, *n;
+	LIST_HEAD(gone);
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&conc->lock, flags);
+	list_splice_init(&conc->masks, &gone);
+	conc->unhit = 0;
+	raw_spin_unlock_irqrestore(&conc->lock, flags);
+	list_for_each_entry_safe(c, n, &gone, node)
+		kfree_rcu(c, rcu);
+}
+
+static int conc_chain_depth(struct task_struct *p)
+{
+	struct task_group *lvl;
+	int n = 0;
+
+	for_each_conc_level(lvl, p)
+		n++;
+	return n;
+}
+
+/*
+ * The levels of a task's chain, one at a time: lock @lvl and return it
+ * when it counts, else NULL. See conc_chain_unlock() for the next level.
+ */
+static struct task_group *conc_chain_lock(struct task_group *lvl, unsigned long *flags)
+{
+	if (!lvl)
+		return NULL;
+	raw_spin_lock_irqsave(&lvl->conc.lock, *flags);
+	if (lvl->conc.active)
+		return lvl;
+	raw_spin_unlock_irqrestore(&lvl->conc.lock, *flags);
+	return NULL;
+}
+
+/*
+ * Unlock @lvl and return the next level of the chain: its parent when
+ * @lvl's list is merged into it. That is read under the lock a merge holds
+ * while it copies the list up (conc_classes_merge()), so that a task's
+ * entry at @lvl is either copied by the merge or added above by its own
+ * walk, never both, and is removed from above when it was copied there.
+ */
+static struct task_group *conc_chain_unlock(struct task_group *lvl, unsigned long flags)
+{
+	struct task_group *up = lvl->conc.merged ? lvl->parent : NULL;
+
+	raw_spin_unlock_irqrestore(&lvl->conc.lock, flags);
+	return up;
+}
+
+static struct conc_class **conc_class_prealloc(int n, gfp_t gfp)
+{
+	struct conc_class **pre;
+	int i;
+
+	if (n <= 0)
+		return NULL;
+	pre = kcalloc(n, sizeof(*pre), gfp);
+	if (!pre)
+		return NULL;
+	for (i = 0; i < n; i++) {
+		pre[i] = conc_class_alloc(gfp);
+		if (!pre[i])
+			break;
+	}
+	return pre;
+}
+
+static void conc_class_prealloc_free(struct conc_class **pre, int n)
+{
+	int i;
+
+	if (!pre)
+		return;
+	for (i = 0; i < n; i++)
+		kfree(pre[i]);
+	kfree(pre);
+}
+
+/*
+ * Register @mask, the mask @p carries or is about to, in its chain,
+ * consuming entries of @pre where a level needs one; @applied is the mask
+ * @p runs on, or is about to. Under p->pi_lock, or the lock of the
+ * runqueue @p is queued on. Without an entry a level misses the class
+ * until the next activation of the group. A task that is exiting is not
+ * registered: its release, which unregisters, may have run already (a
+ * cgroup iterator can hand out a task on its way out).
+ */
+static void conc_task_class_add(struct task_struct *p, const struct cpumask *mask,
+			      const struct cpumask *applied, struct conc_class **pre, int npre)
+{
+	bool outside = conc_mask_outside(mask, applied);
+	struct task_group *lvl = task_group(p);
+	unsigned long flags;
+	int i = 0;
+
+	if (p->conc_class || (p->flags & PF_EXITING) || !conc_mask_counts(p, mask))
+		return;
+	while ((lvl = conc_chain_lock(lvl, &flags))) {
+		struct conc_class *e = pre && i < npre ? pre[i] : NULL, *got;
+
+		got = __conc_class_add(&lvl->conc, mask, e, outside);
+		lvl = conc_chain_unlock(lvl, flags);
+		if (got && got == e)
+			pre[i] = NULL;
+		if (!i) {
+			/* Not even at its own level: not registered at all. */
+			if (!got)
+				return;
+			p->conc_class = got;
+			p->conc_outside = outside;
+		}
+		i++;
+	}
+}
+
+/*
+ * Unregister the mask @p is registered with from the chain starting at
+ * @tg, its group or the one it just left. Same locking. The entry's mask
+ * outlives its removal by a grace period.
+ */
+static void conc_task_class_del_from(struct task_struct *p, struct task_group *tg)
+{
+	struct conc_class *own = p->conc_class;
+	struct task_group *lvl = tg;
+	const struct cpumask *mask;
+	unsigned long flags;
+	bool outside;
+
+	if (!own)
+		return;
+	outside = p->conc_outside;
+	p->conc_class = NULL;
+	p->conc_outside = 0;
+	/*
+	 * A group that stopped counting dropped its list and unmerged it
+	 * from its ancestors; the entry of a task it could not reach then
+	 * (one on its way out) is gone with it.
+	 */
+	if (!READ_ONCE(tg->conc.active))
+		return;
+	mask = conc_class_mask(own);
+	guard(rcu)();
+	while ((lvl = conc_chain_lock(lvl, &flags))) {
+		struct conc_class *e = __conc_class_del(&lvl->conc, mask, outside);
+
+		lvl = conc_chain_unlock(lvl, flags);
+		if (e)
+			kfree_rcu(e, rcu);
+	}
+}
+
+static void conc_task_class_del(struct task_struct *p)
+{
+	conc_task_class_del_from(p, task_group(p));
+}
+
+/* The mask @p is registered with, or NULL. */
+static inline const struct cpumask *conc_task_class_mask(struct task_struct *p)
+{
+	return p->conc_class ? conc_class_mask(p->conc_class) : NULL;
+}
+
+/*
+ * @p stays registered with its mask, and @applied, the mask it runs on or
+ * is about to, misses it or meets it again. A cpuset applies its own CPUs
+ * and keeps the request aside when they miss it, and gives its tasks its
+ * parent's CPUs when all of its own are offline: a hotplug event never
+ * changes the registered mask (see __conc_task_class_mask()), so the
+ * applied one can lie outside it. A class all of whose tasks are outside
+ * is dormant, see conc_class_is_dormant(): until cpuset gives the CPUs
+ * back, which reaches the cpusets one at a time after they come online,
+ * headroom kept for it could serve none of its tasks, and would hold them
+ * off the other CPUs. Counted in place at every level of the chain,
+ * without entries to allocate. Same locking as conc_task_class_add().
+ */
+static void conc_task_set_outside(struct task_struct *p, const struct cpumask *applied)
+{
+	const struct cpumask *mask = conc_task_class_mask(p);
+	struct task_group *lvl = task_group(p);
+	unsigned long flags;
+	bool outside;
+
+	if (!mask)
+		return;
+	outside = conc_mask_outside(mask, applied);
+	if (outside == p->conc_outside)
+		return;
+	p->conc_outside = outside;
+	while ((lvl = conc_chain_lock(lvl, &flags))) {
+		struct tg_concurrency *conc = &lvl->conc;
+		struct conc_class *c;
+
+		list_for_each_entry(c, &conc->masks, node) {
+			if (!cpumask_equal(conc_class_mask(c), mask))
+				continue;
+			if (outside)
+				c->outside = min(c->outside + 1, c->tasks);
+			else if (c->outside)
+				c->outside--;
+			conc_class_tasks_changed(conc, c);
+			break;
+		}
+		lvl = conc_chain_unlock(lvl, flags);
+	}
+}
+
+/*
+ * Is @p registered with @mask? Its outside state then follows @applied,
+ * the mask it runs on or is about to.
+ */
+static bool conc_task_registered_with(struct task_struct *p, const struct cpumask *mask,
+				    const struct cpumask *applied)
+{
+	if (!p->conc_class || !cpumask_equal(conc_task_class_mask(p), mask))
+		return false;
+	conc_task_set_outside(p, applied);
+	return true;
+}
+
+/*
+ * The mask @p is registered with is about to become @new, the mask it
+ * runs on @applied, its current one still in p->cpus_mask. Entries come
+ * from @pre when the change was prepared in process context, see below.
+ */
+static void __conc_task_mask_changed(struct task_struct *p, const struct cpumask *new,
+				   const struct cpumask *applied, struct conc_class **pre, int npre)
+{
+	/*
+	 * Registered ahead by conc_prepare_affinity() or conc_cpuset_update(),
+	 * or unchanged.
+	 */
+	if (conc_task_registered_with(p, new, applied))
+		return;
+	conc_task_class_del(p);
+	if (!conc_mask_counts(p, new) || !READ_ONCE(task_group(p)->conc.active))
+		return;
+	/*
+	 * Without entries (a forced change under the runqueue lock, which
+	 * cannot allocate: a fallback widening at a wakeup) existing entries
+	 * are joined and a level that would need a new one misses the class
+	 * until the next registration; a task that wakes up to no CPU for
+	 * that is held, not placed in excess, see conc_hold_request().
+	 */
+	conc_task_class_add(p, new, applied, pre, npre);
+}
+
+/*
+ * The mask @t is configured to run on, by which it is registered: its
+ * cpuset's CPUs with every CPU online (see
+ * cpuset_task_cpus_configured_rcu()), masked by @user, its requested mask,
+ * when they intersect, as a cpuset change masks it. A hotplug event never
+ * changes it, so that the width of the registered masks, by which changes
+ * are admitted, never grows behind the admission's back; the classes by
+ * which tasks are placed follow the live parts (see conc_refresh_live()).
+ * A fallback widening drops the requested mask (set_cpus_allowed_force()),
+ * and the class follows: the task's mask restricts nothing from then on.
+ */
+static void __conc_task_class_mask(struct task_struct *t, const struct cpumask *user,
+				 struct cpumask *mask)
+{
+	scoped_guard(rcu)
+		cpuset_task_cpus_configured_rcu(t, mask);
+	if (user && cpumask_intersects(mask, user))
+		cpumask_and(mask, mask, user);
+}
+
+static void conc_task_class_mask_now(struct task_struct *t, struct cpumask *mask)
+{
+	guard(raw_spinlock_irq)(&t->pi_lock);
+	__conc_task_class_mask(t, t->user_cpus_ptr, mask);
+}
+
+/*
+ * set_cpus_allowed_common(): under p->pi_lock and the rq lock, the task is
+ * registered by the mask it is configured to run on with the change.
+ */
+void conc_task_mask_changed(struct task_struct *p, struct affinity_context *ctx)
+{
+	struct cpumask *ent;
+
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return;
+	if (!p->conc_class && !READ_ONCE(task_group(p)->conc.active))
+		return;
+	lockdep_assert_irqs_disabled();
+	ent = this_cpu_cpumask_var_ptr(conc_class_scratch);
+	/* The requested mask that will be in place, see the swap in the caller. */
+	__conc_task_class_mask(p, ctx->flags & SCA_USER ? ctx->user_mask : p->user_cpus_ptr, ent);
+	__conc_task_mask_changed(p, ent, ctx->new_mask, ctx->conc.prealloc, ctx->conc.nr_prealloc);
+}
+
+/*
+ * Register @p with the mask it is configured to run on, when not
+ * registered yet. Under p->pi_lock.
+ */
+static void conc_task_register(struct task_struct *p, struct conc_class **pre, int npre)
+{
+	struct cpumask *ent = this_cpu_cpumask_var_ptr(conc_class_scratch);
+
+	lockdep_assert_irqs_disabled();
+	if (p->conc_class)
+		return;
+	__conc_task_class_mask(p, p->user_cpus_ptr, ent);
+	conc_task_class_add(p, ent, &p->cpus_mask, pre, npre);
+}
+
+/* A new task: register it, after cpuset_fork() placed it. */
+void conc_task_fork(struct task_struct *p)
+{
+	struct conc_class **pre;
+	int n;
+
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return;
+	n = conc_chain_depth(p);
+	if (!n)
+		return;
+	pre = conc_class_prealloc(n, GFP_KERNEL);
+	scoped_guard(raw_spinlock_irq, &p->pi_lock)
+		conc_task_register(p, pre, n);
+	conc_class_prealloc_free(pre, n);
+}
+
+/* The levels a merge of @child copies its list into, see conc_classes_merge(). */
+static __maybe_unused int conc_merge_depth(struct task_group *child)
+{
+	struct task_group *lvl;
+	int n = 0;
+
+	for (lvl = child->parent; lvl; lvl = READ_ONCE(lvl->conc.merged) ? lvl->parent : NULL)
+		n++;
+	return n;
+}
+
+/*
+ * Merge (@sign 1) or unmerge (@sign -1) the masks of @child, when its
+ * parent starts or stops counting it. A merge copies them into the parent
+ * and every level above that the parent's list is merged into, then marks
+ * the child's list merged; an unmerge removes them from the parent, the
+ * one level they were in, and clears the mark. @pre supplies up to @npre
+ * entries for a merge. The child's lock is held across, so that a task of
+ * the subtree finds its entry copied up and the list merged, or neither,
+ * see conc_chain_unlock(); each level's lock nests inside in turn, the one
+ * place where two group locks nest.
+ */
+static __maybe_unused void conc_classes_merge(struct task_group *child, int sign, struct conc_class **pre, int npre)
+{
+	struct tg_concurrency *conc = &child->conc;
+	struct task_group *lvl = child->parent;
+	struct conc_class *c, *e;
+	unsigned long flags;
+	unsigned int i;
+	LIST_HEAD(gone);
+	int used = 0;
+
+	raw_spin_lock_irqsave(&conc->lock, flags);
+	while (lvl) {
+		struct tg_concurrency *pc = &lvl->conc;
+
+		raw_spin_lock_nested(&pc->lock, SINGLE_DEPTH_NESTING);
+		list_for_each_entry(c, &conc->masks, node) {
+			for (i = 0; i < c->tasks; i++) {
+				if (sign < 0) {
+					e = __conc_class_del(pc, conc_class_mask(c), i < c->outside);
+					if (e)
+						list_add(&e->node, &gone);
+					continue;
+				}
+				/* Without an entry left, an equal one still counts it. */
+				e = pre && used < npre ? pre[used] : NULL;
+				if (__conc_class_add(pc, conc_class_mask(c), e, i < c->outside) == e && e)
+					pre[used++] = NULL;
+			}
+		}
+		lvl = sign > 0 && pc->merged ? lvl->parent : NULL;
+		raw_spin_unlock(&pc->lock);
+	}
+	conc->merged = sign > 0;
+	raw_spin_unlock_irqrestore(&conc->lock, flags);
+	list_for_each_entry_safe(c, e, &gone, node)
+		kfree_rcu(c, rcu);
+}
+
+static unsigned int conc_nr_masks(struct tg_concurrency *conc)
+{
+	struct conc_class *c;
+	unsigned int n = 0;
+
+	guard(raw_spinlock_irqsave)(&conc->lock);
+	list_for_each_entry(c, &conc->masks, node)
+		n++;
+	return n;
 }
 
 static __maybe_unused struct cpumask *conc_alloc_scratch(void)
@@ -456,6 +1200,82 @@ out:
 	free_cpumask_var(cpus);
 }
 
+/*
+ * Configuration: cpu.concurrency.max and cpu.concurrency.effective
+ */
+
+/*
+ * Register the masks of @tg's own tasks (unclassed ones) when it starts
+ * counting, at every counting level of their chain: the ancestors that
+ * count were visited first by the configuration walk, and a group that
+ * starts counting has no list a merge could add, see conc_update_tree().
+ * Called under RCU from that walk: atomic allocations only.
+ */
+static __maybe_unused void conc_classes_build(struct task_group *tg)
+{
+	struct css_task_iter it;
+	struct task_struct *t;
+
+	css_task_iter_start(&tg->css, 0, &it);
+	while ((t = css_task_iter_next(&it))) {
+		struct conc_class **pre;
+		int n;
+
+		if (READ_ONCE(t->conc_class))
+			continue;
+		n = conc_chain_depth(t);
+		pre = conc_class_prealloc(n, GFP_KERNEL);
+		scoped_guard(raw_spinlock_irq, &t->pi_lock) {
+			if (task_group(t) == tg)
+				conc_task_register(t, pre, n);
+		}
+		conc_class_prealloc_free(pre, n);
+	}
+	css_task_iter_end(&it);
+}
+
+/*
+ * @tg stops counting: drop its list and unclass its direct tasks, the dead
+ * ones too, which keep their entry until they are reaped.
+ */
+static __maybe_unused void conc_classes_teardown(struct task_group *tg)
+{
+	struct css_task_iter it;
+	struct task_struct *t;
+
+	css_task_iter_start(&tg->css, CSS_TASK_ITER_WITH_DEAD, &it);
+	while ((t = css_task_iter_next(&it))) {
+		scoped_guard(raw_spinlock_irq, &t->pi_lock) {
+			if (task_group(t) == tg) {
+				t->conc_class = NULL;
+				t->conc_outside = 0;
+			}
+		}
+	}
+	css_task_iter_end(&it);
+	conc_classes_drop(&tg->conc);
+}
+
+/*
+ * @tg goes offline with dead tasks only, which keep their entry until they
+ * are reaped: unregister them from the chain while it counts, or the
+ * counting ancestors keep their masks. Under conc_mutex.
+ */
+static __maybe_unused void conc_classes_unregister_dead(struct task_group *tg)
+{
+	struct css_task_iter it;
+	struct task_struct *t;
+
+	css_task_iter_start(&tg->css, CSS_TASK_ITER_WITH_DEAD, &it);
+	while ((t = css_task_iter_next(&it))) {
+		scoped_guard(raw_spinlock_irq, &t->pi_lock) {
+			if (task_group(t) == tg)
+				conc_task_class_del(t);
+		}
+	}
+	css_task_iter_end(&it);
+}
+
 static __maybe_unused void conc_activate_tasks(struct task_group *tg)
 {
 	struct css_task_iter it;
@@ -484,6 +1304,360 @@ static __maybe_unused void conc_activate_tasks(struct task_group *tg)
 	css_task_iter_end(&it);
 }
 
+/*
+ * The width of @n distinct masks: the largest number of them no two of
+ * which are nested. By Dilworth's theorem it is the fewest chains
+ * covering them, @n minus a maximum matching of strict inclusion (König),
+ * found here with one augmenting-path search per mask. Why the width:
+ * the classes of any set of tasks the subtree can be left with, by exits,
+ * migrations or CPUs going offline (which restrict every live part alike
+ * and keep nested masks nested), are pairwise un-nested masks of these,
+ * so at most the width of them; admitting while the width is within the
+ * limit keeps the classes within it whatever follows, while the number
+ * of minimal masks alone can grow when a mask that others contained goes
+ * away. The price is that masks which overlap without being nested count
+ * apart even when one CPU would serve them all. Allocates with @gfp;
+ * @n, which no width exceeds, when it cannot.
+ */
+static unsigned int conc_masks_width(const char *masks, unsigned int n, gfp_t gfp)
+{
+	size_t words = BITS_TO_LONGS(n);
+	unsigned long *adj = NULL, *seen = NULL;
+	int *lmatch = NULL, *rmatch = NULL, *prev = NULL, *queue = NULL;
+	unsigned int i, j, s, matched = 0;
+
+#define CONC_MASK(i)	((const struct cpumask *)(masks + (size_t)(i) * cpumask_size()))
+	if (n < 2)
+		return n;
+	adj = kcalloc(n * words, sizeof(long), gfp);
+	seen = bitmap_zalloc(n, gfp);
+	lmatch = kmalloc_array(n, sizeof(int), gfp);
+	rmatch = kmalloc_array(n, sizeof(int), gfp);
+	prev = kmalloc_array(n, sizeof(int), gfp);
+	queue = kmalloc_array(n, sizeof(int), gfp);
+	if (!adj || !seen || !lmatch || !rmatch || !prev || !queue) {
+		matched = 0;
+		goto out;
+	}
+	for (i = 0; i < n; i++) {
+		lmatch[i] = rmatch[i] = -1;
+		for (j = 0; j < n; j++) {
+			if (j != i && cpumask_subset(CONC_MASK(i), CONC_MASK(j)))
+				__set_bit(j, adj + i * words);
+		}
+	}
+	for (s = 0; s < n; s++) {
+		int head = 0, tail = 0, found = -1;
+
+		bitmap_zero(seen, n);
+		queue[tail++] = s;
+		while (head < tail && found < 0) {
+			int u = queue[head++];
+
+			for_each_set_bit(j, adj + u * words, n) {
+				if (__test_and_set_bit(j, seen))
+					continue;
+				prev[j] = u;
+				if (rmatch[j] < 0) {
+					found = j;
+					break;
+				}
+				queue[tail++] = rmatch[j];
+			}
+		}
+		if (found < 0)
+			continue;
+		matched++;
+		for (j = found; (int)j >= 0; ) {
+			int u = prev[j], next = lmatch[u];
+
+			lmatch[u] = j;
+			rmatch[j] = u;
+			j = next;
+		}
+	}
+out:
+#undef CONC_MASK
+	kfree(adj);
+	bitmap_free(seen);
+	kfree(lmatch);
+	kfree(rmatch);
+	kfree(prev);
+	kfree(queue);
+	return n - matched;
+}
+
+/*
+ * The subtree of @top in pre-order, each css referenced, for the walks
+ * that allocate or take a task's locks at length: css_for_each_descendant_pre()
+ * needs RCU, which the configuration paths would otherwise hold across
+ * every task of the subtree, allocating with GFP_ATOMIC. A css being
+ * destroyed, which css_tryget() refuses, has no task left. Dying groups
+ * are listed as the RCU walk lists them; the callers skip them as before.
+ */
+static int conc_subtree_snapshot(struct task_group *top, struct cgroup_subsys_state ***out, int *nr)
+{
+	struct cgroup_subsys_state **arr = NULL, *css;
+	int n, i, cap = 0;
+
+again:
+	n = 0;
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &top->css) {
+		if (n < cap && css_tryget(css))
+			arr[n] = css;
+		else if (n < cap)
+			arr[n] = NULL;
+		n++;
+	}
+	rcu_read_unlock();
+	if (n > cap) {
+		/* The first pass, or the subtree grew meanwhile: once more. */
+		for (i = 0; i < cap; i++) {
+			if (arr[i])
+				css_put(arr[i]);
+		}
+		kvfree(arr);
+		cap = n + 8;
+		arr = kvcalloc(cap, sizeof(*arr), GFP_KERNEL);
+		if (!arr)
+			return -ENOMEM;
+		goto again;
+	}
+	*out = arr;
+	*nr = n;
+	return 0;
+}
+
+static void conc_subtree_release(struct cgroup_subsys_state **arr, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		if (arr[i])
+			css_put(arr[i]);
+	}
+	kvfree(arr);
+}
+
+/*
+ * Add @ent to the distinct masks collected so far. Returns false when
+ * the array could not grow.
+ */
+static bool conc_recount_add(char **masks, unsigned int *n, unsigned int *cap,
+			   const struct cpumask *ent)
+{
+	unsigned int i;
+
+	for (i = 0; i < *n; i++) {
+		if (cpumask_equal((struct cpumask *)(*masks + i * cpumask_size()), ent))
+			return true;
+	}
+	if (*n == *cap) {
+		char *bigger;
+
+		*cap = *cap ? *cap * 2 : 8;
+		bigger = krealloc(*masks, *cap * cpumask_size(), GFP_KERNEL);
+		if (!bigger)
+			return false;
+		*masks = bigger;
+	}
+	cpumask_copy((struct cpumask *)(*masks + *n * cpumask_size()), ent);
+	(*n)++;
+	return true;
+}
+
+/*
+ * The width of @tg's subtree, recounted from the masks its tasks are
+ * configured to run on now, which the registrations converge to: a
+ * relaxation that the registered masks ask for is confirmed this way,
+ * since they can be behind the tasks for an instant while a cpuset change
+ * reaches them one at a time; and changes are judged this way. @trial,
+ * when given, replaces the cpuset part of a task's mask (a cpuset write
+ * being checked); @skip are tasks left out (a migration being checked)
+ * and @extra masks counted in their place. Under conc_mutex, which keeps
+ * the classes it reads. UINT_MAX when it could not be computed: a check
+ * refuses.
+ */
+static unsigned int __conc_recount_width(struct task_group *tg,
+				       bool (*trial)(struct task_struct *t, struct cpumask *mask,
+						     bool *fixed, void *arg),
+				       void *arg, struct task_struct **skip, int nr_skip,
+				       const char *extra, int nr_extra)
+{
+	struct cgroup_subsys_state **csses;
+	struct css_task_iter it;
+	struct task_struct *t;
+	cpumask_var_t ent;
+	char *masks = NULL;
+	unsigned int n = 0, cap = 0, i, width = UINT_MAX;
+	int nr_css, k;
+	bool fixed, trial_changes;
+
+	if (!alloc_cpumask_var(&ent, GFP_KERNEL))
+		return UINT_MAX;
+	if (conc_subtree_snapshot(tg, &csses, &nr_css)) {
+		free_cpumask_var(ent);
+		return UINT_MAX;
+	}
+	/* Every task of the subtree: the children's css hold their own. */
+	for (k = 0; k < nr_css; k++) {
+		if (!csses[k])
+			continue;
+		css_task_iter_start(csses[k], 0, &it);
+		while ((t = css_task_iter_next(&it))) {
+			if (kthread_is_per_cpu(t))
+				continue;
+			for (i = 0; i < nr_skip; i++) {
+				if (skip[i] == t)
+					break;
+			}
+			if (i < nr_skip)
+				continue;
+			/* The mask it would be configured to run on under @trial, else is. */
+			trial_changes = false;
+			if (trial) {
+				scoped_guard(rcu)
+					trial_changes = trial(t, ent, &fixed, arg);
+			}
+			if (trial_changes) {
+				guard(raw_spinlock_irq)(&t->pi_lock);
+				if (t->user_cpus_ptr && cpumask_intersects(ent, t->user_cpus_ptr))
+					cpumask_and(ent, ent, t->user_cpus_ptr);
+			} else {
+				conc_task_class_mask_now(t, ent);
+			}
+			if (!conc_mask_counts(t, ent))
+				continue;
+			if (!conc_recount_add(&masks, &n, &cap, ent)) {
+				css_task_iter_end(&it);
+				goto out;
+			}
+		}
+		css_task_iter_end(&it);
+	}
+	for (i = 0; i < nr_extra; i++) {
+		const struct cpumask *m = (const struct cpumask *)(extra + i * cpumask_size());
+
+		if (cpumask_subset(cpu_possible_mask, m))
+			continue;
+		if (!conc_recount_add(&masks, &n, &cap, m))
+			goto out;
+	}
+	width = conc_masks_width(masks, n, GFP_KERNEL);
+out:
+	conc_subtree_release(csses, nr_css);
+	kfree(masks);
+	free_cpumask_var(ent);
+	return width;
+}
+
+static __maybe_unused unsigned int conc_recount_width(struct task_group *tg)
+{
+	return __conc_recount_width(tg, NULL, NULL, NULL, 0, NULL, 0);
+}
+
+/*
+ * The width of the masks registered at @conc, with one task's mask @del
+ * taken out and @add put in when given (a change being judged).
+ * Snapshot under the lock, computed outside it. UINT_MAX when it could
+ * not be computed.
+ */
+static __maybe_unused unsigned int conc_level_width(struct tg_concurrency *conc, const struct cpumask *del,
+				   const struct cpumask *add, gfp_t gfp)
+{
+	unsigned int n, cap, width;
+	struct conc_class *c;
+	unsigned long flags;
+	char *masks;
+	bool have_add = false;
+
+	cap = conc_nr_masks(conc) + 1;
+retry:
+	masks = kmalloc_array(cap, cpumask_size(), gfp);
+	if (!masks)
+		return UINT_MAX;
+	n = 0;
+	raw_spin_lock_irqsave(&conc->lock, flags);
+	list_for_each_entry(c, &conc->masks, node) {
+		if (del && c->tasks == 1 && cpumask_equal(conc_class_mask(c), del))
+			continue;
+		if (n == cap - 1) {
+			/* Grew meanwhile. */
+			raw_spin_unlock_irqrestore(&conc->lock, flags);
+			kfree(masks);
+			cap *= 2;
+			goto retry;
+		}
+		cpumask_copy((struct cpumask *)(masks + n * cpumask_size()), conc_class_mask(c));
+		if (add && cpumask_equal(conc_class_mask(c), add))
+			have_add = true;
+		n++;
+	}
+	raw_spin_unlock_irqrestore(&conc->lock, flags);
+	if (add && !have_add)
+		cpumask_copy((struct cpumask *)(masks + n++ * cpumask_size()), add);
+	width = conc_masks_width(masks, n, gfp);
+	kfree(masks);
+	return width;
+}
+
+/*
+ * The width of the masks a level allows: the effective limit, or the
+ * effective ceiling when no limit applies, 0 when neither does.
+ */
+static __maybe_unused unsigned int conc_class_cap(struct tg_concurrency *conc)
+{
+	unsigned int cap = READ_ONCE(conc->effective), ceiling = READ_ONCE(conc->ceiling_effective);
+
+	if (ceiling && (!cap || cap > ceiling))
+		cap = ceiling;
+	return cap;
+}
+
+/* The same against the requested limit, for sched_setaffinity(2). */
+static __maybe_unused unsigned int conc_class_cap_requested(struct tg_concurrency *conc)
+{
+	unsigned int cap = READ_ONCE(conc->request), ceiling = READ_ONCE(conc->ceiling_effective);
+
+	if (ceiling && (!cap || cap > ceiling))
+		cap = ceiling;
+	return cap;
+}
+
+/*
+ * The mask @t is entitled to: its cpuset's, masked by its requested mask
+ * as __set_cpus_allowed_ptr() does for a change from the kernel side. A
+ * cpuset change reaches the tasks one at a time; this is ahead of the
+ * ones it has not reached, and lets a presence move with the cpuset as
+ * a whole.
+ */
+static void __conc_task_entitled(struct task_struct *t, const struct cpumask *user,
+			       struct cpumask *mask)
+{
+	scoped_guard(rcu)
+		cpuset_task_cpus_rcu(t, mask);
+	if (user && cpumask_intersects(mask, user))
+		cpumask_and(mask, mask, user);
+}
+
+static __maybe_unused void conc_task_entitled(struct task_struct *t, struct cpumask *mask)
+{
+	guard(raw_spinlock_irq)(&t->pi_lock);
+	__conc_task_entitled(t, t->user_cpus_ptr, mask);
+}
+
+/*
+ * Tasks whose mask the limit never changes on its own: kernel threads and
+ * the tasks nothing may set the affinity of, and deadline tasks, whose
+ * bandwidth is admitted per root domain and would have to be checked
+ * again for a mask reaching another (dl_task_check_affinity()).
+ */
+static inline bool conc_task_mask_fixed(struct task_struct *t)
+{
+	return t->flags & (PF_KTHREAD | PF_NO_SETAFFINITY) || dl_task(t);
+}
+
 static __maybe_unused int conc_resv_cpu(struct conc_resv *resv)
 {
 	return resv->cpu;
@@ -498,3 +1672,195 @@ static inline void conc_debug_hold_end(struct task_struct *p, const char *how) {
 
 static inline void conc_debug_hold_arm(void) { }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
+
+/*
+ * The usable CPUs changed: the live part of every mask follows, and the
+ * classes and the unhit ones are counted again from them. A sleeping task
+ * pinned to CPUs that went away keeps its mask, as it would without a
+ * limit, and is no class meanwhile (select_fallback_rq() widens it if it
+ * wakes up before they come back); the masks around it may be classes
+ * now, and the ones that come back ask for their headroom. One whose
+ * tasks all run outside it stays dormant until cpuset gives them its CPUs
+ * back, see conc_task_set_outside(). Every counting
+ * group keeps its own list, so each one is visited. The configured masks,
+ * by which changes are admitted, are untouched: the width of their live
+ * parts never exceeds theirs, so the classes stay within the limit.
+ */
+static __maybe_unused void conc_refresh_live(void)
+{
+	struct task_group *tg;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(tg, &task_groups, list) {
+		struct tg_concurrency *conc = &tg->conc;
+		struct conc_class *c;
+		unsigned long flags;
+
+		if (!READ_ONCE(conc->active))
+			continue;
+		raw_spin_lock_irqsave(&conc->lock, flags);
+		list_for_each_entry(c, &conc->masks, node)
+			conc_class_set_live(c);
+		conc_classes_recount(conc);
+		raw_spin_unlock_irqrestore(&conc->lock, flags);
+	}
+	rcu_read_unlock();
+}
+
+/* Pin @p's group for a retry; NULL when it does not count. */
+static struct task_group *conc_pin_task_group(struct task_struct *p)
+{
+	struct task_group *tg;
+
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return NULL;
+	guard(rcu)();
+	tg = READ_ONCE(p->sched_task_group);
+	if (!READ_ONCE(tg->conc.active) || !css_tryget_online(&tg->css))
+		return NULL;
+	return tg;
+}
+
+/*
+ * A cpuset change, from cpuset_update_tasks_cpumask() before it reaches
+ * the tasks one at a time: the presence of every counting subtree under
+ * the cpuset moves into the new mask as a whole first, judged by the
+ * entitled masks (see conc_task_entitled()), so that each task's own change
+ * then finds a used CPU of its mask and no task wakes up to none. The
+ * registered masks change as a whole too: every task is registered with
+ * the mask it is configured to run on with the cpuset as written, so
+ * that the old and the new masks are never both counted with the limit
+ * relaxed to their width in between. A hotplug event comes this way and
+ * changes no registered mask.
+ */
+void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus)
+{
+	struct task_group **tops = NULL;
+	struct css_task_iter it;
+	struct task_struct *t;
+	cpumask_var_t outside, ent;
+	int i, n = 0, cap = 0, cpu;
+	bool have_ent;
+
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return;
+
+	have_ent = alloc_cpumask_var(&ent, GFP_KERNEL);
+	/*
+	 * The topmost counting groups of the tasks, each once, and the
+	 * classes switched to the new masks as a whole: under the
+	 * configuration mutex, so that no retry sees old and new mixed.
+	 */
+	mutex_lock(&conc_mutex);
+	css_task_iter_start(css, 0, &it);
+	while ((t = css_task_iter_next(&it))) {
+		struct task_group *tg = conc_pin_task_group(t), *top;
+
+		if (!tg)
+			continue;
+		if (have_ent && !kthread_is_per_cpu(t)) {
+			struct conc_class **pre = NULL;
+			int npre = 0;
+
+			/*
+			 * The mask it is configured to run on with the cpuset
+			 * as written, see __conc_task_class_mask(): unchanged by a
+			 * hotplug event, which reaches the tasks this way too.
+			 */
+			/*
+			 * Its outside state follows the mask the pass applies
+			 * next, see conc_task_set_outside(): back inside as a whole
+			 * with the cpuset, as the presence moves.
+			 */
+			scoped_guard(raw_spinlock_irq, &t->pi_lock) {
+				struct cpumask *applied = this_cpu_cpumask_var_ptr(conc_entitled_mask);
+
+				__conc_task_class_mask(t, t->user_cpus_ptr, ent);
+				__conc_task_entitled(t, t->user_cpus_ptr, applied);
+				if (conc_task_registered_with(t, ent, applied))
+					goto registered;
+			}
+			npre = conc_chain_depth(t);
+			pre = conc_class_prealloc(npre, GFP_KERNEL);
+			scoped_guard(raw_spinlock_irq, &t->pi_lock) {
+				struct cpumask *applied = this_cpu_cpumask_var_ptr(conc_entitled_mask);
+
+				__conc_task_entitled(t, t->user_cpus_ptr, applied);
+				conc_task_class_del(t);
+				if (conc_mask_counts(t, ent) && READ_ONCE(task_group(t)->conc.active))
+					conc_task_class_add(t, ent, applied, pre, npre);
+			}
+			conc_class_prealloc_free(pre, npre);
+		}
+registered:
+		top = tg;
+		while (top->parent && READ_ONCE(top->parent->conc.active))
+			top = top->parent;
+		for (i = 0; i < n; i++) {
+			if (tops[i] == top)
+				break;
+		}
+		if (i == n && n == cap) {
+			/* The iterator pins its position: sleeping is fine here. */
+			struct task_group **bigger;
+
+			cap = cap ? cap * 2 : 16;
+			bigger = kvrealloc(tops, cap * sizeof(*tops), GFP_KERNEL);
+			if (!bigger) {
+				css_put(&tg->css);
+				break;
+			}
+			tops = bigger;
+		}
+		if (i == n && css_tryget_online(&top->css))
+			tops[n++] = top;
+		css_put(&tg->css);
+	}
+	css_task_iter_end(&it);
+	if (have_ent)
+		free_cpumask_var(ent);
+	if (!n) {
+		mutex_unlock(&conc_mutex);
+		kvfree(tops);
+		return;
+	}
+
+	if (alloc_cpumask_var(&outside, GFP_KERNEL)) {
+		for (i = 0; i < n; i++) {
+			struct task_group *top = tops[i];
+
+			cpumask_andnot(outside, top->conc.used, cpus);
+			for_each_cpu(cpu, outside) {
+				if (!READ_ONCE(top->conc.active))
+					break;
+				if (atomic_read(per_cpu_ptr(top->conc.present, cpu)) < 0)
+					continue;
+				/* Best effort: the tasks' own changes finish the job. */
+				conc_evict_cpu(top, cpu, true, false, NULL, NULL, cpus);
+			}
+		}
+		free_cpumask_var(outside);
+	}
+	mutex_unlock(&conc_mutex);
+	for (i = 0; i < n; i++)
+		css_put(&tops[i]->css);
+	kvfree(tops);
+}
+
+#ifdef CONFIG_SCHED_MM_CID
+/*
+ * Is @t pinned to its cpu cgroup? Its mm is read under task_lock(), as
+ * execve(2) replaces it. A kernel thread borrowing an mm is not.
+ */
+static __maybe_unused bool conc_task_pinned(struct task_struct *t)
+{
+	bool pinned;
+
+	if (t->flags & PF_KTHREAD)
+		return false;
+	task_lock(t);
+	pinned = t->mm && READ_ONCE(t->mm->conc_pin);
+	task_unlock(t);
+	return pinned;
+}
+#endif /* CONFIG_SCHED_MM_CID */
