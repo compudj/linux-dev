@@ -8793,6 +8793,7 @@ int sched_cpu_activate(unsigned int cpu)
 	 */
 	sched_smt_present_inc(cpu);
 	set_cpu_active(cpu, true);
+	conc_cpu_activate(cpu);
 
 	if (sched_smp_initialized) {
 		sched_update_numa(cpu, true);
@@ -8832,6 +8833,12 @@ int sched_cpu_deactivate(unsigned int cpu)
 	 */
 	scoped_guard (rcu)
 		nohz_balance_exit_idle(rq);
+
+	/*
+	 * Move the presence of concurrency limited groups away as a whole
+	 * while the CPU is still active, before the pushes below start.
+	 */
+	conc_cpu_deactivate(cpu);
 
 	set_cpu_active(cpu, false);
 
@@ -8910,6 +8917,7 @@ int sched_cpu_wait_empty(unsigned int cpu)
 {
 	balance_hotplug_wait();
 	sched_force_init_mm();
+	conc_cpu_offline(cpu);
 	return 0;
 }
 
