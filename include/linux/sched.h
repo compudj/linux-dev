@@ -972,6 +972,14 @@ struct task_struct {
 	 * Documentation/scheduler/sched-max-concurrency.rst.
 	 */
 	u8				conc_accounted;
+	/*
+	 * Running without a slot (CONC_HOLD_UNPLACED), or on one that is being
+	 * emptied (CONC_HOLD_EVICT): held off the CPUs at the next return to
+	 * user space, see conc_hold_request(). Takes no concurrency ID.
+	 */
+	u8				conc_hold_pending;
+	/* No concurrency ID free below a bound at its schedule in: takes or waits for one at its return, see sched_cid_resume(). */
+	u8				cid_wait;
 	/* Held: out of its class, queued for the core, in TASK_RUNNING, on conc_held_list. */
 	u8				conc_held;
 	/* Its applied mask misses the one it is registered by, see conc_task_set_outside(). */
@@ -1481,6 +1489,7 @@ struct task_struct {
 #endif
 
 	struct rseq_data		rseq;
+	/* Concurrency IDs: the mm's domain, and the concurrency ID namespace's */
 	struct cid_user			mm_cid;
 
 	struct tlbflush_unmap_batch	tlb_ubc;
@@ -2398,7 +2407,7 @@ static __always_inline void alloc_tag_restore(struct alloc_tag *tag, struct allo
 void sched_mm_cid_before_execve(struct task_struct *t);
 void sched_mm_cid_after_execve(struct task_struct *t);
 void sched_mm_cid_exit(struct task_struct *t);
-void cid_domain_init(struct cid_domain *dom, struct cid_pcpu __percpu *pcpu,
+void cid_domain_init(struct cid_domain *dom, unsigned int kind, struct cid_pcpu __percpu *pcpu,
 		     unsigned long *cidmask, struct cpumask *cpus_allowed, struct task_struct *p);
 static __always_inline int task_mm_cid(struct task_struct *t)
 {
@@ -2572,7 +2581,19 @@ struct cgroup_subsys_state;
 struct cgroup_taskset;
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 extern void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus);
+extern void sched_cid_resume(void);
+
+/*
+ * From resume_user_mode_work(): the task found no concurrency ID free
+ * below a bound at its schedule in, and takes or waits for one now.
+ */
+static inline void sched_conc_resume_user_mode(void)
+{
+	if (unlikely(READ_ONCE(current->cid_wait)))
+		sched_cid_resume();
+}
 #else /* !CONFIG_SCHED_MAX_CONCURRENCY */
 static inline void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus) { }
+static inline void sched_conc_resume_user_mode(void) { }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 #endif

@@ -90,12 +90,54 @@ static __always_inline void cid_unset_on_task(struct cid_domain *dom, struct cid
 		cid_drop(dom, cid);
 }
 
+/*
+ * The domains whose CID each CPU owns, for the limit to drop them when a
+ * CPU leaves a group's used set (conc_slot_removed()) without walking the
+ * group's tasks. A record is on the list of its CPU while its CID has the
+ * ONCPU bit; every write of the field goes through here, under the rq lock
+ * of pcp->cpu, which the readers take too.
+ */
+DECLARE_PER_CPU(struct list_head, cid_cpu_doms);
+static __always_inline void cid_pcpu_write(struct cid_pcpu *pcp, unsigned int cid)
+{
+	bool had = cid_on_cpu(pcp->cid), has = cid_on_cpu(cid);
+
+	if (has && !had)
+		list_add(&pcp->node, per_cpu_ptr(&cid_cpu_doms, pcp->cpu));
+	else if (had && !has)
+		list_del_init(&pcp->node);
+	pcp->cid = cid;
+}
+
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+/* Do users wait for an ID below the bound? See sched_cid_resume(). */
+static __always_inline bool cid_waiters(struct cid_domain *dom)
+{
+	return READ_ONCE(dom->waiters);
+}
+
+/*
+ * An ID went back to the pool some other way than a schedule out, which
+ * gives it to a waiter: the waiters try again, from the irq work, which
+ * can be queued under any lock the callers hold.
+ */
+static __always_inline void cid_kick_waiters(struct cid_domain *dom)
+{
+	if (unlikely(cid_waiters(dom)))
+		irq_work_queue(&dom->irq_work);
+}
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static inline bool cid_waiters(struct cid_domain *dom) { return false; }
+static inline void cid_kick_waiters(struct cid_domain *dom) { }
+#endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
+
 static __always_inline void cid_drop_on_cpu(struct cid_domain *dom, struct cid_pcpu *pcp)
 {
 	/* Clear the ONCPU bit, but do not set UNSET in the per CPU storage */
 	if (cid_on_cpu(pcp->cid)) {
-		pcp->cid = cpu_cid_to_cid(pcp->cid);
+		cid_pcpu_write(pcp, cpu_cid_to_cid(pcp->cid));
 		cid_drop(dom, pcp->cid);
+		cid_kick_waiters(dom);
 	}
 }
 
@@ -110,16 +152,50 @@ static inline unsigned int __cid_get(struct cid_domain *dom, unsigned int max_ci
 	return cid;
 }
 
+/*
+ * Under a concurrency bound, the effective limit of the users' cgroup, no
+ * ID at or above it, see sched-max-concurrency.rst: a user that finds none
+ * free below it waits for one at its return to user space (cid_wait()).
+ */
 static inline unsigned int cid_get(struct cid_domain *dom)
 {
+	unsigned int bound = READ_ONCE(dom->bound);
 	unsigned int cid = __cid_get(dom, READ_ONCE(dom->max_cids));
 
+	if (cid == MM_CID_UNSET && bound)
+		return __cid_get(dom, bound);
 	while (cid == MM_CID_UNSET) {
 		cpu_relax();
 		cid = __cid_get(dom, num_possible_cpus());
 	}
 	return cid;
 }
+
+/* Is @cid one the domain cannot keep: at or above its bound? */
+static __always_inline bool cid_over(struct cid_domain *dom, unsigned int cid)
+{
+	unsigned int bound = READ_ONCE(dom->bound);
+
+	return bound && cpu_cid_to_cid(cid) >= bound;
+}
+
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+/*
+ * @t, scheduling in on this CPU, got no ID of the domain: it takes one at
+ * its return to user space, or waits there for one, see
+ * sched_cid_resume(). Nothing of the domain's is written here: @t owns no
+ * ID and this CPU caches none.
+ */
+static __always_inline void cid_wait(struct task_struct *t)
+{
+	WRITE_ONCE(t->cid_wait, 1);
+	set_tsk_thread_flag(t, TIF_NOTIFY_RESUME);
+}
+extern void cid_release_cpu(struct cid_domain *dom, struct cid_pcpu *pcp);
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static inline void cid_wait(struct task_struct *t) { }
+static inline void cid_release_cpu(struct cid_domain *dom, struct cid_pcpu *pcp) { }
+#endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 
 static inline unsigned int cid_converge(struct cid_domain *dom, unsigned int orig_cid,
 					unsigned int max_cids)
@@ -140,6 +216,21 @@ static inline unsigned int cid_converge(struct cid_domain *dom, unsigned int ori
 	return orig_cid;
 }
 
+/*
+ * Under a concurrency bound, a CID handed over between task and CPU, or
+ * the one a CPU owns found by a user with none, converges below max_cids
+ * at once, as the fast paths make the ones they keep converge: a bound is
+ * no target to reach at a later schedule in, see sched-max-concurrency.rst.
+ * Without one, the next schedule in converges it, as it always did.
+ */
+static __always_inline unsigned int cid_converge_bounded(struct cid_domain *dom,
+							 unsigned int orig_cid,
+							 unsigned int max_cids)
+{
+	if (likely(!READ_ONCE(dom->bound)) || cpu_cid_to_cid(orig_cid) < max_cids)
+		return orig_cid;
+	return cid_converge(dom, orig_cid, max_cids);
+}
 static __always_inline void cid_update_task(struct task_struct *t, struct cid_user *u,
 					    unsigned int cid)
 {
@@ -151,7 +242,7 @@ static __always_inline void cid_update_task(struct task_struct *t, struct cid_us
 
 static __always_inline void cid_update_pcpu(struct cid_domain *dom, unsigned int cid)
 {
-	__this_cpu_write(dom->pcpu->cid, cid);
+	cid_pcpu_write(this_cpu_ptr(dom->pcpu), cid);
 }
 
 static __always_inline void cid_from_cpu(struct cid_domain *dom, struct task_struct *t,
@@ -169,6 +260,8 @@ static __always_inline void cid_from_cpu(struct cid_domain *dom, struct task_str
 		}
 		/* Try to converge into the optimal CID space */
 		cpu_cid = cid_converge(dom, cpu_cid, max_cids);
+		if (unlikely(cid_over(dom, cpu_cid)))
+			goto over;
 	} else {
 		/* Hand over or drop the task owned CID */
 		if (cid_on_task(tcid)) {
@@ -178,8 +271,16 @@ static __always_inline void cid_from_cpu(struct cid_domain *dom, struct task_str
 				cpu_cid = cid_to_cpu_cid(tcid);
 		}
 		/* Still nothing, allocate a new one */
-		if (!cid_on_cpu(cpu_cid))
-			cpu_cid = cid_to_cpu_cid(cid_get(dom));
+		if (!cid_on_cpu(cpu_cid)) {
+			cpu_cid = cid_get(dom);
+			if (unlikely(cpu_cid == MM_CID_UNSET))
+				goto none;
+			cpu_cid = cid_to_cpu_cid(cpu_cid);
+		} else {
+			cpu_cid = cid_converge_bounded(dom, cpu_cid, max_cids);
+			if (unlikely(cid_over(dom, cpu_cid)))
+				goto over;
+		}
 
 		/* Handle the transition mode flag if required */
 		if (mode & MM_CID_TRANSIT)
@@ -187,6 +288,13 @@ static __always_inline void cid_from_cpu(struct cid_domain *dom, struct task_str
 	}
 	cid_update_pcpu(dom, cpu_cid);
 	cid_update_task(t, u, cpu_cid);
+	return;
+over:
+	/* The CPU's cached ID, beyond the bound: given back. */
+	cid_drop_on_cpu(dom, this_cpu_ptr(dom->pcpu));
+none:
+	cid_update_task(t, u, MM_CID_UNSET);
+	cid_wait(t);
 }
 
 static __always_inline void cid_from_task(struct cid_domain *dom, struct task_struct *t,
@@ -204,6 +312,8 @@ static __always_inline void cid_from_task(struct cid_domain *dom, struct task_st
 		}
 		/* Try to converge into the optimal CID space */
 		tcid = cid_converge(dom, tcid, max_cids);
+		if (unlikely(cid_over(dom, tcid)))
+			goto over;
 	} else {
 		/* Hand over or drop the CPU owned CID */
 		if (cid_on_cpu(cpu_cid)) {
@@ -213,13 +323,27 @@ static __always_inline void cid_from_task(struct cid_domain *dom, struct task_st
 				tcid = cpu_cid_to_cid(cpu_cid);
 		}
 		/* Still nothing, allocate a new one */
-		if (!cid_on_task(tcid))
+		if (!cid_on_task(tcid)) {
 			tcid = cid_get(dom);
+			if (unlikely(tcid == MM_CID_UNSET))
+				goto none;
+		} else {
+			tcid = cid_converge_bounded(dom, tcid, max_cids);
+			if (unlikely(cid_over(dom, tcid)))
+				goto over;
+		}
 		/* Set the transition mode flag if required */
 		tcid |= mode & MM_CID_TRANSIT;
 	}
 	cid_update_pcpu(dom, tcid);
 	cid_update_task(t, u, tcid);
+	return;
+over:
+	/* The task's own ID, beyond the bound: given back. */
+	cid_drop(dom, cid_from_transit_cid(tcid));
+none:
+	cid_update_task(t, u, MM_CID_UNSET);
+	cid_wait(t);
 }
 
 static __always_inline void __cid_schedin(struct cid_domain *dom, struct task_struct *next,
@@ -235,14 +359,40 @@ static __always_inline void __cid_schedin(struct cid_domain *dom, struct task_st
 		cid_from_cpu(dom, next, u, cpu_cid, mode);
 }
 
+#ifndef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+static inline void conc_debug_cid_kept(struct cid_domain *dom, struct task_struct *prev) { }
+#endif /* !CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+extern void conc_cid_left_cpu(struct cid_domain *dom, struct task_struct *prev);
+/* A CPU-owned ID does not outlive the group's presence on the CPU. */
+static __always_inline void conc_cid_schedout(struct cid_domain *dom, struct task_struct *prev,
+					    struct cid_user *u)
+{
+	if (static_branch_unlikely(&sched_conc_enabled) && cid_on_cpu(u->cid))
+		conc_cid_left_cpu(dom, prev);
+}
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static __always_inline void conc_cid_schedout(struct cid_domain *dom, struct task_struct *prev,
+					    struct cid_user *u) { }
+#endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 static __always_inline void __cid_schedout(struct cid_domain *dom, struct task_struct *prev,
 					   struct cid_user *u)
 {
 	unsigned int mode, cid;
 
 	/* During mode transitions CIDs are temporary and need to be dropped */
-	if (likely(!cid_in_transit(u->cid)))
+	if (likely(!cid_in_transit(u->cid))) {
+		/*
+		 * A user waits for an ID: the one this CPU owns goes to it
+		 * rather than staying cached here.
+		 */
+		if (unlikely(cid_waiters(dom)) && cid_on_cpu(u->cid)) {
+			cid_release_cpu(dom, this_cpu_ptr(dom->pcpu));
+			return;
+		}
+		conc_cid_schedout(dom, prev, u);
 		return;
+	}
 
 	mode = READ_ONCE(dom->mode);
 	cid = cid_from_transit_cid(u->cid);
@@ -258,6 +408,8 @@ static __always_inline void __cid_schedout(struct cid_domain *dom, struct task_s
 		/* Update both so that the next schedule in goes into the fast path */
 		cid_update_pcpu(dom, cid);
 		u->cid = cid;
+		/* Now CPU-owned: not past the group's presence here, as above. */
+		conc_cid_schedout(dom, prev, u);
 	} else {
 		cid_drop(dom, cid);
 		u->cid = MM_CID_UNSET;
@@ -286,11 +438,17 @@ static inline void mm_cid_switch_to(struct task_struct *prev, struct task_struct
 }
 
 /* Called from outside cid.c. */
+void __init cid_init_cpus(void);
+void cid_update_cpus_allowed(struct cid_domain *dom, const struct cpumask *affmsk);
 void mm_update_cpus_allowed(struct mm_struct *mm, const struct cpumask *affmsk);
 
 void sched_mm_cid_fork(struct task_struct *t);
+void cid_apply_bound(struct cid_domain *dom);
+
 #else /* !CONFIG_SCHED_MM_CID */
+static inline void cid_init_cpus(void) { }
 static inline void mm_cid_switch_to(struct task_struct *prev, struct task_struct *next) { }
+static inline void cid_update_cpus_allowed(struct cid_domain *dom, const struct cpumask *affmsk) { }
 static inline void mm_update_cpus_allowed(struct mm_struct *mm, const struct cpumask *affmsk) { }
 
 static inline void sched_mm_cid_fork(struct task_struct *t) { }

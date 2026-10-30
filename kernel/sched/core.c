@@ -4655,6 +4655,11 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	WARN_ON_ONCE(p->se.sched_delayed);
 	WARN_ON_ONCE(p->is_blocked);
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	/* A wait for a concurrency ID is the parent's. */
+	p->cid_wait			= 0;
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	p->se.cfs_rq			= NULL;
 #ifdef CONFIG_CFS_BANDWIDTH
@@ -8970,6 +8975,8 @@ void __init sched_init(void)
 	list_add(&root_task_group.list, &task_groups);
 	INIT_LIST_HEAD(&root_task_group.children);
 	INIT_LIST_HEAD(&root_task_group.siblings);
+	cid_init_cpus();
+	conc_init_root();
 	autogroup_init(&init_task);
 #endif /* CONFIG_CGROUP_SCHED */
 
