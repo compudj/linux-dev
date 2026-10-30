@@ -2953,6 +2953,10 @@ static int find_later_rq(struct task_struct *task)
 	if (!cpudl_find(&task_rq(task)->rd->cpudl, task, later_mask))
 		return -1;
 
+	/* Stay inside the used set of a group at its concurrency limit. */
+	if (!conc_constrain_mask(task, later_mask))
+		return -1;
+
 	/*
 	 * If we are here, some targets have been found, including
 	 * the most suitable which is, among the runqueues where the
@@ -3197,10 +3201,11 @@ retry:
 		goto retry;
 	}
 
-	move_queued_task_locked(rq, later_rq, next_task);
-	ret = 1;
-
-	resched_curr(later_rq);
+	/* The concurrency limit may still refuse the destination. */
+	if (move_queued_task_locked(rq, later_rq, next_task)) {
+		ret = 1;
+		resched_curr(later_rq);
+	}
 
 	double_unlock_balance(rq, later_rq);
 
@@ -3282,8 +3287,7 @@ static void pull_dl_task(struct rq *this_rq)
 
 			if (is_migration_disabled(p)) {
 				push_task = get_push_task(src_rq);
-			} else {
-				move_queued_task_locked(src_rq, this_rq, p);
+			} else if (move_queued_task_locked(src_rq, this_rq, p)) {
 				dmin = p->dl.deadline;
 				resched = true;
 			}

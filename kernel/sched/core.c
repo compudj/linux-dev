@@ -3158,7 +3158,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 	 * for groups of tasks (ie. cpuset), so that load balancing is not
 	 * immediately required to distribute the tasks within their new mask.
 	 */
-	dest_cpu = cpumask_any_and_distribute(cpu_valid_mask, ctx->new_mask);
+	dest_cpu = conc_pick_dest(p, cpu_valid_mask, ctx->new_mask, ctx);
 	if (dest_cpu >= nr_cpu_ids) {
 		ret = -EINVAL;
 		goto out;
@@ -3633,7 +3633,9 @@ int select_task_rq(struct task_struct *p, int cpu, int *wake_flags)
 	lockdep_assert_held(&p->pi_lock);
 
 	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p)) {
+		conc_select_prepare(p);
 		cpu = p->sched_class->select_task_rq(p, cpu, *wake_flags);
+		conc_select_done();
 		*wake_flags |= WF_RQ_SELECTED;
 	} else {
 		cpu = cpumask_any(p->cpus_ptr);
@@ -3651,6 +3653,10 @@ int select_task_rq(struct task_struct *p, int cpu, int *wake_flags)
 	 */
 	if (unlikely(!is_cpu_allowed(p, cpu)))
 		cpu = select_fallback_rq(task_cpu(p), p);
+
+	/* Claim a concurrency slot, redirecting into the used set if needed. */
+	if (conc_task_active(p))
+		cpu = conc_select_cpu(p, cpu);
 
 	return cpu;
 }
@@ -5664,7 +5670,9 @@ void sched_exec(void)
 	int dest_cpu;
 
 	scoped_guard (raw_spinlock_irqsave, &p->pi_lock) {
+		conc_select_prepare(p);
 		dest_cpu = p->sched_class->select_task_rq(p, task_cpu(p), WF_EXEC);
+		conc_select_done();
 		if (dest_cpu == smp_processor_id())
 			return;
 
@@ -9440,6 +9448,7 @@ static void sched_free_group(struct task_group *tg)
 {
 	free_fair_sched_group(tg);
 	free_rt_sched_group(tg);
+	free_conc_sched_group(tg);
 	autogroup_free(tg);
 	kmem_cache_free(task_group_cache, tg);
 }
@@ -9473,6 +9482,9 @@ struct task_group *sched_create_group(struct task_group *parent)
 		goto err;
 
 	if (!alloc_rt_sched_group(tg, parent))
+		goto err;
+
+	if (!alloc_conc_sched_group(tg))
 		goto err;
 
 	scx_tg_init(tg);
@@ -9579,7 +9591,11 @@ void sched_move_task(struct task_struct *tsk, bool for_autogroup)
 	rq = rq_guard.rq;
 
 	scoped_guard (sched_change, tsk, queue_flags) {
+		struct task_group *old_tg = task_group(tsk);
+
 		sched_change_group(tsk);
+		conc_task_change_group(tsk, old_tg);
+		conc_mm_task_moved(tsk);
 		if (!for_autogroup)
 			scx_cgroup_move_task(tsk);
 		if (scope->running)
