@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Shared by the tests of cpu.concurrency.max, test_cpu_concurrency.c, and
+ * their stress variants, test_cpu_concurrency_stress.c.
  */
 #ifndef CPU_CONCURRENCY_UTIL_H
 #define CPU_CONCURRENCY_UTIL_H
