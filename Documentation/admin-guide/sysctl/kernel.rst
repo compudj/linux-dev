@@ -723,6 +723,31 @@ A value of 0 means no change. The default value is 200 meaning the NMI
 watchdog is set to 30s (based on ``watchdog_thresh`` equal to 10).
 
 
+ns_cid_cur and ns_cid_max (IPC namespaces)
+==========================================
+
+Read-only, per IPC namespace: the bounds of the cross-process concurrency
+ID that rseq(2) reports in ``ns_cid`` to the tasks of the namespace the
+reader is in, as exclusive upper bounds.
+
+``ns_cid_max`` never changes for the life of a namespace: in a namespace
+created with ``CLONE_IPC_CID``, it is the effective ceiling of the
+``cpu.concurrency.max`` cgroup the creator sat in when the namespace was
+created, or the number of possible CPUs when there was none, and a
+process may size per-ID tables by it once. A cgroup has its ceiling
+from its creation on (``cpu.concurrency.child_ceiling``); the processes
+of the namespace are kept under the nearest cgroup with a ceiling,
+the creator's own or an ancestor. ``ns_cid_cur`` is the current target the
+IDs are kept below at the moment, which follows the limits of the
+cgroups of the namespace's tasks. In a namespace created
+without ``CLONE_IPC_CID``, the initial namespace included, ``ns_cid`` is
+the CPU number and both report the number of CPU IDs. Membership is per
+thread: a thread that switches IPC namespace with setns(2) switches
+alone, and the threads of one process may then read different values.
+See :ref:`Documentation/scheduler/sched-max-concurrency.rst
+<sched-max-concurrency>`.
+
+
 numa_balancing
 ==============
 

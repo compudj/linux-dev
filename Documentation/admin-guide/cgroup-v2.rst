@@ -611,7 +611,12 @@ namespace of the process which is attempting the migration.  If either
 is not reachable, the migration is rejected with -ENOENT.
 
 A "cpu.concurrency.max" limit (see the cpu controller) gives a delegatee
-two holds on the delegator that no other control gives.  The affinities a
+three holds on the delegator that no other control gives.  A process of a
+delegated sub-hierarchy that joined an IPC namespace created with
+CLONE_IPC_CID, which takes no more than CAP_SYS_ADMIN in a user
+namespace, cannot be moved out of the subtree its concurrency IDs were
+bounded on, by anyone: "cgroup.procs" and "cgroup.threads" writes fail
+with EBUSY, and "cgroup.kill" is the remedy.  And the affinities a
 delegatee sets, counted by their width, keep the enforced value of
 "cpu.concurrency.max" of the delegated cgroup at that width for as long
 as they stand: the delegator who needs the lower value back narrows
@@ -1412,7 +1417,8 @@ will be referred to. All time durations are in microseconds.
 	pool, are nested or disjoint and are not affected.
 
 	The limit also bounds the concurrency IDs that rseq(2) reports
-	to the processes of the cgroup, ``mm_cid``.  The bound of
+	to the processes of the cgroup: ``mm_cid``, and ``ns_cid`` in an
+	IPC namespace created with ``CLONE_IPC_CID``.  The bound of
 	``mm_cid`` follows the cgroup the process is in, and a process
 	moved out of the subtree leaves its ceiling behind: data
 	indexed by ``mm_cid`` is sized by the number of possible CPUs,
@@ -1424,7 +1430,24 @@ will be referred to. All time durations are in microseconds.
 	failing with EBUSY; its ``mm_cid`` stays below the ceiling
 	prctl(``PR_GET_CONCURRENCY_PIN``) returns, the effective ceiling
 	value when it pinned itself.  The pin cannot be undone; a
-	fork(2) child inherits it, execve(2) drops it.
+	fork(2) child inherits it, execve(2) drops it.  A namespace
+	created with ``CLONE_IPC_CID`` freezes its ``ns_cid`` ceiling,
+	readable as the ``ns_cid_max`` sysctl, on the effective ceiling
+	value of the cgroup its creator was in, and keeps its processes
+	under the nearest cgroup with a ceiling, the creator's own or
+	an ancestor: a process of the namespace cannot be moved out of
+	the subtree of that cgroup, nor can a process outside the
+	subtree join the namespace with setns(2), both failing with
+	EBUSY.  Data indexed by ``ns_cid`` can thus be sized once by
+	``ns_cid_max``.  A namespace created where no ceiling applies
+	has the number of possible CPUs as its ceiling.  Membership
+	follows each thread's IPC namespace: a thread that joins or
+	leaves a namespace with setns(2) does so alone.  The ``ns_cid``
+	field exists in rseq registrations of at least 36 bytes, which
+	user space detects as an ``AT_RSEQ_FEATURE_SIZE`` of at least
+	36; glibc 2.41 and later register that size.  A registration of
+	33 to 35 bytes, valid before the field existed, fails with
+	EINVAL.
 
 	This file affects all processes in the cgroup, whatever their
 	scheduling policy.  Kernel threads attached to the cgroup follow
@@ -1448,8 +1471,13 @@ will be referred to. All time durations are in microseconds.
 	- sched_setaffinity(2): EINVAL, when the mask would raise the
 	  width above the requested limit of the cgroup or of an
 	  ancestor, would overlap another mask of the limited subtree
-	  without nesting, or neither lies within the cpuset nor names
-	  every possible CPU.
+	  without nesting, would be narrower than a partition root
+	  holding SCHED_DEADLINE processes under its limit, or neither
+	  lies within the cpuset nor names every possible CPU.
+	- sched_setattr(2) and sched_setscheduler(2) to SCHED_DEADLINE:
+	  EPERM, in a limited subtree, while deadline admission control
+	  is on, but in a partition root under its own limit, where
+	  EBUSY means the bandwidth exceeds the limit.
 	- "cgroup.procs", "cgroup.threads" and clone3(2) with
 	  CLONE_INTO_CGROUP: EBUSY, when the move would raise the width
 	  above the enforced value or make masks overlap without
@@ -1457,8 +1485,13 @@ will be referred to. All time durations are in microseconds.
 	  process's affinity, the process is a SCHED_DEADLINE one bound
 	  for a limited subtree other than a partition root under its
 	  own limit, its mask is narrower than such a partition root
-	  holding SCHED_DEADLINE processes, or the process pinned itself
-	  to its cgroup.
+	  holding SCHED_DEADLINE processes, the process pinned itself to
+	  its cgroup, or it belongs to an IPC namespace whose ceiling
+	  was frozen on a cgroup the destination is not under.
+	- setns(2) to an IPC namespace with concurrency IDs: EBUSY,
+	  from outside that subtree.  unshare(2) and clone3(2) with
+	  UNSHARE_IPC_CID or CLONE_IPC_CID: EINVAL, without
+	  CLONE_NEWIPC or on a kernel without concurrency IDs.
 	- "cpuset.cpus", "cpuset.cpus.exclusive" and
 	  "cpuset.cpus.partition": EBUSY, when the write would raise the
 	  width above an enforced value or make masks overlap without
@@ -1505,7 +1538,8 @@ will be referred to. All time durations are in microseconds.
 	A container runtime gives a container's cgroup its ceiling by
 	writing "cpu.concurrency.child_ceiling" on the parent before
 	creating the cgroup, or by creating an intermediate cgroup of
-	its own.
+	its own, in either case before the container's IPC namespace is
+	created.
 	See :ref:`Documentation/scheduler/sched-max-concurrency.rst
 	<sched-max-concurrency>` for details.
 
