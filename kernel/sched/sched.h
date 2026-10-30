@@ -589,6 +589,8 @@ struct tg_concurrency {
 
 	struct irq_work		irq_work;
 	struct work_struct	work;
+	/* On conc_pass_retries, retried at the end of a cpuset pass. */
+	struct list_head	pass_node;
 	struct cgroup_file	effective_file;
 };
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
@@ -2741,11 +2743,13 @@ struct conc_affinity_ctx {
 	/* Class entries preallocated for the new requested mask, one per level. */
 	struct conc_class		**prealloc;
 	int			nr_prealloc;
-	/* With SCA_CC_JUDGED: the task's conc_move_seq and the limit generation judged at. */
+	/* With SCA_CONC_JUDGED: the task's conc_move_seq and the limit generation judged at. */
 	unsigned int		move_seq;
 	unsigned int		gen;
 	/* Counted as a change in flight, which set-moves wait for. */
 	bool			pending;
+	/* The mask was the task's already: the change returned early. */
+	bool			unchanged;
 };
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 struct affinity_context {
@@ -2756,6 +2760,13 @@ struct affinity_context {
 #endif
 	unsigned int		flags;
 };
+
+static inline void conc_affinity_unchanged(struct affinity_context *ctx)
+{
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	ctx->conc.unchanged = true;
+#endif
+}
 
 extern s64 update_curr_common(struct rq *rq);
 
