@@ -1606,8 +1606,16 @@ static inline int mm_alloc_cid_noprof(struct mm_struct *mm, struct task_struct *
 }
 # define mm_alloc_cid(...)	alloc_hooks(mm_alloc_cid_noprof(__VA_ARGS__))
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+extern void conc_dom_destroy(struct cid_domain *dom);
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static inline void conc_dom_destroy(struct cid_domain *dom) { }
+#endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
+extern void cid_domain_exit(struct cid_domain *dom);
 static inline void mm_destroy_cid(struct mm_struct *mm)
 {
+	conc_dom_destroy(&mm->mm_cid);
+	cid_domain_exit(&mm->mm_cid);
 	free_percpu(mm->mm_cid.pcpu);
 	mm->mm_cid.pcpu = NULL;
 }
