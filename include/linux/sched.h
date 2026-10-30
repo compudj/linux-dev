@@ -944,6 +944,18 @@ struct task_struct {
 	void				*migration_pending;
 	unsigned short			migration_disabled;
 	unsigned short			migration_flags;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	/*
+	 * The task holds a concurrency slot on task_cpu() for task_group().
+	 * Written under p->pi_lock or task_rq(p)->lock, see
+	 * Documentation/scheduler/sched-max-concurrency.rst.
+	 */
+	u8				conc_accounted;
+	/* Held: out of its class, queued for the core, in TASK_RUNNING, on conc_held_list. */
+	u8				conc_held;
+	/* The CPU of a slot reserved for this task's arrival, -1 when none. */
+	int				conc_resv_cpu;
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
 #ifdef CONFIG_PREEMPT_RCU
 	int				rcu_read_lock_nesting;
@@ -2549,4 +2561,7 @@ extern void migrate_enable(void);
 
 DEFINE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
 
+struct cgroup;
+struct cgroup_subsys_state;
+struct cgroup_taskset;
 #endif

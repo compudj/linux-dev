@@ -11247,10 +11247,16 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 
 /*
  * detach_task() -- detach the task for the migration specified in env
+ *
+ * Returns false, without detaching, when the concurrency limit of the
+ * task's group refuses env->dst_cpu.
  */
-static void detach_task(struct task_struct *p, struct lb_env *env)
+static bool detach_task(struct task_struct *p, struct lb_env *env)
 {
 	lockdep_assert_rq_held(env->src_rq);
+
+	if (!conc_task_move(p, env->src_cpu, env->dst_cpu, false))
+		return false;
 
 	if (p->sched_task_hot) {
 		p->sched_task_hot = 0;
@@ -11263,6 +11269,7 @@ static void detach_task(struct task_struct *p, struct lb_env *env)
 
 	deactivate_task(env->src_rq, p, DEQUEUE_NOCLOCK);
 	set_task_cpu(p, env->dst_cpu);
+	return true;
 }
 
 /*
@@ -11282,7 +11289,8 @@ static struct task_struct *detach_one_task(struct lb_env *env)
 		if (!can_migrate_task(p, env))
 			continue;
 
-		detach_task(p, env);
+		if (!detach_task(p, env))
+			continue;
 
 		/*
 		 * Right now, this is only the second place where
@@ -11401,7 +11409,12 @@ static int detach_tasks(struct lb_env *env)
 			break;
 		}
 
-		detach_task(p, env);
+		/*
+		 * A refusal here leaves env->imbalance reduced for this task:
+		 * the loop may end a little early.
+		 */
+		if (!detach_task(p, env))
+			goto next;
 		list_add(&p->se.group_node, &env->tasks);
 
 		detached++;

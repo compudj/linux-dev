@@ -2449,6 +2449,8 @@ static void move_remote_task_to_local_dsq(struct scx_sched *sch,
 	 */
 	p->scx.sticky_cpu = cpu_of(dst_rq);
 	deactivate_task(src_rq, p, 0);
+	/* sched_ext chose the CPU: the slot follows, or the task goes without one. */
+	conc_task_move(p, cpu_of(src_rq), cpu_of(dst_rq), true);
 	set_task_cpu(p, cpu_of(dst_rq));
 
 	switch_rq_lock(src_rq, dst_rq);

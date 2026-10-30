@@ -1187,6 +1187,20 @@ config CFS_BANDWIDTH
 	  restriction.
 	  See Documentation/scheduler/sched-bwc.rst for more information.
 
+config SCHED_MAX_CONCURRENCY
+	bool "Per-cgroup limit on concurrently used CPUs"
+	depends on CGROUP_SCHED && CPUSETS && SMP
+	default n
+	help
+	  This option adds the cpu.concurrency.max cgroup interface file,
+	  which bounds the number of CPUs on which the tasks of a cgroup
+	  may be present at any instant without pinning them to specific
+	  CPUs. The bound also caps the rseq concurrency IDs handed out to
+	  processes in the cgroup.
+	  See Documentation/scheduler/sched-max-concurrency.rst.
+
+	  If unsure, say N.
+
 config RT_GROUP_SCHED
 	bool "Group scheduling for SCHED_RR/FIFO"
 	depends on CGROUP_SCHED

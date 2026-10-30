@@ -546,6 +546,7 @@ static void cid_work_fn(struct work_struct *work)
 {
 	struct cid_domain *dom = container_of(work, struct cid_domain, work);
 
+	lockdep_assert_held(&dom->mutex);
 	guard(mutex)(&dom->mutex);
 	/* Did the last user leave already? */
 	if (!dom->users)

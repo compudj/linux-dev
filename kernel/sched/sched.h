@@ -475,6 +475,78 @@ struct cfs_bandwidth {
 };
 
 /* Task group related information */
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+/*
+ * Per task group state for the cpu.concurrency.max limit, see
+ * Documentation/scheduler/sched-max-concurrency.rst.
+ *
+ * present[cpu] encodes the state of the (group, cpu) slot in its sign:
+ *
+ *   >= 0			slot in use, holds that many entities (tasks of
+ *				this group plus child groups using the CPU)
+ *   CONC_SLOT_UNUSED		no slot
+ *   CONC_SLOT_DRAINING		idle slot the cleaner is removing
+ *   reserved			slot reserved for a set-move, see conc_slot_reserved();
+ *				count is value + CONC_SLOT_RESERVE_BIAS
+ *   evicting			busy slot being emptied, see conc_slot_evicting();
+ *				count is value + CONC_SLOT_EVICT_BIAS
+ *
+ * Lockless claims use atomic_inc_unless_negative(), so a slot with a
+ * negative value never gains entities behind the back of the slow path.
+ */
+#define CONC_SLOT_UNUSED		(-1)
+#define CONC_SLOT_DRAINING	(-2)
+#define CONC_SLOT_RESERVE_BIAS	(1 << 29)
+#define CONC_SLOT_EVICT_BIAS	(1 << 30)
+static inline bool conc_slot_reserved(int v)
+{
+	return v < CONC_SLOT_DRAINING && v >= -CONC_SLOT_RESERVE_BIAS;
+}
+enum conc_claim_result {
+	CONC_REFUSED	= 0,	/* the limit refuses the CPU */
+	CONC_CLAIMED	= 1,	/* an entity was added */
+	CONC_INACTIVE	= 2,	/* the group does not count; nothing was added */
+};
+struct tg_concurrency {
+	raw_spinlock_t		lock;
+	atomic_t __percpu	*present;
+	cpumask_var_t		used;
+	cpumask_var_t		unused_cores;	/* CPUs of the SMT cores no used CPU is on */
+	unsigned int		nr_used;
+	unsigned int		nr_evicting;	/* slots being evicted, counted in nr_used */
+
+	/* Requested masks of the subtree's tasks, under @lock */
+	struct list_head	masks;
+	unsigned int		unhit;		/* classes no used CPU hits: headroom kept for them */
+	bool			merged;		/* @masks counted above too, conc_chain_unlock() */
+
+	/* Configuration, serialized by conc_mutex */
+	unsigned int		request;	/* limit written, 0: "max" */
+	unsigned int		ceiling;		/* ceiling, fixed at creation, 0: "max" */
+	unsigned int		child_ceiling;	/* ceiling a new child takes, 0: "max" */
+	struct list_head	onlining;	/* took a ceiling, css not published yet */
+	unsigned int		effective;	/* limit in force, 0: unlimited */
+	unsigned int		ceiling_effective;	/* min of the ceilings up to the root, 0: unlimited */
+	unsigned int		reported;	/* last values notified via effective_file */
+	unsigned int		reported_ceiling;
+	bool			active;		/* counting enabled: self or an ancestor is limited */
+	bool			propagate;	/* parent counts this group's slots as entities */
+	bool			shrink_pending;	/* nr_used > effective: over the limit */
+
+	/*
+	 * The value reported dropped, and the concurrency bounds of the
+	 * subtree's domains must follow before the file shows the drop:
+	 * until then it shows no less than @shown_floor (UINT_MAX: "max").
+	 * Under @lock.
+	 */
+	bool			bounds_pending;
+	unsigned int		shown_floor;
+
+	struct irq_work		irq_work;
+	struct work_struct	work;
+	struct cgroup_file	effective_file;
+};
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 struct task_group {
 	struct cgroup_subsys_state css;
 
@@ -518,6 +590,10 @@ struct task_group {
 #endif
 
 	struct cfs_bandwidth	cfs_bandwidth;
+
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	struct tg_concurrency	conc;
+#endif
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 	/* The two decimal precision [%] value requested from user-space */
@@ -2611,6 +2687,9 @@ extern const u32		sched_prio_to_wmult[40];
 
 #define RETRY_TASK		((void *)-1UL)
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+struct conc_resv;
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 struct affinity_context {
 	const struct cpumask	*new_mask;
 	struct cpumask		*user_mask;
@@ -2900,6 +2979,7 @@ extern struct task_struct *pick_task_idle(struct rq *rq, struct rq_flags *rf);
 #define SCA_MIGRATE_DISABLE	0x02
 #define SCA_MIGRATE_ENABLE	0x04
 #define SCA_USER		0x08
+#define SCA_CC_JUDGED		0x10
 
 extern void update_group_capacity(struct sched_domain *sd, int cpu);
 
@@ -3066,6 +3146,41 @@ static inline void sub_nr_running(struct rq *rq, unsigned count)
 	sched_update_tick_dependency(rq);
 }
 
+/*
+ * Per-CPU kthreads are allowed to run on !active && online CPUs, see
+ * __set_cpus_allowed_ptr() and select_fallback_rq().
+ */
+static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
+{
+	/* When not in the task's cpumask, no point in looking further. */
+	if (!task_allowed_on_cpu(p, cpu))
+		return false;
+
+	/* migrate_disabled() must be allowed to finish. */
+	if (is_migration_disabled(p))
+		return cpu_online(cpu);
+
+	/* Non kernel threads are not allowed during either online or offline. */
+	if (!(p->flags & PF_KTHREAD))
+		return cpu_active(cpu);
+
+	/* KTHREAD_IS_PER_CPU is always allowed. */
+	if (kthread_is_per_cpu(p))
+		return cpu_online(cpu);
+
+	/* Regular kernel threads don't get to stay during offline. */
+	if (cpu_dying(cpu))
+		return false;
+
+	/* But are allowed during online. */
+	return cpu_online(cpu);
+}
+struct migration_arg {
+	struct task_struct		*task;
+	int				dest_cpu;
+	struct set_affinity_pending	*pending;
+};
+#include "concurrency.h"
 static inline void __block_task(struct rq *rq, struct task_struct *p)
 {
 	if (p->sched_contributes_to_load)
@@ -3105,7 +3220,12 @@ static inline void __block_task(struct rq *rq, struct task_struct *p)
 	 *
 	 * Callers must ensure to not reference @p after this -- we no longer
 	 * own it.
+	 *
+	 * The concurrency slot is released before that store, so a waker
+	 * that observes p->on_rq == 0 also observes the release before it
+	 * claims a slot of its own.
 	 */
+	conc_task_release(p, cpu_of(rq));
 	smp_store_release(&p->on_rq, 0);
 }
 
@@ -3914,8 +4034,9 @@ extern void init_sched_mm(struct task_struct *p);
 
 extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
 extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
+/* Move without concurrency accounting; callers have moved the slot already. */
 static inline
-void move_queued_task_locked(struct rq *src_rq, struct rq *dst_rq, struct task_struct *task)
+void __move_queued_task_locked(struct rq *src_rq, struct rq *dst_rq, struct task_struct *task)
 {
 	lockdep_assert_rq_held(src_rq);
 	lockdep_assert_rq_held(dst_rq);
@@ -3926,6 +4047,18 @@ void move_queued_task_locked(struct rq *src_rq, struct rq *dst_rq, struct task_s
 	wakeup_preempt(dst_rq, task, 0);
 }
 
+/*
+ * Returns false, without moving, when the concurrency limit of the task's
+ * group refuses the destination CPU.
+ */
+static inline
+bool move_queued_task_locked(struct rq *src_rq, struct rq *dst_rq, struct task_struct *task)
+{
+	if (!conc_task_move(task, src_rq->cpu, dst_rq->cpu, false))
+		return false;
+	__move_queued_task_locked(src_rq, dst_rq, task);
+	return true;
+}
 static inline
 bool task_is_pushable(struct rq *rq, struct task_struct *p, int cpu)
 {
