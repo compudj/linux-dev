@@ -2589,10 +2589,39 @@ struct cgroup;
 struct cgroup_subsys_state;
 struct cgroup_taskset;
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
+extern bool conc_cgroup_limited(struct cgroup *cgrp);
+extern int conc_cpuset_attach_check(struct cgroup_taskset *tset);
 extern void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus);
+extern int conc_cpuset_check(struct cgroup_subsys_state *css,
+			   bool (*trial)(struct task_struct *t, struct cpumask *mask,
+					 bool *fixed, void *arg),
+			   void *arg);
+extern int conc_cpuset_busy(struct cgroup_subsys_state *css,
+			  bool (*in)(struct cgroup_subsys_state *css));
+extern bool conc_cpuset_active(void);
 extern void conc_fatal_signal(struct task_struct *t);
 #else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static inline int conc_cpuset_attach_check(struct cgroup_taskset *tset)
+{
+	return 0;
+}
 static inline void conc_fatal_signal(struct task_struct *t) { }
 static inline void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus) { }
+static inline int conc_cpuset_busy(struct cgroup_subsys_state *css,
+				 bool (*in)(struct cgroup_subsys_state *css))
+{
+	return 0;
+}
+static inline bool conc_cpuset_active(void)
+{
+	return false;
+}
+static inline int conc_cpuset_check(struct cgroup_subsys_state *css,
+				  bool (*trial)(struct task_struct *t, struct cpumask *mask,
+						bool *fixed, void *arg),
+				  void *arg)
+{
+	return 0;
+}
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 #endif

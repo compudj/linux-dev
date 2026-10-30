@@ -165,6 +165,16 @@ static int conc_resv_cpu(struct conc_resv *resv);
 
 static void conc_classes_drop(struct tg_concurrency *conc);
 
+/*
+ * The groups that took a ceiling in their css_online() and whose css
+ * cgroup core has not published yet (online_css()): a cpuset write on
+ * their subtree meanwhile still resolves their cgroups to the css above,
+ * and must be judged as under their limit all the same. Entries leave
+ * once seen published, or when the group does not come online or goes.
+ */
+static LIST_HEAD(conc_onlining);
+static DEFINE_SPINLOCK(conc_onlining_lock);
+
 static inline bool conc_task_mask_fixed(struct task_struct *t);
 static void conc_task_entitled(struct task_struct *t, struct cpumask *mask);
 
@@ -336,7 +346,7 @@ void conc_fork_done(struct task_struct *p)
  * (conc_attach_check(), conc_fork_check()), end the same way: they need
  * nothing a waiter holds.
  */
-static __maybe_unused void conc_wait_judged(void)
+static void conc_wait_judged(void)
 {
 	lockdep_assert_held(&conc_mutex);
 	for (;;) {
@@ -2700,6 +2710,276 @@ static bool conc_request_taken(struct task_struct *t, const struct cpumask *req,
 		return true;
 	cpumask_and(tmp, req, possible);
 	return cpumask_subset(tmp, conf);
+}
+
+/*
+ * Is the cpuset @css one whose configured CPUs change by judged writes
+ * only, see conc_request_taken()? Its cgroup must be of a limited subtree,
+ * or of the subtree a limit is starting on (@starting), for the rule that
+ * grants it all it names to hold. Under RCU.
+ */
+static bool conc_cpuset_fixed(struct cgroup_subsys_state *css, struct task_group *starting)
+{
+	if (!cpuset_css_cpus_fixed_rcu(css))
+		return false;
+	if (starting && cgroup_is_descendant(css->cgroup, starting->css.cgroup))
+		return true;
+	return conc_cgroup_limited(css->cgroup);
+}
+
+/* Does a group being onlined with a ceiling hold @cgrp in its subtree? */
+static bool conc_cgroup_onlining(struct cgroup *cgrp)
+{
+	struct task_group *tg, *tmp;
+
+	guard(spinlock)(&conc_onlining_lock);
+	list_for_each_entry_safe(tg, tmp, &conc_onlining, conc.onlining) {
+		struct cgroup *tg_cgrp = tg->css.cgroup;
+
+		if (rcu_access_pointer(tg_cgrp->subsys[cpu_cgrp_id]) == &tg->css) {
+			list_del_init(&tg->conc.onlining);
+			continue;
+		}
+		if (cgroup_is_descendant(cgrp, tg_cgrp))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Does the group of @cgrp count, under a limit of its own or of an
+ * ancestor? Its cpusets must then grant what they name, see
+ * cpuset_conc_judge(). Under RCU.
+ */
+bool conc_cgroup_limited(struct cgroup *cgrp)
+{
+	if (READ_ONCE(css_tg(cgroup_e_css(cgrp, &cpu_cgrp_subsys))->conc.active))
+		return true;
+	return conc_cgroup_onlining(cgrp);
+}
+
+/*
+ * May the subtree of @tg start counting? Every cpuset in it must grant
+ * what it names (cpuset_conc_check_subtree()), and every task's requested
+ * mask must be taken (conc_request_taken()): the limit could not
+ * hold what they become without a write it judges. cpuset_mutex and
+ * conc_mutex held.
+ */
+static __maybe_unused int conc_subtree_literal(struct task_group *tg)
+{
+	struct cgroup_subsys_state **csses;
+	struct css_task_iter it;
+	struct task_struct *t;
+	cpumask_var_t conf, tmp;
+	int ret, nr_css, k;
+
+	ret = cpuset_conc_check_subtree(tg->css.cgroup);
+	if (ret)
+		return ret;
+	if (!alloc_cpumask_var(&conf, GFP_KERNEL))
+		return -ENOMEM;
+	if (!alloc_cpumask_var(&tmp, GFP_KERNEL)) {
+		free_cpumask_var(conf);
+		return -ENOMEM;
+	}
+	ret = conc_subtree_snapshot(tg, &csses, &nr_css);
+	if (ret)
+		goto out;
+	for (k = 0; k < nr_css; k++) {
+		if (!csses[k])
+			continue;
+		css_task_iter_start(csses[k], 0, &it);
+		while (!ret && (t = css_task_iter_next(&it))) {
+			bool fixed;
+
+			scoped_guard(rcu) {
+				cpuset_task_cpus_configured_rcu(t, conf);
+				fixed = conc_cpuset_fixed(task_css(t, cpuset_cgrp_id), tg);
+			}
+			guard(raw_spinlock_irq)(&t->pi_lock);
+			if (t->user_cpus_ptr &&
+			    !conc_request_taken(t, t->user_cpus_ptr, conf, fixed, tmp)) {
+				trace_sched_conc_refuse(t, "cpu.concurrency.max",
+						      "a request its cpuset cuts", -EBUSY);
+				ret = -EBUSY;
+			}
+		}
+		css_task_iter_end(&it);
+		if (ret)
+			break;
+	}
+	conc_subtree_release(csses, nr_css);
+out:
+	free_cpumask_var(tmp);
+	free_cpumask_var(conf);
+	return ret;
+}
+
+/**
+ * conc_cpuset_check - would a cpuset write raise the width above a limit?
+ * @css: the cpuset css whose subtree holds every cpuset the write changes
+ * @trial: the mask a task would be configured to run on once the write is
+ *	   applied, and whether its cpuset then names it (see
+ *	   conc_request_taken()), or false when the write leaves its mask alone
+ * @arg: @trial's argument
+ *
+ * Every active group with a task whose mask the write changes, and every
+ * active ancestor, is recounted with the trial masks, since a child's
+ * masks can be wider than its parent's. The tasks are looked for in the
+ * cpusets below @css too: a cpuset with cpusets below it holds none of
+ * theirs. A task of an active group must keep its requested mask within
+ * the trial's CPUs, or name every CPU, unless its cpuset names them (see
+ * conc_request_taken()).
+ *
+ * Return: 0, -EBUSY when a group would exceed its limit, or a request
+ * would be cut, or -ENOMEM.
+ */
+int conc_cpuset_check(struct cgroup_subsys_state *css,
+		    bool (*trial)(struct task_struct *t, struct cpumask *mask, bool *fixed,
+				  void *arg),
+		    void *arg)
+{
+	struct task_group **seen = NULL;
+	struct cgroup_subsys_state **csses;
+	struct css_task_iter it;
+	struct task_struct *t;
+	cpumask_var_t mask, tmp;
+	int n = 0, cap = 0, ret = 0, nr_css, k;
+
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return 0;
+	if (!alloc_cpumask_var(&mask, GFP_KERNEL))
+		return -ENOMEM;
+	if (!alloc_cpumask_var(&tmp, GFP_KERNEL)) {
+		free_cpumask_var(mask);
+		return -ENOMEM;
+	}
+
+	mutex_lock(&conc_mutex);
+	/* The migrations and forks judged before the write: judged where they land. */
+	conc_wait_judged();
+	ret = conc_subtree_snapshot(css_tg(css), &csses, &nr_css);
+	if (ret)
+		goto out;
+	for (k = 0; k < nr_css; k++) {
+		if (!csses[k])
+			continue;
+		css_task_iter_start(csses[k], 0, &it);
+		while (!ret && (t = css_task_iter_next(&it))) {
+			struct task_group *lvl;
+			bool fixed = false, changes;
+
+			/* The trial reads the task's cpuset. */
+			scoped_guard(rcu)
+				changes = trial(t, mask, &fixed, arg);
+			if (!changes)
+				continue;
+			if (READ_ONCE(READ_ONCE(t->sched_task_group)->conc.active)) {
+				scoped_guard(rcu)
+					fixed = fixed && conc_cgroup_limited(task_css(t, cpuset_cgrp_id)->cgroup);
+				scoped_guard(raw_spinlock_irq, &t->pi_lock) {
+					if (t->user_cpus_ptr &&
+					    !conc_request_taken(t, t->user_cpus_ptr, mask, fixed, tmp))
+						ret = -EBUSY;
+				}
+				if (ret) {
+					trace_sched_conc_refuse(t, "cpuset write",
+							      "a request the cpuset would cut", ret);
+					break;
+				}
+			}
+			for (lvl = READ_ONCE(t->sched_task_group); lvl && READ_ONCE(lvl->conc.active);
+			     lvl = lvl->parent) {
+				unsigned int limit, width;
+				int i;
+
+				/* A level checked already had its ancestors checked too. */
+				for (i = 0; i < n; i++) {
+					if (seen[i] == lvl)
+						break;
+				}
+				if (i < n)
+					break;
+				if (n == cap) {
+					struct task_group **bigger;
+
+					cap = cap ? cap * 2 : 16;
+					bigger = krealloc_array(seen, cap, sizeof(*seen),
+								GFP_KERNEL);
+					if (!bigger) {
+						ret = -ENOMEM;
+						break;
+					}
+					seen = bigger;
+				}
+				seen[n++] = lvl;
+				limit = conc_class_cap(&lvl->conc);
+				if (!limit)
+					continue;
+				width = __conc_recount_width(lvl, trial, arg, NULL, 0, NULL, 0);
+				if (width > limit) {
+					trace_sched_conc_refuse(t, "cpuset write",
+							      "the width above the limit", -EBUSY);
+					ret = -EBUSY;
+					break;
+				}
+			}
+		}
+		css_task_iter_end(&it);
+		if (ret)
+			break;
+	}
+	conc_subtree_release(csses, nr_css);
+out:
+	mutex_unlock(&conc_mutex);
+	kfree(seen);
+	free_cpumask_var(tmp);
+	free_cpumask_var(mask);
+	return ret;
+}
+
+/* Is a group counting? A cpuset write needs no trial otherwise. */
+bool conc_cpuset_active(void)
+{
+	return static_branch_unlikely(&sched_conc_enabled);
+}
+
+/*
+ * Does a task of a counting group live in a cpuset of @css's subtree that
+ * @in selects? -EBUSY then, for the cpuset writes whose effect on the
+ * configured CPUs a trial cannot compute; see cpuset_conc_judge().
+ */
+int conc_cpuset_busy(struct cgroup_subsys_state *css, bool (*in)(struct cgroup_subsys_state *css))
+{
+	struct cgroup_subsys_state *pos;
+	struct css_task_iter it;
+	struct task_struct *t;
+	int ret = 0;
+
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return 0;
+	mutex_lock(&conc_mutex);
+	rcu_read_lock();
+	css_for_each_descendant_pre(pos, css) {
+		if (!in(pos))
+			continue;
+		css_task_iter_start(pos, 0, &it);
+		while ((t = css_task_iter_next(&it))) {
+			if (READ_ONCE(READ_ONCE(t->sched_task_group)->conc.active)) {
+				trace_sched_conc_refuse(t, "cpuset write",
+						      "a change of its cpuset that cannot be judged",
+						      -EBUSY);
+				ret = -EBUSY;
+				break;
+			}
+		}
+		css_task_iter_end(&it);
+		if (ret)
+			break;
+	}
+	rcu_read_unlock();
+	mutex_unlock(&conc_mutex);
+	return ret;
 }
 
 /*
@@ -5927,6 +6207,12 @@ int conc_attach_check(struct cgroup_taskset *tset)
 	ret = __conc_attach_check(tset, false);
 	conc_cfg_unlock();
 	return ret;
+}
+
+/* From cpuset_can_attach(), under cpuset_mutex. */
+int conc_cpuset_attach_check(struct cgroup_taskset *tset)
+{
+	return __conc_attach_check(tset, true);
 }
 
 /*

@@ -11,12 +11,6 @@
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 /* Filled in by a later patch. */
-static inline bool conc_cpuset_fixed(struct cgroup_subsys_state *css, struct task_group *starting)
-{
-	return false;
-}
-
-/* Filled in by a later patch. */
 static inline unsigned int conc_ns_clamp(struct cid_domain *dom, unsigned int bound)
 {
 	return bound;
