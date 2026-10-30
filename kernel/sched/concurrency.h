@@ -10,12 +10,6 @@
 /* Included by sched.h, after the runqueue and task group definitions. */
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
-/* Filled in by a later patch. */
-static inline bool conc_task_pinned_offlining(struct task_struct *p)
-{
-	return false;
-}
-
 /*
  * Concurrency accounting primitives, see
  * Documentation/scheduler/sched-max-concurrency.rst.
@@ -217,6 +211,9 @@ extern int conc_pick_dest(struct task_struct *p, const struct cpumask *valid,
 extern void conc_task_mask_changed(struct task_struct *p, struct affinity_context *ctx);
 extern void conc_task_fork(struct task_struct *p);
 struct kernel_clone_args;
+extern void conc_cpu_deactivate(unsigned int cpu);
+extern void conc_cpu_activate(unsigned int cpu);
+extern void conc_cpu_offline(unsigned int cpu);
 
 /* Called from outside concurrency.c. */
 int alloc_conc_sched_group(struct task_group *tg);
@@ -294,6 +291,12 @@ static inline void conc_task_mask_changed(struct task_struct *p, struct affinity
 static inline void conc_task_fork(struct task_struct *p) { }
 
 struct kernel_clone_args;
+
+static inline void conc_cpu_deactivate(unsigned int cpu) { }
+
+static inline void conc_cpu_activate(unsigned int cpu) { }
+
+static inline void conc_cpu_offline(unsigned int cpu) { }
 
 static inline int alloc_conc_sched_group(struct task_group *tg) { return 1; }
 
