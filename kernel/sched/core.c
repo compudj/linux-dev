@@ -3208,6 +3208,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 		    !(ctx->flags & SCA_DL_BW_RESERVED)) {
 			if (ctx->flags & SCA_USER)
 				swap(p->user_cpus_ptr, ctx->user_mask);
+			conc_affinity_unchanged(ctx);
 			goto out;
 		}
 
@@ -3286,6 +3287,15 @@ int __set_cpus_allowed_ptr(struct task_struct *p, struct affinity_context *ctx)
 {
 	struct rq_flags rf;
 	struct rq *rq;
+	int ret;
+
+	/*
+	 * Let the concurrency limit prepare the change before the mask
+	 * changes. See conc_prepare_affinity(). migrate_disable() and
+	 * migrate_enable() do not change the mask.
+	 */
+	if (!(ctx->flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)))
+		conc_prepare_affinity(p, ctx);
 
 	rq = task_rq_lock(p, &rf);
 	/*
@@ -3297,7 +3307,17 @@ int __set_cpus_allowed_ptr(struct task_struct *p, struct affinity_context *ctx)
 	    cpumask_and(rq->scratch_mask, ctx->new_mask, p->user_cpus_ptr))
 		ctx->new_mask = rq->scratch_mask;
 
-	return __set_cpus_allowed_ptr_locked(p, ctx, rq, &rf);
+	ret = __set_cpus_allowed_ptr_locked(p, ctx, rq, &rf);
+
+	/*
+	 * Tell the concurrency limit that the change ended. A mask change can
+	 * let a group come back within its limit. migrate_disable() and
+	 * migrate_enable() do not change the mask and cannot sleep.
+	 */
+	if (!(ctx->flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)))
+		conc_task_affinity_changed(p, ctx);
+
+	return ret;
 }
 
 int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
@@ -9784,6 +9804,7 @@ static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
 
 static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
 {
+	int ret;
 #ifdef CONFIG_RT_GROUP_SCHED
 	struct task_struct *task;
 	struct cgroup_subsys_state *css;
@@ -9797,7 +9818,29 @@ static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
 	}
 scx_check:
 #endif /* CONFIG_RT_GROUP_SCHED */
-	return scx_cgroup_can_attach(tset);
+	ret = scx_cgroup_can_attach(tset);
+	if (ret)
+		return ret;
+	/*
+	 * If the check below refuses the migration, the cpu controller is the
+	 * subsystem which failed. cgroup core does not call cancel_attach()
+	 * for that subsystem. So cancel the preparation of sched_ext here.
+	 */
+	ret = conc_attach_check(tset);
+	if (ret) {
+		scx_cgroup_cancel_attach(tset);
+		return ret;
+	}
+	/*
+	 * Record the groups which the threads leave. They are retried after
+	 * the move.
+	 */
+	ret = conc_attach_record_srcs(tset);
+	if (ret) {
+		conc_attach_finish(tset, false);
+		scx_cgroup_cancel_attach(tset);
+	}
+	return ret;
 }
 
 static void cpu_cgroup_attach(struct cgroup_taskset *tset)
@@ -9807,10 +9850,17 @@ static void cpu_cgroup_attach(struct cgroup_taskset *tset)
 
 	cgroup_taskset_for_each(task, css, tset)
 		sched_move_task(task, false);
+
+	/*
+	 * Retry the limits of the groups which the tasks left and joined. The
+	 * attach stage never fails. A task which finds no slot is held.
+	 */
+	conc_attach_finish(tset, true);
 }
 
 static void cpu_cgroup_cancel_attach(struct cgroup_taskset *tset)
 {
+	conc_attach_finish(tset, false);
 	scx_cgroup_cancel_attach(tset);
 }
 

@@ -546,6 +546,8 @@ struct tg_concurrency {
 
 	struct irq_work		irq_work;
 	struct work_struct	work;
+	/* On conc_pass_retries, retried at the end of a cpuset pass. */
+	struct list_head	pass_node;
 	struct cgroup_file	effective_file;
 };
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
@@ -2735,6 +2737,15 @@ extern const u32		sched_prio_to_wmult[40];
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 struct conc_resv;
+/* The part of an affinity change which the concurrency limit uses. */
+struct conc_affinity_ctx {
+	/* A slot reserved for the task's new CPU. */
+	struct conc_resv		*resv;
+	/* Counted as a change in flight, which set-moves wait for. */
+	bool			pending;
+	/* The mask was the task's already: the change returned early. */
+	bool			unchanged;
+};
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 struct affinity_context {
 	const struct cpumask	*new_mask;
@@ -2743,8 +2754,18 @@ struct affinity_context {
 	u64			dl_bw_moved;
 	/* In, with SCA_DL_BW_RESERVED: the CPU the caller made room on. */
 	int			dl_bw_cpu;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	struct conc_affinity_ctx	conc;
+#endif
 	unsigned int		flags;
 };
+
+static inline void conc_affinity_unchanged(struct affinity_context *ctx)
+{
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	ctx->conc.unchanged = true;
+#endif
+}
 
 extern s64 update_curr_common(struct rq *rq);
 

@@ -11,27 +11,6 @@
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 /* Filled in by a later patch. */
-static inline int conc_make_reachable(struct task_group *tg, const struct cpumask *mask)
-{
-	return false;
-}
-
-/* Filled in by a later patch. */
-static inline int conc_set_move(struct task_group *top, int src, int dst,
-				struct task_struct *mask_task, const struct cpumask *mask)
-{
-	return -EBUSY;
-}
-
-/* Filled in by a later patch. */
-static inline int conc_set_move_dest(struct task_group *top, int src, struct cpumask *scratch,
-				     const struct cpumask *within,
-				     struct task_struct *mask_task, const struct cpumask *mask)
-{
-	return -EBUSY;
-}
-
-/* Filled in by a later patch. */
 static inline bool conc_task_pinned_offlining(struct task_struct *p)
 {
 	return false;
@@ -300,11 +279,19 @@ extern bool conc_can_move(struct task_struct *p, int cpu);
 extern bool conc_constrain_mask(struct task_struct *p, struct cpumask *mask);
 extern int conc_pick_dest(struct task_struct *p, const struct cpumask *valid,
 			const struct cpumask *allowed, struct affinity_context *ctx);
+extern void conc_task_affinity_changed(struct task_struct *p, struct affinity_context *ctx);
+extern void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx);
 
 /* Called from outside concurrency.c. */
 int alloc_conc_sched_group(struct task_group *tg);
 
 void free_conc_sched_group(struct task_group *tg);
+
+int conc_attach_record_srcs(struct cgroup_taskset *tset);
+
+void conc_attach_finish(struct cgroup_taskset *tset, bool retry);
+
+int conc_attach_check(struct cgroup_taskset *tset);
 
 #ifdef CONFIG_SCHED_MM_CID
 
@@ -386,11 +373,22 @@ static inline int conc_pick_dest(struct task_struct *p, const struct cpumask *va
 	return cpumask_any_and_distribute(valid, allowed);
 }
 
+static inline void conc_task_affinity_changed(struct task_struct *p,
+					      struct affinity_context *ctx) { }
+
+static inline void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx) { }
+
 static inline int alloc_conc_sched_group(struct task_group *tg) { return 1; }
 
 static inline void free_conc_sched_group(struct task_group *tg) { }
 
 static inline void conc_mm_task_moved(struct task_struct *p) { }
+
+static inline int conc_attach_record_srcs(struct cgroup_taskset *tset) { return 0; }
+
+static inline void conc_attach_finish(struct cgroup_taskset *tset, bool retry) { }
+
+static inline int conc_attach_check(struct cgroup_taskset *tset) { return 0; }
 
 #ifdef CONFIG_SCHED_MM_CID
 static inline void conc_bounds_lock(void) { }

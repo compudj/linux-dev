@@ -1007,6 +1007,17 @@ struct task_struct {
 	 * tasks.
 	 */
 	u8				conc_held;
+	/*
+	 * The task runs a cgroup migration and is between can_attach() and
+	 * attach(), see conc_wait_attach().
+	 */
+	u8				conc_attaching;
+	/*
+	 * The task applies the CPUs of a cpuset to the tasks of the cpuset.
+	 * The retries of the limits wait for the end of this pass
+	 * (conc_pass_end()).
+	 */
+	u8				conc_in_pass;
 	/* The CPU of a slot reserved for this task's arrival, -1 when none. */
 	int				conc_resv_cpu;
 	struct list_head		conc_hold_node;
@@ -2601,6 +2612,8 @@ extern void migrate_enable(void);
 DEFINE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
+extern void conc_pass_begin(void);
+extern void conc_pass_end(void);
 extern void conc_fatal_signal(struct task_struct *t);
 extern void conc_hold_resume(void);
 extern void sched_cid_resume(void);
@@ -2620,5 +2633,7 @@ static inline void sched_conc_resume_user_mode(void)
 #else /* !CONFIG_SCHED_MAX_CONCURRENCY */
 static inline void sched_conc_resume_user_mode(void) { }
 static inline void conc_fatal_signal(struct task_struct *t) { }
+static inline void conc_pass_begin(void) { }
+static inline void conc_pass_end(void) { }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 #endif
