@@ -8693,7 +8693,7 @@ sched_balance_find_dst_group_cpu(struct sched_group *group, struct task_struct *
 		return cpumask_first(sched_group_span(group));
 
 	/* Traverse only the allowed CPUs */
-	for_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) {
+	for_each_cpu_and(i, sched_group_span(group), task_select_cpus(p)) {
 		struct rq *rq = cpu_rq(i);
 
 		if (!sched_core_cookie_match(rq, p))
@@ -8740,7 +8740,7 @@ static inline int sched_balance_find_dst_cpu(struct sched_domain *sd, struct tas
 {
 	int new_cpu = cpu;
 
-	if (!cpumask_intersects(sched_domain_span(sd), p->cpus_ptr))
+	if (!cpumask_intersects(sched_domain_span(sd), task_select_cpus(p)))
 		return prev_cpu;
 
 	/*
@@ -8890,7 +8890,7 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
 {
 	int cpu;
 
-	for_each_cpu_and(cpu, cpu_smt_mask(target), p->cpus_ptr) {
+	for_each_cpu_and(cpu, cpu_smt_mask(target), task_select_cpus(p)) {
 		if (cpu == target)
 			continue;
 		/*
@@ -8932,7 +8932,7 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 			return -1;
 	}
 
-	if (!cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr))
+	if (!cpumask_and(cpus, sched_domain_span(sd), task_select_cpus(p)))
 		return -1;
 
 	if (static_branch_unlikely(&sched_cluster_active)) {
@@ -9049,7 +9049,7 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 	int nr = INT_MAX;
 
 	cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
-	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
+	cpumask_and(cpus, sched_domain_span(sd), task_select_cpus(p));
 
 	task_util = task_util_est(p);
 	util_min = uclamp_eff_value(p, UCLAMP_MIN);
@@ -9242,7 +9242,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	    recent_used_cpu != target &&
 	    cpus_share_cache(recent_used_cpu, target) &&
 	    choose_idle_cpu(recent_used_cpu, p) &&
-	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
+	    cpumask_test_cpu(recent_used_cpu, task_select_cpus(p)) &&
 	    asym_fits_cpu(task_util, util_min, util_max, recent_used_cpu)) {
 
 		if (!static_branch_unlikely(&sched_cluster_active) ||
@@ -9797,7 +9797,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 			if (!cpumask_test_cpu(cpu, sched_domain_span(sd)))
 				continue;
 
-			if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+			if (!cpumask_test_cpu(cpu, task_select_cpus(p)))
 				continue;
 
 			util = cpu_util(cpu, p, cpu, 0);
@@ -9940,7 +9940,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		record_wakee(p);
 
 		if ((wake_flags & WF_CURRENT_CPU) &&
-		    cpumask_test_cpu(cpu, p->cpus_ptr))
+		    cpumask_test_cpu(cpu, task_select_cpus(p)))
 			return cpu;
 
 		if (!is_rd_overutilized(this_rq()->rd)) {
@@ -9950,7 +9950,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 			new_cpu = prev_cpu;
 		}
 
-		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
+		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, task_select_cpus(p));
 	}
 
 	for_each_domain(cpu, tmp) {
@@ -11157,6 +11157,10 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 		return 0;
 
 	if (task_is_blocked(p))
+		return 0;
+
+	/* The concurrency limit of the task's group may refuse dst_cpu. */
+	if (!conc_can_move(p, env->dst_cpu))
 		return 0;
 
 	if (!cpumask_test_cpu(env->dst_cpu, p->cpus_ptr)) {
@@ -12606,7 +12610,7 @@ static inline void update_sg_wakeup_stats(struct sched_domain *sd,
 	if (sd->flags & SD_ASYM_CPUCAPACITY)
 		sgs->group_misfit_task_load = 1;
 
-	for_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) {
+	for_each_cpu_and(i, sched_group_span(group), task_select_cpus(p)) {
 		struct rq *rq = cpu_rq(i);
 		unsigned int local;
 
@@ -12725,7 +12729,7 @@ sched_balance_find_dst_group(struct sched_domain *sd, struct task_struct *p, int
 
 		/* Skip over this group if it has no CPUs allowed */
 		if (!cpumask_intersects(sched_group_span(group),
-					p->cpus_ptr))
+					task_select_cpus(p)))
 			continue;
 
 		/* Skip over this group if no cookie matched */
@@ -12846,7 +12850,7 @@ sched_balance_find_dst_group(struct sched_domain *sd, struct task_struct *p, int
 			 * take care of it.
 			 */
 			if (p->nr_cpus_allowed != NR_CPUS) {
-				unsigned int w = cpumask_weight_and(p->cpus_ptr,
+				unsigned int w = cpumask_weight_and(task_select_cpus(p),
 								sched_group_span(local));
 				imb_numa_nr = min(w, sd->imb_numa_nr);
 			}
