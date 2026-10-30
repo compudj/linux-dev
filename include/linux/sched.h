@@ -1036,6 +1036,16 @@ struct task_struct {
 	 * wait. A wait covers the holds which a move of the task splits.
 	 */
 	u64				conc_wait_at;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+	/*
+	 * The start of its wait for a slot, 0 when it does not wait. See
+	 * conc_debug_hold_end().
+	 */
+	u64				conc_debug_wait_at;
+	u64				conc_debug_hold_at;
+	u64				conc_debug_held_ns;
+	unsigned int			conc_debug_holds;
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
 #ifdef CONFIG_PREEMPT_RCU

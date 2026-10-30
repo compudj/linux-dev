@@ -2196,6 +2196,11 @@ void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	 */
 	uclamp_rq_inc(rq, p, flags);
 
+	/*
+	 * A held task must not be enqueued. Its hold ends first, see
+	 * conc_unhold().
+	 */
+	conc_debug_enqueue(p);
 	p->sched_class->enqueue_task(rq, p, flags);
 
 	psi_enqueue(p, flags);
@@ -4834,6 +4839,9 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->conc_resv_cpu			= -1;
 	p->conc_move_seq			= 0;
 	INIT_LIST_HEAD(&p->conc_hold_node);
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+	p->conc_debug_wait_at		= 0;
+#endif
 #endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -5751,6 +5759,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		}
 	}
 
+	conc_debug_switch(rq, prev, next);
 	mm_cid_switch_to(prev, next);
 
 	/*

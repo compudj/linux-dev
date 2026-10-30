@@ -107,9 +107,30 @@ struct conc_attach_src {
  * Concurrency accounting for cpu.concurrency.max, see
  * Documentation/scheduler/sched-max-concurrency.rst
  *
- * Lock order: cpuset_mutex -> conc_mutex -> tg->conc.lock. The locks of two
- * groups never nest (see conc_claim_slow()). tg->conc.lock nests inside
- * p->pi_lock and rq->lock, never the other way.
+ * Lock order, outermost first. The sleeping locks:
+ *
+ *   cgroup_mutex -> cpus_read_lock() -> cgroup_threadgroup_rwsem
+ *     -> cpuset_mutex -> conc_mutex -> dom->mutex
+ *   cgroup_mutex -> conc_key_mutex -> cpus_read_lock()
+ *
+ * A path takes a part of the first chain:
+ *
+ *  - a cpuset write takes cpus_read_lock() -> cpuset_mutex -> conc_mutex;
+ *  - a fork takes cgroup_threadgroup_rwsem -> cpuset_mutex -> conc_mutex;
+ *  - CPU hotplug takes conc_mutex with the hotplug lock held for writing.
+ *
+ * The static key changes outside cpuset_mutex and conc_mutex (conc_key_get(),
+ * conc_key_put()), because a jump label update takes cpus_read_lock().
+ *
+ * No sleeping lock is taken under a spinlock. Among the spinlocks:
+ *
+ *   p->pi_lock -> rq->lock -> conc_sm_lock -> tg->conc.lock
+ *   rq->lock -> dom->lock, conc_hold_lock
+ *   conc_sm_lock -> dom->lock
+ *
+ * The locks of two groups never nest (see conc_claim_slow()). See
+ * conc_wait_attach() for the waits under these locks, and for why they
+ * cannot deadlock.
  */
 DEFINE_STATIC_KEY_FALSE(sched_conc_enabled);
 /*
@@ -366,6 +387,10 @@ static void conc_held_wake_fn(struct irq_work *work)
 	swake_up_one(&conc_held_wq);
 }
 static struct irq_work conc_held_wake_work = IRQ_WORK_INIT_HARD(conc_held_wake_fn);
+
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+static s64 conc_debug_wait_max;
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 
 static LIST_HEAD(conc_attach_srcs);
 
@@ -3635,7 +3660,67 @@ void conc_hold_kick(void)
 		irq_work_queue(&conc_hold_irq_work);
 }
 
-#ifndef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+/*
+ * Report the longest wait for a slot.
+ *
+ * A wait runs from the first hold of a task to its placement, its blocking or
+ * its death. A move ends a hold and asks for a new one. The wait continues
+ * across these holds.
+ *
+ * The end of a wait of 10 ms or more is reported when it is the longest so
+ * far. A wait has no upper bound. A task waits for a rotation period behind
+ * each task of its class, and for as long as a higher class runs.
+ */
+
+/*
+ * Record the start of a hold of @p. Start a wait too, unless one is running.
+ * Call under the runqueue lock.
+ */
+static void conc_debug_hold_start(struct task_struct *p)
+{
+	u64 now = local_clock();
+
+	if (!p->conc_debug_wait_at) {
+		p->conc_debug_held_ns = 0;
+		p->conc_debug_holds = 0;
+		p->conc_debug_wait_at = now ?: 1;
+	}
+	p->conc_debug_hold_at = now;
+	p->conc_debug_holds++;
+}
+
+/*
+ * Record the end of a hold of @p. The wait may go on. Call under the runqueue
+ * lock.
+ */
+static void conc_debug_hold_stop(struct task_struct *p)
+{
+	if (p->conc_debug_wait_at)
+		p->conc_debug_held_ns += local_clock() - p->conc_debug_hold_at;
+}
+
+/*
+ * End the wait of @p. @how tells why: placed, blocked, killed, exiting or
+ * exited. Report the wait if it lasted 10 ms or more and is the longest so
+ * far.
+ */
+static void conc_debug_hold_end(struct task_struct *p, const char *how)
+{
+	s64 wait;
+
+	if (!p->conc_debug_wait_at)
+		return;
+	wait = local_clock() - p->conc_debug_wait_at;
+	p->conc_debug_wait_at = 0;
+	if (wait < 10 * NSEC_PER_MSEC || wait <= READ_ONCE(conc_debug_wait_max))
+		return;
+	WRITE_ONCE(conc_debug_wait_max, wait);
+	printk_deferred(KERN_INFO "conc: longest wait so far: %s/%d, %lld ms, held %lld ms over %u holds, %s\n",
+			p->comm, p->pid, div_s64(wait, NSEC_PER_MSEC),
+			div_s64(p->conc_debug_held_ns, NSEC_PER_MSEC), p->conc_debug_holds, how);
+}
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 static inline void conc_debug_hold_start(struct task_struct *p) { }
 
 static inline void conc_debug_hold_stop(struct task_struct *p) { }
@@ -5552,6 +5637,71 @@ void conc_dl_wait(struct task_struct *p)
 		wait_event(conc_attach_wq, READ_ONCE(p->conc_move_seq) != seq);
 }
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+/*
+ * Return true if the slot value @v means that the group has no slot: unused
+ * or draining. Only an empty slot can become draining.
+ */
+bool conc_debug_no_slot(int v)
+{
+	return v == CONC_SLOT_UNUSED || v == CONC_SLOT_DRAINING;
+}
+
+/*
+ * Warn if the group of @p counts @p on this CPU but has no slot here. The
+ * group would then run on more CPUs than its used set, above its limit, and
+ * its IDs would exceed the bound.
+ *
+ * A claim overwritten by a plain store leaves this state, see
+ * conc_remove_reserved(). The task switched out is checked too, while it
+ * keeps its slot (preempted). This covers a claim made while it ran: a change
+ * of group, or the claim at its return to user space.
+ *
+ * Called from context_switch() under the runqueue lock. @how is "switched in"
+ * or "switched out".
+ */
+static void conc_debug_counted(struct rq *rq, struct task_struct *p, const char *how)
+{
+	struct task_group *tg;
+	int v;
+
+	if (!p->conc_accounted)
+		return;
+	tg = task_group(p);
+	if (!conc_active(&tg->conc))
+		return;
+	v = atomic_read(per_cpu_ptr(tg->conc.present, cpu_of(rq)));
+	WARN_ONCE(conc_debug_no_slot(v),
+		  "conc: %s/%d %s counted on CPU %d, where its group has no slot (%d)\n",
+		  p->comm, p->pid, how, cpu_of(rq), v);
+}
+
+void conc_debug_switch(struct rq *rq, struct task_struct *prev, struct task_struct *next)
+{
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return;
+	/*
+	 * A held task is out of its class until the placement work returns it
+	 * there, see conc_hold(). Nothing may run it meanwhile. This includes
+	 * the walk of proxy execution to a lock owner (find_proxy_task()).
+	 */
+	WARN_ONCE(next->conc_held, "conc: %s/%d switched in while held, on CPU %d\n",
+		  next->comm, next->pid, cpu_of(rq));
+	conc_debug_counted(rq, prev, "switched out");
+	conc_debug_counted(rq, next, "switched in");
+#ifdef CONFIG_SCHED_MM_CID
+	/*
+	 * An exiting task runs without a slot when it finds none, see
+	 * conc_hold_request(). So it must not be the user of any ID domain by
+	 * then.
+	 */
+	WARN_ONCE((next->flags & PF_EXITING) && (next->mm_cid.active),
+		  "conc: %s/%d on its way out still takes concurrency IDs\n",
+		  next->comm, next->pid);
+#endif
+}
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
+
 /*
  * Handle the exit of task @p. Called from the release callback of the cpu
  * controller.
@@ -6112,6 +6262,11 @@ int cpu_concurrency_stat_show(struct seq_file *sf, void *v)
 	seq_printf(sf, "nr_rotations %ld\n", atomic_long_read(&conc->st_nr_rotations));
 	seq_printf(sf, "rotated_usec %llu\n",
 		   div_u64(atomic64_read(&conc->st_rotated_ns), NSEC_PER_USEC));
+	/* Not a part of the interface. */
+	if (IS_ENABLED(CONFIG_SCHED_MAX_CONCURRENCY_DEBUG) && conc->present)
+		seq_printf(sf, "debug effective %u nr_used %u used %*pbl shrink_pending %d evicting %u\n",
+			   conc->effective, READ_ONCE(conc->nr_used), cpumask_pr_args(conc->used),
+			   conc->shrink_pending, conc->nr_evicting);
 	return 0;
 }
 
@@ -6510,6 +6665,41 @@ void conc_cid_left_cpu(struct cid_domain *dom, struct task_struct *prev)
 	if (atomic_read(per_cpu_ptr(tg->conc.present, smp_processor_id())) <= 0)
 		cid_drop_on_cpu(dom, this_cpu_ptr(dom->pcpu));
 }
+
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+/*
+ * Check the bounded domain @dom after @prev was scheduled out. Warn if this
+ * CPU still owns an ID of @dom while the group of @dom has no slot on this
+ * CPU. Nothing would drop that ID: the last slot of the group here is gone.
+ * The ID then stays taken from the space below the bound for as long as the
+ * CPU caches it. Call under the runqueue lock.
+ */
+void conc_debug_cid_kept(struct cid_domain *dom, struct task_struct *prev)
+{
+	unsigned int cid = __this_cpu_read(dom->pcpu->cid);
+	struct task_group *tg;
+	int v;
+
+	if (!static_branch_unlikely(&sched_conc_enabled) || !cid_on_cpu(cid))
+		return;
+	/*
+	 * The domain is not bounded yet: its group starts to count. Do not
+	 * check it. Applying the bound drops the IDs cached outside the CPUs
+	 * of the group (cid_apply_bound()), before the effective file shows
+	 * the bound.
+	 */
+	if (!READ_ONCE(dom->bound))
+		return;
+	tg = conc_dom_group(dom);
+	if (!tg)
+		return;
+	v = atomic_read(per_cpu_ptr(tg->conc.present, smp_processor_id()));
+	WARN_ONCE(conc_debug_no_slot(v),
+		  "conc: CPU %d keeps %s cid %u after %s/%d left, its group without a slot (%d)\n",
+		  smp_processor_id(), dom->kind == CID_DOMAIN_MM ? "mm" : "ns",
+		  cpu_cid_to_cid(cid), prev->comm, prev->pid, v);
+}
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 
 void conc_dom_user_exited(struct cid_domain *dom, struct task_struct *t)
 {
