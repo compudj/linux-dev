@@ -2738,8 +2738,8 @@ int push_cpu_stop(void *arg)
 
 	// XXX validate p is still the highest prio task
 	if (task_rq(p) == rq) {
-		move_queued_task_locked(rq, lowest_rq, p);
-		resched_curr(lowest_rq);
+		if (move_queued_task_locked(rq, lowest_rq, p))
+			resched_curr(lowest_rq);
 	}
 
 	double_unlock_balance(rq, lowest_rq);
@@ -2764,6 +2764,8 @@ void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx
 		return;
 	}
 
+	/* The class of the mask being replaced leaves, the new mask's joins. */
+	conc_task_mask_changed(p, ctx);
 	cpumask_copy(&p->cpus_mask, ctx->new_mask);
 	p->nr_cpus_allowed = cpumask_weight(ctx->new_mask);
 	mm_update_cpus_allowed(p->mm, ctx->new_mask);

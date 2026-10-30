@@ -1224,6 +1224,14 @@ struct mm_struct {
 
 		/* MM CID related storage: the mm's cid domain */
 		struct cid_domain mm_cid;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+		/*
+		 * The ceiling of mm_cid under which the process pinned itself
+		 * to its cpu cgroup, 0 when it did not: copied by fork(2),
+		 * not by execve(2), see PR_SET_CONCURRENCY_PIN.
+		 */
+		unsigned int conc_pin;
+#endif
 
 		/* sched_cache related statistics */
 		struct sched_cache_group *sched_cache_grp;
