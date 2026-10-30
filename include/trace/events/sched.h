@@ -922,6 +922,35 @@ DECLARE_TRACE(sched_dl_server_stop,
 	TP_PROTO(struct sched_dl_entity *dl_se, int cpu, u8 type),
 	TP_ARGS(dl_se, cpu, type));
 
+/*
+ * A request a concurrency limit (cpu.concurrency.max) refused: the task
+ * judged, the operation refused and why, with the error returned.
+ */
+TRACE_EVENT(sched_conc_refuse,
+
+	TP_PROTO(struct task_struct *p, const char *op, const char *why, int err),
+
+	TP_ARGS(p, op, why, err),
+
+	TP_STRUCT__entry(
+		__array(	char,	comm,	TASK_COMM_LEN	)
+		__field(	pid_t,	pid			)
+		__string(	op,	op			)
+		__string(	why,	why			)
+		__field(	int,	err			)
+	),
+
+	TP_fast_assign(
+		memcpy(__entry->comm, p->comm, TASK_COMM_LEN);
+		__entry->pid	= p->pid;
+		__assign_str(op);
+		__assign_str(why);
+		__entry->err	= err;
+	),
+
+	TP_printk("comm=%s pid=%d op=%s why=%s err=%d",
+		  __entry->comm, __entry->pid, __get_str(op), __get_str(why), __entry->err)
+);
 #endif /* _TRACE_SCHED_H */
 
 /* This part must be outside protection */

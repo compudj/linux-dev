@@ -2465,7 +2465,7 @@ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state
 	return ncsw;
 }
 
-static void
+void
 do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx);
 
 static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
@@ -2514,62 +2514,6 @@ static inline bool rq_has_pinned_tasks(struct rq *rq)
 	return rq->nr_pinned;
 }
 
-static inline bool task_can_migrate_to_preferred(struct task_struct *p, int cpu)
-{
-	/* No need to migrate from a preferred CPU */
-	if (cpu_preferred(cpu))
-		return false;
-
-	/* Only FAIR tasks honor preferred CPU state */
-	if (unlikely(p->sched_class != &fair_sched_class))
-		return false;
-
-	/* Ignore preferred state if task affinity is changing */
-	if (unlikely(!cpumask_test_cpu(task_cpu(p), p->cpus_ptr)))
-		return false;
-
-	return cpumask_intersects_and(p->cpus_ptr, cpu_preferred_mask,
-				      task_cpu_possible_mask(p));
-}
-
-/*
- * Per-CPU kthreads are allowed to run on !active && online CPUs, see
- * __set_cpus_allowed_ptr() and select_fallback_rq().
- */
-static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
-{
-	/* When not in the task's cpumask, no point in looking further. */
-	if (!task_allowed_on_cpu(p, cpu))
-		return false;
-
-	/* migrate_disabled() must be allowed to finish. */
-	if (is_migration_disabled(p))
-		return cpu_online(cpu);
-
-	/* Non kernel threads are not allowed during either online or offline. */
-	if (!(p->flags & PF_KTHREAD)) {
-		/* Try to use preferred CPU if task's affinity allows */
-		if (task_can_migrate_to_preferred(p, cpu))
-			return false;
-		return cpu_active(cpu);
-	}
-
-	/* KTHREAD_IS_PER_CPU is always allowed. */
-	if (kthread_is_per_cpu(p))
-		return cpu_online(cpu);
-
-	/* Regular kernel threads don't get to stay during offline. */
-	if (cpu_dying(cpu))
-		return false;
-
-	/* Try to keep unbound kthreads on a preferred CPU if possible. */
-	if (task_can_migrate_to_preferred(p, cpu))
-		return false;
-
-	/* Otherwise, they are allowed to run on online CPU. */
-	return cpu_online(cpu);
-}
-
 /*
  * This is how migration works:
  *
@@ -2590,10 +2534,18 @@ static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
  * Returns (locked) new rq. Old rq's lock is released.
  */
 static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
-				   struct task_struct *p, int new_cpu)
+				   struct task_struct *p, int new_cpu, bool must)
 	__must_hold(__rq_lockp(rq))
 {
 	lockdep_assert_rq_held(rq);
+
+	/*
+	 * Refused by the concurrency limit: leave the task where it is, unless
+	 * it must leave, in which case it goes without a slot and is held at
+	 * its next return to user space, see conc_task_move().
+	 */
+	if (!conc_task_move(p, cpu_of(rq), new_cpu, must))
+		return rq;
 
 	deactivate_task(rq, p, DEQUEUE_NOCLOCK);
 	set_task_cpu(p, new_cpu);
@@ -2608,12 +2560,6 @@ static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 
 	return rq;
 }
-
-struct migration_arg {
-	struct task_struct		*task;
-	int				dest_cpu;
-	struct set_affinity_pending	*pending;
-};
 
 /*
  * @refs: number of wait_for_completion()
@@ -2636,15 +2582,15 @@ struct set_affinity_pending {
  * So we race with normal scheduler movements, but that's OK, as long
  * as the task is no longer on this CPU.
  */
-static struct rq *__migrate_task(struct rq *rq, struct rq_flags *rf,
-				 struct task_struct *p, int dest_cpu)
+struct rq *__migrate_task(struct rq *rq, struct rq_flags *rf,
+				 struct task_struct *p, int dest_cpu, bool must)
 	__must_hold(__rq_lockp(rq))
 {
 	/* Affinity changed (again). */
 	if (!is_cpu_allowed(p, dest_cpu))
 		return rq;
 
-	rq = move_queued_task(rq, rf, p, dest_cpu);
+	rq = move_queued_task(rq, rf, p, dest_cpu, must);
 
 	return rq;
 }
@@ -2654,7 +2600,7 @@ static struct rq *__migrate_task(struct rq *rq, struct rq_flags *rf,
  * and performs thread migration by bumping thread off CPU then
  * 'pushing' onto another runqueue.
  */
-static int migration_cpu_stop(void *data)
+int migration_cpu_stop(void *data)
 {
 	struct migration_arg *arg = data;
 	struct set_affinity_pending *pending = arg->pending;
@@ -2709,7 +2655,13 @@ static int migration_cpu_stop(void *data)
 
 		if (task_on_rq_queued(p)) {
 			update_rq_clock(rq);
-			rq = __migrate_task(rq, &rf, p, arg->dest_cpu);
+			/*
+			 * An affinity change must not leave the task on a
+			 * CPU outside its mask: when the concurrency limit
+			 * refuses the destination the task goes without a
+			 * slot and is held at its next return to user space.
+			 */
+			rq = __migrate_task(rq, &rf, p, arg->dest_cpu, pending != NULL);
 		} else {
 			p->wake_cpu = arg->dest_cpu;
 		}
@@ -2833,7 +2785,7 @@ void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx
 		swap(p->user_cpus_ptr, ctx->user_mask);
 }
 
-static void
+void
 do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
 {
 	scoped_guard (sched_change, p, DEQUEUE_SAVE)
@@ -3119,8 +3071,9 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
 	} else {
 
 		if (!is_migration_disabled(p)) {
+			/* Affinity change: must not stay on a disallowed CPU. */
 			if (task_on_rq_queued(p))
-				rq = move_queued_task(rq, rf, p, dest_cpu);
+				rq = move_queued_task(rq, rf, p, dest_cpu, true);
 
 			if (!pending->stop_pending) {
 				p->migration_pending = NULL;
@@ -3474,7 +3427,8 @@ static void __migrate_swap_task(struct task_struct *p, int cpu)
 		rq_pin_lock(src_rq, &srf);
 		rq_pin_lock(dst_rq, &drf);
 
-		move_queued_task_locked(src_rq, dst_rq, p);
+		/* The concurrency slots were swapped by migrate_swap_stop(). */
+		__move_queued_task_locked(src_rq, dst_rq, p);
 		wakeup_preempt(dst_rq, p, 0);
 
 		rq_unpin_lock(dst_rq, &drf);
@@ -3495,6 +3449,23 @@ struct migration_swap_arg {
 	int src_cpu, dst_cpu;
 };
 
+/*
+ * Swap the concurrency slots of two queued tasks, both or neither. A task
+ * that is not queued holds no slot and only gets its wake_cpu adjusted.
+ */
+static bool conc_swap_slots(struct task_struct *a, int acpu, struct task_struct *b, int bcpu)
+{
+	bool qa = task_on_rq_queued(a), qb = task_on_rq_queued(b);
+
+	if (qa && !conc_task_move(a, acpu, bcpu, false))
+		return false;
+	if (qb && !conc_task_move(b, bcpu, acpu, false)) {
+		if (qa)
+			conc_task_move(a, bcpu, acpu, true);
+		return false;
+	}
+	return true;
+}
 static int migrate_swap_stop(void *data)
 {
 	struct migration_swap_arg *arg = data;
@@ -3519,6 +3490,9 @@ static int migrate_swap_stop(void *data)
 		return -EAGAIN;
 
 	if (!cpumask_test_cpu(arg->src_cpu, arg->dst_task->cpus_ptr))
+		return -EAGAIN;
+
+	if (!conc_swap_slots(arg->src_task, arg->src_cpu, arg->dst_task, arg->dst_cpu))
 		return -EAGAIN;
 
 	__migrate_swap_task(arg->src_task, arg->dst_cpu);
@@ -3612,7 +3586,7 @@ EXPORT_SYMBOL_GPL(kick_process);
  * select_task_rq() below may allow selection of !active CPUs in order
  * to satisfy the above rules.
  */
-static int select_fallback_rq(int cpu, struct task_struct *p)
+int select_fallback_rq(int cpu, struct task_struct *p)
 {
 	int nid = cpu_to_node(cpu);
 	const struct cpumask *nodemask = NULL;
@@ -3680,7 +3654,6 @@ out:
 /*
  * The caller (fork, wakeup) owns p->pi_lock, ->cpus_ptr is stable.
  */
-static inline
 int select_task_rq(struct task_struct *p, int cpu, int *wake_flags)
 {
 	lockdep_assert_held(&p->pi_lock);
@@ -4465,9 +4438,21 @@ int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 		 * to ensure we observe the correct CPU on which the task is currently
 		 * scheduling.
 		 */
-		if (smp_load_acquire(&p->on_cpu) &&
-		    ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
-			break;
+		if (smp_load_acquire(&p->on_cpu)) {
+			int wcpu = task_cpu(p);
+
+			/*
+			 * The shortcut keeps the task on its CPU, so it needs
+			 * the concurrency slot that __block_task() released.
+			 * When the limit refuses it, fall through to a full
+			 * selection below.
+			 */
+			if (conc_task_claim(p, wcpu)) {
+				if (ttwu_queue_wakelist(p, wcpu, wake_flags))
+					break;
+				conc_task_release(p, wcpu);
+			}
+		}
 
 		/*
 		 * If the owning (remote) CPU is still in the middle of schedule() with
@@ -6599,7 +6584,8 @@ static bool try_steal_cookie(int this, int that)
 		if (sched_task_is_throttled(p, this))
 			goto next;
 
-		move_queued_task_locked(src, dst, p);
+		if (!move_queued_task_locked(src, dst, p))
+			goto next;
 		resched_curr(dst);
 
 		success = true;
@@ -6975,6 +6961,12 @@ static void proxy_migrate_task(struct rq *rq, struct rq_flags *rf,
 	proxy_resched_idle(rq);
 	for (; p; p = p->blocked_donor) {
 		WARN_ON(p == rq->curr);
+		/*
+		 * A blocked donor never runs as itself on the target CPU, so
+		 * it holds no concurrency slot there; it claims one again
+		 * when it returns through the wakeup path.
+		 */
+		conc_task_release(p, cpu_of(rq));
 		deactivate_task(rq, p, DEQUEUE_NOCLOCK);
 		proxy_set_task_cpu(p, target_cpu);
 		/*
@@ -8423,8 +8415,12 @@ static int __balance_push_cpu_stop(void *arg)
 
 		rq_lock(rq, &rf);
 		update_rq_clock(rq);
+		/*
+		 * Hotplug must not hang on a concurrency limit: the task must
+		 * leave, without a slot if need be, and is held later.
+		 */
 		if (task_rq(p) == rq && task_on_rq_queued(p))
-			rq = __migrate_task(rq, &rf, p, cpu);
+			rq = __migrate_task(rq, &rf, p, cpu, true);
 		rq_unlock(rq, &rf);
 	}
 

@@ -854,6 +854,8 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 		p->dl.dl_bw_cpu = later_rq->cpu;
 	}
 
+	/* The CPU is gone: the slot follows, or the task goes without one. */
+	conc_task_move(p, cpu_of(rq), later_rq->cpu, true);
 	set_task_cpu(p, later_rq->cpu);
 	double_unlock_balance(later_rq, rq);
 
