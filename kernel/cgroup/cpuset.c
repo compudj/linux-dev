@@ -1980,7 +1980,7 @@ static int update_parent_effective_cpumask(struct cpuset *cs, int cmd,
 		/*
 		 * partcmd_update w/o newmask
 		 *
-		 * delmask = effective_xcpus & parent->effective_cpus
+		 * delmask = xcpus & parent->effective_xcpus
 		 *
 		 * This can be called from:
 		 * 1) update_cpumasks_hier()
@@ -2018,9 +2018,14 @@ static int update_parent_effective_cpumask(struct cpuset *cs, int cmd,
 				}
 			}
 			rcu_read_unlock();
+			/*
+			 * Offline CPUs included, as for partcmd_enable: left
+			 * out of subpartitions_cpus, they would go to the top
+			 * cpuset too when they come online.
+			 */
 			if (exclusive)
 				deleting = cpumask_and(tmp->delmask,
-						xcpus, parent->effective_cpus);
+						xcpus, parent->effective_xcpus);
 			else
 				part_error = PERR_NOTEXCL;
 		}
