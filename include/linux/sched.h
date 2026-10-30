@@ -989,6 +989,18 @@ struct task_struct {
 	 */
 	u8				conc_accounted;
 	/*
+	 * Running without a slot (CONC_HOLD_UNPLACED), or on one that is being
+	 * emptied (CONC_HOLD_EVICT): held off the CPUs at the next return to
+	 * user space, see conc_hold_request(). Takes no concurrency ID.
+	 */
+	u8				conc_hold_pending;
+	/*
+	 * Set at schedule in when no concurrency ID is free below the bound.
+	 * At its return to user space the task takes one or waits for one,
+	 * see sched_cid_resume().
+	 */
+	u8				cid_wait;
+	/*
 	 * The task is held. It is dequeued from its scheduling class only: the
 	 * core still sees it queued, in TASK_RUNNING. It is on the list of held
 	 * tasks.
@@ -1497,6 +1509,7 @@ struct task_struct {
 #endif
 
 	struct rseq_data		rseq;
+	/* Concurrency ID state of the task, one field per kind of domain */
 	struct cid_user			mm_cid;
 
 	struct tlbflush_unmap_batch	tlb_ubc;
@@ -2415,7 +2428,7 @@ void sched_mm_cid_before_execve(struct task_struct *t);
 void sched_mm_cid_after_execve(struct task_struct *t);
 void sched_mm_cid_mm_barrier(struct task_struct *t);
 void sched_mm_cid_exit(struct task_struct *t);
-void cid_domain_init(struct cid_domain *dom, struct cid_pcpu __percpu *pcpu,
+void cid_domain_init(struct cid_domain *dom, unsigned int kind, struct cid_pcpu __percpu *pcpu,
 		     unsigned long *cidmask, struct cpumask *cpus_allowed, struct task_struct *p);
 static __always_inline int task_mm_cid(struct task_struct *t)
 {
@@ -2585,4 +2598,19 @@ extern void migrate_enable(void);
 
 DEFINE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+extern void sched_cid_resume(void);
+
+/*
+ * From resume_user_mode_work(): the task found no concurrency ID free
+ * below a bound at its schedule in, and takes or waits for one now.
+ */
+static inline void sched_conc_resume_user_mode(void)
+{
+	if (unlikely(READ_ONCE(current->cid_wait)))
+		sched_cid_resume();
+}
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static inline void sched_conc_resume_user_mode(void) { }
+#endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 #endif

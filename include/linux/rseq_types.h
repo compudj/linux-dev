@@ -3,11 +3,13 @@
 #define _LINUX_RSEQ_TYPES_H
 
 #include <linux/irq_work_types.h>
+#include <linux/list.h>
 #include <linux/types.h>
 #include <linux/workqueue_types.h>
 
 #ifdef CONFIG_RSEQ
 struct rseq;
+struct task_group;
 
 /*
  * rseq_event::has_rseq contains the ABI version number so preserving it
@@ -137,8 +139,17 @@ struct rseq_data { };
 #define MM_CID_ONCPU	BIT(30)
 #define MM_CID_TRANSIT	BIT(29)
 
+/*
+ * A cid domain hands out concurrency IDs to the tasks of its users which
+ * run at the same time. A domain is the mm of a process or a concurrency
+ * ID namespace.
+ */
+enum cid_domain_kind {
+	CID_DOMAIN_MM,
+	CID_DOMAIN_NS,
+};
 /**
- * struct cid_user - Storage for per task CID data
+ * struct cid_user - Storage for per task CID data, one per domain kind
  * @active:	The task is a user of the domain
  * @cid:	The CID associated to the task either permanently or
  *		borrowed from the CPU
@@ -150,13 +161,21 @@ struct cid_user {
 	struct hlist_node	node;
 };
 
+struct cid_domain;
+
 /**
  * struct cid_pcpu - Storage for per CPU CID data
- * @cid:	The CID associated to the CPU either permanently or
- *		while a task with a CID is running
+ * @cid:	The CID which the CPU owns (MM_CID_ONCPU), caches or hands over.
+ *		Written under the runqueue lock of @cpu, see cid_pcpu_write()
+ * @cpu:	The CPU this record belongs to
+ * @dom:	The domain this record belongs to
+ * @node:	Entry in the list of the domains whose CID @cpu owns
  */
 struct cid_pcpu {
-	unsigned int	cid;
+	unsigned int		cid;
+	int			cpu;
+	struct cid_domain	*dom;
+	struct list_head	node;
 }____cacheline_aligned_in_smp;
 
 /**
@@ -166,6 +185,9 @@ struct cid_pcpu {
  * @max_cids:		The exclusive maximum CID value for allocation and convergence
  * @cidmask:		The allocation bitmap, num_possible_cpus() bits
  * @cpus_allowed:	Union of the users' allowed CPUs, growth only
+ * @kind:		The kind of domain (enum cid_domain_kind). It says which
+ *			task field holds the state of a user
+ * @bound:		Concurrency bound from cpu.concurrency.max, 0 if none
  * @irq_work:		irq_work to handle the affinity mode change case
  * @work:		Regular work to handle the affinity mode change case
  * @lock:		Spinlock to protect against affinity setting which can't take @mutex
@@ -177,6 +199,24 @@ struct cid_pcpu {
  *			by other entities which do not actually share the MM.
  * @pcpu_thrs:		Threshold for switching back from per CPU mode
  * @update_deferred:	A deferred switch back to per task mode is pending.
+ * @bound_update:	A deferred bound update is pending
+ * @waiters:		The length of @waitq
+ * @kick:		cid_irq_work() must make every waiter try again, see
+ *			cid_kick_waiters()
+ * @lca:		Lowest common ancestor task group of the users
+ * @tops:		Buffer for the topmost limited groups of the users, when
+ *			they span several; grown in process context
+ * @nr_tops:		Its capacity
+ * @tops_wanted:	The capacity the last scan needed
+ * @bounds_walk:	The last bounds walk which refreshed @bound. A walk
+ *			refreshes a domain once, see conc_update_mm_bounds().
+ *			Under conc_mutex
+ * @waitq:		The users which found no CID free below @bound. They
+ *			wait for one at their return to user space, in order,
+ *			see sched_cid_resume(). A schedule out hands the CID
+ *			of its CPU to the first waiter instead of caching it
+ * @handoff:		The waiters which were given a CID, or told to try
+ *			again. cid_irq_work() wakes them
  */
 struct cid_domain {
 	/* Hotpath read mostly members */
@@ -185,6 +225,8 @@ struct cid_domain {
 	unsigned int		max_cids;
 	unsigned long		*cidmask;
 	struct cpumask		*cpus_allowed;
+	unsigned int		kind;
+	unsigned int		bound;
 
 	/* Rarely used. Moves @lock and @mutex into the second cacheline */
 	struct irq_work		irq_work;
@@ -199,6 +241,18 @@ struct cid_domain {
 	unsigned int		users;
 	unsigned int		pcpu_thrs;
 	unsigned int		update_deferred;
+	unsigned int		bound_update;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	unsigned int		waiters;
+	unsigned int		kick;
+	struct task_group	*lca;
+	struct task_group	**tops;
+	unsigned int		nr_tops;
+	unsigned int		tops_wanted;
+	u64			bounds_walk;
+	struct list_head	waitq;
+	struct list_head	handoff;
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 } ____cacheline_aligned;
 #else /* CONFIG_SCHED_MM_CID */
 struct cid_domain { };

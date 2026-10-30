@@ -11,11 +11,6 @@
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 /* Filled in by a later patch. */
-static inline void conc_bounds_apply(struct task_group *top)
-{
-}
-
-/* Filled in by a later patch. */
 static inline void conc_hold_kick(void)
 {
 }
@@ -24,11 +19,6 @@ static inline void conc_hold_kick(void)
 static inline bool conc_hold_request(struct task_struct *p, u8 why)
 {
 	return false;
-}
-
-/* Filled in by a later patch. */
-static inline void conc_slot_removed(struct task_group *tg, int cpu)
-{
 }
 
 /* Filled in by a later patch. */
@@ -84,6 +74,18 @@ static inline enum conc_claim_result conc_claim(struct task_group *tg, int cpu, 
 }
 
 extern atomic_t conc_nr_held;
+
+/*
+ * Return true if @p is about to be held, see conc_hold_request(). Such a
+ * task takes no concurrency ID. If the static key goes off while a request
+ * is pending, the request means nothing. It is cleared at the next return
+ * of the task to user space.
+ */
+static __always_inline bool conc_task_unplaced(struct task_struct *p)
+{
+	return static_branch_unlikely(&sched_conc_enabled) &&
+	       unlikely(READ_ONCE(p->conc_hold_pending));
+}
 
 /*
  * Remove an entity. The slot stays in the used set, at zero. A slot that
@@ -215,7 +217,35 @@ extern void __init conc_init_root(void);
 int alloc_conc_sched_group(struct task_group *tg);
 
 void free_conc_sched_group(struct task_group *tg);
-#else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+
+#ifdef CONFIG_SCHED_MM_CID
+
+unsigned int conc_dom_bound(struct cid_domain *dom);
+
+void conc_dom_grow_tops(struct cid_domain *dom);
+
+void conc_dom_init(struct cid_domain *dom, struct task_struct *p);
+
+void conc_dom_fork(struct cid_domain *dom, struct task_struct *t);
+
+void conc_dom_user_exited(struct cid_domain *dom, struct task_struct *t);
+
+void conc_mm_task_moved(struct task_struct *p);
+
+void conc_dom_drop_stale_cids(struct cid_domain *dom);
+
+void conc_bounds_lock(void);
+
+void conc_bounds_unlock(void);
+
+/* Lock guard for conc_bounds_lock() and conc_bounds_unlock(). */
+DEFINE_LOCK_GUARD_0(conc_bounds, conc_bounds_lock(), conc_bounds_unlock())
+#else /* !CONFIG_SCHED_MM_CID */
+static inline void conc_mm_task_moved(struct task_struct *p) { }
+#endif /* !CONFIG_SCHED_MM_CID */
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
+
+#ifndef CONFIG_SCHED_MAX_CONCURRENCY
 
 static inline void conc_init_root(void) { }
 
@@ -236,10 +266,31 @@ static inline void conc_task_unclaim_dst(struct task_struct *p, int dst, int cla
 
 static inline void conc_task_commit_move(struct task_struct *p, int src, int claimed) { }
 
+static __always_inline bool conc_task_unplaced(struct task_struct *p) { return false; }
+
 static inline int alloc_conc_sched_group(struct task_group *tg) { return 1; }
 
 static inline void free_conc_sched_group(struct task_group *tg) { }
 
+static inline void conc_mm_task_moved(struct task_struct *p) { }
+
+#ifdef CONFIG_SCHED_MM_CID
+static inline void conc_bounds_lock(void) { }
+
+static inline void conc_bounds_unlock(void) { }
+
+static inline unsigned int conc_dom_bound(struct cid_domain *dom) { return 0; }
+
+static inline void conc_dom_grow_tops(struct cid_domain *dom) { }
+
+static inline void conc_dom_init(struct cid_domain *dom, struct task_struct *p) { }
+
+static inline void conc_dom_fork(struct cid_domain *dom, struct task_struct *t) { }
+
+static inline void conc_dom_user_exited(struct cid_domain *dom, struct task_struct *t) { }
+
+static inline void conc_dom_drop_stale_cids(struct cid_domain *dom) { }
+#endif /* CONFIG_SCHED_MM_CID */
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 
 #ifndef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG

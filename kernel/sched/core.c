@@ -4755,6 +4755,8 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 	/* A slot and a hold belong to the parent. The child has none. */
 	p->conc_accounted			= 0;
+	p->conc_hold_pending		= 0;
+	p->cid_wait			= 0;
 	p->conc_held			= 0;
 	p->conc_resv_cpu			= -1;
 #endif
@@ -9082,6 +9084,12 @@ void __init sched_init(void)
 	init_rt_bandwidth(&root_task_group.rt_bandwidth,
 			global_rt_period(), global_rt_runtime());
 #endif /* CONFIG_RT_GROUP_SCHED */
+
+	/*
+	 * Initialize the per CPU lists which cid_pcpu_write() uses. They are
+	 * needed with and without CONFIG_CGROUP_SCHED.
+	 */
+	cid_init_cpus();
 
 #ifdef CONFIG_CGROUP_SCHED
 	task_group_cache = KMEM_CACHE(task_group, 0);
