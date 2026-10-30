@@ -584,6 +584,16 @@ static int test_concurrency_stress_mixed(const char *root)
 	return stress_test(root, "cc_test_stress_mix", STRESS_HOTPLUG | STRESS_CPUSET);
 }
 
+static int test_concurrency_stress_ns(const char *root)
+{
+	return stress_test(root, "cc_test_stress_ns", STRESS_NS);
+}
+
+static int test_concurrency_stress_ns_mixed(const char *root)
+{
+	return stress_test(root, "cc_test_stress_nsmix", STRESS_NS | STRESS_HOTPLUG | STRESS_CPUSET);
+}
+
 #define T(x) { x, #x }
 struct cc_test {
 	int (*fn)(const char *root);
@@ -593,6 +603,8 @@ struct cc_test {
 	T(test_concurrency_stress_hotplug),
 	T(test_concurrency_stress_cpuset),
 	T(test_concurrency_stress_mixed),
+	T(test_concurrency_stress_ns),
+	T(test_concurrency_stress_ns_mixed),
 };
 
 #undef T
