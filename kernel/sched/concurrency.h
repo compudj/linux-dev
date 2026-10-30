@@ -10,18 +10,6 @@
 /* Included by sched.h, after the runqueue and task group definitions. */
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
-/* Filled in by a later patch. */
-static inline unsigned int conc_ns_clamp(struct cid_domain *dom, unsigned int bound)
-{
-	return bound;
-}
-
-/* Filled in by a later patch. */
-static inline bool conc_task_ns_allows(struct task_struct *t, struct task_group *tg)
-{
-	return false;
-}
-
 /*
  * Concurrency accounting primitives, see
  * Documentation/scheduler/sched-max-concurrency.rst.
@@ -285,6 +273,20 @@ int cpu_concurrency_effective_show(struct seq_file *sf, void *v);
 int conc_attach_check(struct cgroup_taskset *tset);
 
 #ifdef CONFIG_SCHED_MM_CID
+unsigned int conc_ns_ceiling(struct cid_domain *dom);
+
+bool conc_ns_admit(struct ns_cid *nc, struct task_struct *p);
+
+bool conc_ns_admit_fork(struct ns_cid *nc, struct task_struct *p);
+
+bool conc_ns_admit_self(struct ns_cid *nc, struct task_struct *t);
+
+void conc_ns_release(struct ns_cid *nc);
+
+void conc_ns_pending_set(struct task_struct *t, struct ns_cid *nc);
+
+void conc_ns_pending_clear(struct task_struct *t);
+
 unsigned int conc_dom_bound(struct cid_domain *dom);
 
 void conc_dom_grow_tops(struct cid_domain *dom);
@@ -305,6 +307,7 @@ void conc_bounds_unlock(void);
 
 /* conc_mutex, for the namespace admissions of cid.c. */
 DEFINE_LOCK_GUARD_0(conc_bounds, conc_bounds_lock(), conc_bounds_unlock())
+#define conc_ns_guard()	guard(conc_bounds)()
 #endif /* CONFIG_SCHED_MM_CID */
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
@@ -424,6 +427,21 @@ static inline void conc_bounds_lock(void) { }
 
 static inline void conc_bounds_unlock(void) { }
 
+static inline unsigned int conc_ns_ceiling(struct cid_domain *dom) { return num_possible_cpus(); }
+
+static inline bool conc_ns_admit(struct ns_cid *nc, struct task_struct *p) { return true; }
+
+static inline bool conc_ns_admit_fork(struct ns_cid *nc, struct task_struct *p) { return true; }
+
+static inline bool conc_ns_admit_self(struct ns_cid *nc, struct task_struct *t) { return true; }
+
+static inline void conc_ns_pending_set(struct task_struct *t, struct ns_cid *nc) { }
+
+static inline void conc_ns_pending_clear(struct task_struct *t) { }
+
+static inline void conc_ns_release(struct ns_cid *nc) { }
+
+#define conc_ns_guard()	do { } while (0)
 static inline unsigned int conc_dom_bound(struct cid_domain *dom) { return 0; }
 
 static inline void conc_dom_grow_tops(struct cid_domain *dom) { }

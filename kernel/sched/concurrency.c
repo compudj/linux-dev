@@ -350,6 +350,7 @@ unsigned int conc_limit_gen;
 static LIST_HEAD(conc_attach_srcs);
 
 #ifdef CONFIG_SCHED_MM_CID
+static bool conc_task_ns_allows(struct task_struct *t, struct task_group *tg);
 static int conc_pin_check(struct cgroup_taskset *tset);
 static int conc_pin_fork_check(struct task_struct *p, struct kernel_clone_args *kargs);
 
@@ -448,11 +449,7 @@ static void conc_wait_attach(void)
 }
 
 #ifndef CONFIG_SCHED_MM_CID
-void conc_mm_task_moved(struct task_struct *p)
-{
-	if (p->mm)
-		conc_dom_task_moved(&p->mm->mm_cid);
-}
+static inline void conc_mm_task_moved(struct task_struct *p) { }
 #endif /* !CONFIG_SCHED_MM_CID */
 
 /*
@@ -1974,12 +1971,15 @@ static void __conc_remove_slot(struct task_group *tg, int cpu)
 /* A reference on the object a domain is embedded in. */
 static void cid_domain_put(struct cid_domain *dom)
 {
-	mmdrop(cid_domain_mm(dom));
+	if (dom->kind == CID_DOMAIN_MM)
+		mmdrop(cid_domain_mm(dom));
+	else
+		put_ipc_ns(container_of(dom, struct ns_cid, dom)->ns);
 }
 
 /*
- * The domains of @t, each with a reference held: its mm's. Returns their
- * number.
+ * The domains of @t, each with a reference held: its mm's, and its IPC
+ * namespace's when that one has a domain. Returns their number.
  */
 static int conc_task_domains(struct task_struct *t, struct cid_domain **doms)
 {
@@ -1989,6 +1989,10 @@ static int conc_task_domains(struct task_struct *t, struct cid_domain **doms)
 	if (t->mm) {
 		mmgrab(t->mm);
 		doms[n++] = &t->mm->mm_cid;
+	}
+	if (t->ns_dom) {
+		get_ipc_ns(container_of(t->ns_dom, struct ns_cid, dom)->ns);
+		doms[n++] = t->ns_dom;
 	}
 	task_unlock(t);
 	return n;
@@ -4034,6 +4038,7 @@ static int conc_sm_move(struct conc_set_move_arg *arg, struct task_struct *p,
 		cpumask_copy(&p->cpus_mask, ent);
 		p->nr_cpus_allowed = cpumask_weight(ent);
 		mm_update_cpus_allowed(p->mm, ent);
+		cid_update_cpus_allowed(p->ns_dom, ent);
 		set_task_cpu(p, arg->dst);
 		activate_task(dst_rq, p, 0);
 		wakeup_preempt(dst_rq, p, 0);
@@ -4603,6 +4608,7 @@ static void conc_cid_refresh(struct task_struct *p)
 {
 #ifdef CONFIG_SCHED_MM_CID
 	mm_cid_schedin(p);
+	ns_cid_schedin(p);
 	rseq_force_update();
 #endif
 }
@@ -6129,7 +6135,7 @@ void conc_debug_switch(struct rq *rq, struct task_struct *prev, struct task_stru
 	 * A task on its way out runs without a slot when it finds none, see
 	 * conc_hold_request(): it must be the user of no domain by then.
 	 */
-	WARN_ONCE((next->flags & PF_EXITING) && (next->mm_cid.active),
+	WARN_ONCE((next->flags & PF_EXITING) && (next->mm_cid.active || READ_ONCE(next->ns_dom)),
 		  "conc: %s/%d on its way out still takes concurrency IDs\n", next->comm, next->pid);
 #endif
 }
@@ -6621,6 +6627,8 @@ int cpu_concurrency_effective_show(struct seq_file *sf, void *v)
 }
 
 #ifndef CONFIG_SCHED_MM_CID
+static inline bool conc_task_ns_allows(struct task_struct *t, struct task_group *tg) { return true; }
+
 static inline int conc_pin_check(struct cgroup_taskset *tset) { return 0; }
 
 static inline int conc_pin_fork_check(struct task_struct *p, struct kernel_clone_args *kargs)
@@ -6986,6 +6994,151 @@ static bool conc_tg_is_ancestor(struct task_group *anc, struct task_group *tg)
 }
 
 /*
+ * The ceiling of a namespace's domain, frozen at its first admission:
+ * the effective ceiling of the innermost group with a ceiling of the
+ * first member, whose subtree later members and migrations stay in, or
+ * the number of possible CPUs when there was none, in which case nothing
+ * is refused. See the design document.
+ */
+unsigned int conc_ns_ceiling(struct cid_domain *dom)
+{
+	struct ns_cid *nc = container_of(dom, struct ns_cid, dom);
+
+	/* Pairs with the release in conc_ns_admit(): a frozen bound is complete. */
+	return smp_load_acquire(&nc->frozen) ? READ_ONCE(nc->ceiling) : num_possible_cpus();
+}
+
+/* A namespace's bound never exceeds its ceiling, with or without a group bound. */
+static unsigned int conc_ns_clamp(struct cid_domain *dom, unsigned int bound)
+{
+	unsigned int ceiling;
+
+	if (dom->kind != CID_DOMAIN_NS)
+		return bound;
+	ceiling = conc_ns_ceiling(dom);
+	if (ceiling >= num_possible_cpus())
+		return bound;
+	return bound ? min(bound, ceiling) : ceiling;
+}
+
+/* Does @tg sit in the subtree the bound of @nc was frozen on, if any? */
+static bool conc_ns_tg_allowed(struct ns_cid *nc, struct task_group *tg)
+{
+	return !nc || !nc->frozen || !nc->ceiling_css || conc_tg_is_ancestor(css_tg(nc->ceiling_css), tg);
+}
+
+/*
+ * Admit a task of group @tg into @nc: the first admission freezes the
+ * ceiling on the effective ceiling of @tg, which comes from its
+ * innermost ancestor with a ceiling; the later ones must sit within that
+ * ancestor's subtree, where no effective ceiling is larger. Ceilings
+ * never change, so the frozen one stays that of the ancestor.
+ * Under conc_mutex, which orders admissions against migrations
+ * (conc_attach_check()).
+ */
+bool conc_ns_admit(struct ns_cid *nc, struct task_struct *p)
+{
+	struct task_group *tg = task_group(p), *g;
+
+	lockdep_assert_held(&conc_mutex);
+	if (nc->frozen)
+		return conc_ns_tg_allowed(nc, tg);
+	for (g = tg; g; g = g->parent) {
+		if (READ_ONCE(g->conc.ceiling))
+			break;
+	}
+	if (g) {
+		css_get(&g->css);
+		nc->ceiling_css = &g->css;
+		nc->ceiling = min(READ_ONCE(g->conc.ceiling_effective) ?: READ_ONCE(g->conc.ceiling),
+			       num_possible_cpus());
+	} else {
+		nc->ceiling = num_possible_cpus();
+	}
+	/*
+	 * Publishes @ceiling_css and @ceiling to the readers that do not hold
+	 * conc_mutex: conc_ns_ceiling() and conc_ns_admit_fork().
+	 */
+	smp_store_release(&nc->frozen, true);
+	return true;
+}
+
+/*
+ * Admit a fork(2) child into @nc. Once the bound is frozen, admission
+ * only asks that the child's group sit in the subtree it was frozen on,
+ * and neither moves meanwhile: the child's group is final and no
+ * migration sees the child yet, and a frozen bound never changes. Only
+ * the first admission, which freezes the bound, takes conc_mutex.
+ */
+bool conc_ns_admit_fork(struct ns_cid *nc, struct task_struct *p)
+{
+	/* Pairs with the release in conc_ns_admit(). */
+	if (smp_load_acquire(&nc->frozen))
+		return conc_ns_tg_allowed(nc, task_group(p));
+	guard(mutex)(&conc_mutex);
+	return conc_ns_admit(nc, p);
+}
+
+/*
+ * Admit @t, the running task, into @nc: a setns(2) admission or an
+ * unshare(2) join, which no cgroup lock orders against a migration of
+ * @t. One judged before and still in flight did not see this admission
+ * (conc_task_ns_allows()) and would move @t out of the subtree afterwards:
+ * wait for it to be applied first, so that the group read here is the
+ * one @t lands in; one judged later, under conc_mutex, sees ns_pending or
+ * the membership.
+ */
+bool conc_ns_admit_self(struct ns_cid *nc, struct task_struct *t)
+{
+	lockdep_assert_held(&conc_mutex);
+	conc_wait_attach();
+	return conc_ns_admit(nc, t);
+}
+
+void conc_ns_release(struct ns_cid *nc)
+{
+	if (nc->ceiling_css)
+		css_put(nc->ceiling_css);
+}
+
+/*
+ * May @t move to @tg: do the namespaces it is a member of, is joining
+ * through setns(2), or was born into and joins once forked, all keep it
+ * within the subtree their ceiling was frozen on? Under conc_mutex.
+ */
+static bool conc_task_ns_allows(struct task_struct *t, struct task_group *tg)
+{
+	struct ns_cid *born;
+	bool ok;
+
+	lockdep_assert_held(&conc_mutex);
+	task_lock(t);
+	born = t->mm && t->nsproxy ? t->nsproxy->ipc_ns->cid : NULL;
+	ok = conc_ns_tg_allowed(t->ns_dom ? container_of(t->ns_dom, struct ns_cid, dom) : NULL, tg) &&
+	     conc_ns_tg_allowed(t->ns_pending, tg) &&
+	     conc_ns_tg_allowed(born, tg);
+	task_unlock(t);
+	return ok;
+}
+
+/* The setns(2) in progress of @t, for the migrations judged meanwhile. */
+void conc_ns_pending_set(struct task_struct *t, struct ns_cid *nc)
+{
+	task_lock(t);
+	t->ns_pending = nc;
+	task_unlock(t);
+}
+
+void conc_ns_pending_clear(struct task_struct *t)
+{
+	if (!t->ns_pending)
+		return;
+	task_lock(t);
+	t->ns_pending = NULL;
+	task_unlock(t);
+}
+
+/*
  * prctl(PR_SET_CONCURRENCY_PIN): the calling process pins itself to its
  * cpu cgroup, for good. No task using its mm may change cpu cgroup any
  * more (conc_pin_check(), conc_pin_fork_check()), and a new thread joins its
@@ -7201,7 +7354,7 @@ static unsigned int __conc_dom_bound(struct cid_domain *dom)
 
 unsigned int conc_dom_bound(struct cid_domain *dom)
 {
-	return __conc_dom_bound(dom);
+	return conc_ns_clamp(dom, __conc_dom_bound(dom));
 }
 
 /* Give the scan above the room it asked for. Process context, the domain's mutex held. */
@@ -7367,6 +7520,8 @@ void conc_mm_task_moved(struct task_struct *p)
 {
 	if (p->mm)
 		conc_dom_task_moved(&p->mm->mm_cid);
+	if (p->ns_dom)
+		conc_dom_task_moved(p->ns_dom);
 }
 
 /*
@@ -7418,7 +7573,9 @@ void conc_cid_violation(struct cid_domain *dom, unsigned int cid)
 	 * sum over the groups covering them, or none once one is uncovered,
 	 * as when a limit is removed: computed afresh, or no report when the
 	 * domain's lock is taken (the caller may hold it), rather than one
-	 * against a cached bound such a removal leaves stale.
+	 * against a cached bound such a removal leaves stale. A namespace's
+	 * frozen ceiling caps it whatever the groups report: an ID at or
+	 * above it is a violation.
 	 */
 	if (!tg) {
 		if (!raw_spin_trylock_irqsave(&dom->lock, flags))
@@ -7426,6 +7583,7 @@ void conc_cid_violation(struct cid_domain *dom, unsigned int cid)
 		live = __conc_dom_bound(dom);
 		raw_spin_unlock_irqrestore(&dom->lock, flags);
 	}
+	live = conc_ns_clamp(dom, live);
 	if (!live || cid < live)
 		return;
 	/* Under the runqueue lock: the console output is deferred. */

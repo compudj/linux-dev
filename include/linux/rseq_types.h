@@ -10,6 +10,7 @@
 struct rseq;
 struct task_group;
 struct ipc_namespace;
+struct ns_cid;
 
 /*
  * rseq_event::has_rseq contains the ABI version number so preserving it
@@ -69,8 +70,9 @@ struct rseq_event {
  * @cpu_id:	The CPU ID which was written last to user space
  * @mm_cid:	The MM CID which was written last to user space
  * @node_id:	The node ID which was written last to user space
+ * @ns_cid:	The NS CID which was written last to user space
  *
- * @cpu_id, @mm_cid and @node_id are updated when the data is written to user space.
+ * @cpu_id, @mm_cid, @node_id and @ns_cid are updated when the data is written to user space.
  */
 struct rseq_ids {
 	union {
@@ -81,6 +83,7 @@ struct rseq_ids {
 		};
 	};
 	u32			node_id;
+	u32			ns_cid;
 };
 
 /**
@@ -254,6 +257,15 @@ struct cid_domain {
  * See Documentation/scheduler/sched-max-concurrency.rst
  */
 struct cgroup_subsys_state;
+struct ns_cid {
+	struct cid_domain	dom;
+	struct ipc_namespace	*ns;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	struct cgroup_subsys_state *ceiling_css;
+	unsigned int		ceiling;
+	bool			frozen;
+#endif
+};
 #else /* CONFIG_SCHED_MM_CID */
 struct cid_domain { };
 struct cid_user { };

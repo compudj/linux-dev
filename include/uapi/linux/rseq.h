@@ -197,15 +197,23 @@ struct rseq {
 	struct rseq_slice_ctrl slice_ctrl;
 
 	/*
-	 * Before rseq became extensible, its original size was 32 bytes even
-	 * though the active rseq area was only 20 bytes.
-	 * Exposing a 32 bytes feature size would make life needlessly painful
-	 * for userspace. Therefore, add a reserved byte after byte 32
-	 * to bump the rseq feature size from 32 to 33.
-	 * The next field to be added to the rseq area will be larger
-	 * than one byte, and will replace this reserved byte.
+	 * Restartable sequences ns_cid field. Updated by the kernel. Read by
+	 * user-space with single-copy atomicity semantics. This field should
+	 * only be read by the thread which registered this data structure.
+	 * Aligned on 32-bit. Contains the current thread's cross-process
+	 * concurrency ID: in an IPC namespace created with CLONE_IPC_CID, an
+	 * ID allocated uniquely among the tasks of the namespace running at
+	 * the same time, below the kernel.ns_cid_max sysctl read from within
+	 * the namespace, which does not change for the life of the namespace;
+	 * elsewhere, the CPU number, below that sysctl there too. Membership
+	 * follows the thread's own IPC namespace. The field is 0 until the
+	 * first update after registration. Only valid for registrations
+	 * larger than the original 32 bytes: AT_RSEQ_FEATURE_SIZE of at
+	 * least 36 says the kernel writes it. This field took the place of
+	 * the reserved byte that bumped the feature size from 32 to 33;
+	 * registrations of 33 to 35 bytes are refused.
 	 */
-	__u8 __reserved;
+	__u32 ns_cid;
 
 	/*
 	 * Flexible array member at end of structure, after last feature field.

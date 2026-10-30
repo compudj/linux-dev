@@ -1485,6 +1485,12 @@ struct task_struct {
 	struct rseq_data		rseq;
 	/* Concurrency IDs: the mm's domain, and the IPC namespace's when it has one */
 	struct cid_user			mm_cid;
+	struct cid_user			ns_cid;
+	struct cid_domain		*ns_dom;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	/* A setns(2) in progress into that namespace's domain, see conc_task_ns_allows() */
+	struct ns_cid			*ns_pending;
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
 	struct tlbflush_unmap_batch	tlb_ubc;
 
@@ -2430,6 +2436,16 @@ static __always_inline int task_mm_cid(struct task_struct *t)
 {
 	return t->mm_cid.cid & ~(MM_CID_ONCPU | MM_CID_TRANSIT);
 }
+/*
+ * The cross-process concurrency ID: the namespace's ID when its domain
+ * runs, otherwise the CPU number, a concurrency ID too.
+ */
+static __always_inline int task_ns_cid(struct task_struct *t)
+{
+	if (!t->ns_dom)
+		return task_cpu(t);
+	return t->ns_cid.cid & ~(MM_CID_ONCPU | MM_CID_TRANSIT);
+}
 #else
 static inline void sched_mm_cid_before_execve(struct task_struct *t) { }
 static inline void sched_mm_cid_after_execve(struct task_struct *t) { }
@@ -2441,6 +2457,10 @@ static __always_inline int task_mm_cid(struct task_struct *t)
 	 * disabled. This provides functional per-cpu data structure accesses
 	 * in user-space, althrough it won't provide the memory usage benefits.
 	 */
+	return task_cpu(t);
+}
+static __always_inline int task_ns_cid(struct task_struct *t)
+{
 	return task_cpu(t);
 }
 #endif

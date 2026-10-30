@@ -1013,6 +1013,13 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	tsk->mm_cid.cid = MM_CID_UNSET;
 	tsk->mm_cid.active = 0;
 	INIT_HLIST_NODE(&tsk->mm_cid.node);
+	tsk->ns_cid.cid = MM_CID_UNSET;
+	tsk->ns_cid.active = 0;
+	INIT_HLIST_NODE(&tsk->ns_cid.node);
+	tsk->ns_dom = NULL;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	tsk->ns_pending = NULL;
+#endif
 #endif
 
 #ifdef CONFIG_BPF_SYSCALL
@@ -3025,7 +3032,11 @@ static bool clone3_args_valid(struct kernel_clone_args *kargs)
 	if (kargs->flags &
 	    ~(CLONE_LEGACY_FLAGS | CLONE_CLEAR_SIGHAND |
 	      CLONE_INTO_CGROUP | CLONE_AUTOREAP | CLONE_NNP |
-	      CLONE_PIDFD_AUTOKILL | CLONE_EMPTY_MNTNS))
+	      CLONE_PIDFD_AUTOKILL | CLONE_EMPTY_MNTNS | CLONE_IPC_CID))
+		return false;
+
+	/* Concurrency IDs are a property of a new IPC namespace. */
+	if ((kargs->flags & CLONE_IPC_CID) && !(kargs->flags & CLONE_NEWIPC))
 		return false;
 
 	/*
@@ -3177,7 +3188,11 @@ static int check_unshare_flags(unsigned long unshare_flags)
 {
 	if (unshare_flags & ~(CLONE_THREAD|CLONE_FS|CLONE_SIGHAND|
 				CLONE_VM|CLONE_FILES|CLONE_SYSVSEM|
-				CLONE_NS_ALL | UNSHARE_EMPTY_MNTNS))
+				CLONE_NS_ALL | UNSHARE_EMPTY_MNTNS |
+				UNSHARE_IPC_CID))
+		return -EINVAL;
+	/* Concurrency IDs are a property of a new IPC namespace. */
+	if ((unshare_flags & UNSHARE_IPC_CID) && !(unshare_flags & CLONE_NEWIPC))
 		return -EINVAL;
 	/*
 	 * Not implemented, but pretend it works if there is nothing

@@ -9,11 +9,28 @@
 
 void __rseq_handle_slowpath(struct pt_regs *regs);
 
+/* The original rseq structure size (including padding) is 32 bytes. */
+#define ORIG_RSEQ_SIZE		32
 static __always_inline bool rseq_v2(struct task_struct *t)
 {
 	return IS_ENABLED(CONFIG_GENERIC_IRQ_ENTRY) && likely(t->rseq.event.has_rseq > 1);
 }
 
+/*
+ * True when the registered area contains the ns_cid field, which sits
+ * past the original 32 bytes. rseq_length_valid() admits no length in
+ * between, so a larger registration holds the whole field.
+ *
+ * Unlike the RSEQ ABI V2 mode, which the architecture decides, this
+ * follows what user space registered: AT_RSEQ_FEATURE_SIZE advertises
+ * ns_cid on every architecture, so every architecture writes it. The
+ * time slice extension, the other field past mm_cid, stays V2 only
+ * because it needs the generic entry code anyway.
+ */
+static __always_inline bool rseq_has_ns_cid(struct task_struct *t)
+{
+	return t->rseq.len > ORIG_RSEQ_SIZE;
+}
 /* Invoked from resume_user_mode_work() */
 static inline void rseq_handle_slowpath(struct pt_regs *regs)
 {
@@ -174,6 +191,7 @@ static inline unsigned int rseq_alloc_align(void)
 
 #else /* CONFIG_RSEQ */
 static inline bool rseq_v2(struct task_struct *t) { return false; }
+static inline bool rseq_has_ns_cid(struct task_struct *t) { return false; }
 static inline void rseq_handle_slowpath(struct pt_regs *regs) { }
 static inline void rseq_signal_deliver(struct ksignal *ksig, struct pt_regs *regs) { }
 static inline void rseq_sched_switch_event(struct task_struct *t) { }

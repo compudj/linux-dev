@@ -12,6 +12,7 @@
 #include <linux/highmem.h>
 #include <linux/hrtimer_api.h>
 #include <linux/ktime_api.h>
+#include <linux/sched/cid.h>
 #include <linux/sched/signal.h>
 #include <linux/syscalls_api.h>
 #include <linux/debug_locks.h>
@@ -60,6 +61,8 @@
 #include <linux/psi.h>
 #include <linux/rcuwait_api.h>
 #include <linux/rseq.h>
+#include <linux/ipc_namespace.h>
+#include <linux/nsproxy.h>
 #include <linux/sched/wake_q.h>
 #include <linux/scs.h>
 #include <linux/slab.h>
@@ -2793,6 +2796,7 @@ void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx
 	cpumask_copy(&p->cpus_mask, ctx->new_mask);
 	p->nr_cpus_allowed = cpumask_weight(ctx->new_mask);
 	mm_update_cpus_allowed(p->mm, ctx->new_mask);
+	cid_update_cpus_allowed(p->ns_dom, ctx->new_mask);
 
 	/*
 	 * Swap in a new user_cpus_ptr if SCA_USER flag set
@@ -4988,6 +4992,7 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
 {
 	unsigned long flags;
+	int ret;
 
 	/*
 	 * Because we're not yet on the pid-hash, p->pi_lock isn't strictly
@@ -5012,7 +5017,15 @@ int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
 		p->sched_class->task_fork(p);
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
 
-	return scx_fork(p, kargs);
+	ret = scx_fork(p, kargs);
+	if (ret)
+		return ret;
+	/* A child born into another cgroup is judged as a migration into it. */
+	ret = conc_fork_check(p, kargs);
+	if (ret)
+		return ret;
+	/* The child's cgroup is final: its IPC namespace's bound admits it, or not. */
+	return sched_cid_fork_ns(p);
 }
 
 void sched_cancel_fork(struct task_struct *p)
@@ -5023,7 +5036,9 @@ void sched_cancel_fork(struct task_struct *p)
 
 void sched_post_fork(struct task_struct *p)
 {
-	sched_mm_cid_fork(p);
+	sched_cid_fork(p);
+	conc_task_fork(p);
+	conc_fork_done(p);
 	uclamp_post_fork(p);
 	scx_post_fork(p);
 }

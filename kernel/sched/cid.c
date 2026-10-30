@@ -10,9 +10,18 @@
 #include <linux/sched/mm.h>
 #include <linux/cpuset.h>
 #include <linux/stop_machine.h>
+#include <linux/ipc_namespace.h>
+#include <linux/nsproxy.h>
+#include <linux/sched/cid.h>
 
 #include "sched.h"
 #include "smp.h"
+
+/*
+ * Globals and forward declarations
+ */
+
+static void sched_cid_leave_ns(struct task_struct *t);
 
 /*
  * Concurrency IDentifier management
@@ -371,6 +380,23 @@ static void cid_fixup_tasks_to_cpus(struct cid_domain *dom)
 	cid_complete_transit(dom, MM_CID_ONCPU);
 }
 
+/*
+ * The users of a namespace's domain come from anywhere: the union of the
+ * allowed CPUs grows with each one. For an mm this changes nothing, the
+ * first user seeds the union and a thread inherits its creator's mask.
+ */
+static void cid_join_cpus_allowed(struct cid_domain *dom, struct task_struct *t)
+{
+	unsigned int weight;
+
+	lockdep_assert_held(&dom->lock);
+	weight = cpumask_weighted_or(dom->cpus_allowed, dom->cpus_allowed, &t->cpus_mask);
+	if (weight == dom->nr_cpus_allowed)
+		return;
+	WRITE_ONCE(dom->nr_cpus_allowed, weight);
+	if (cid_on_cpu(dom->mode))
+		dom->pcpu_thrs = cid_calc_pcpu_thrs(dom);
+}
 static bool cid_add_user(struct cid_domain *dom, struct cid_user *u)
 {
 	unsigned int bound;
@@ -435,11 +461,16 @@ static void cid_user_join(struct cid_domain *dom, struct task_struct *t, struct 
 	scoped_guard(cid_local, dom) {
 		struct cid_pcpu *pcp = this_cpu_ptr(dom->pcpu);
 
+		/* The new user's mask and group may widen the CPUs and the bound. */
+		cid_join_cpus_allowed(dom, t);
+		conc_dom_fork(dom, t);
+
 		/* First user ? */
 		if (!dom->users) {
 			cid_add_user(dom, u);
 			u->cid = cid_get(dom);
-			/* Required for execve() */
+			/* Required for execve(); a fresh domain: the CPU owns nothing. */
+			WARN_ON_ONCE(cid_on_cpu(pcp->cid));
 			pcp->cid = u->cid;
 			return;
 		}
@@ -477,10 +508,13 @@ static void cid_user_join(struct cid_domain *dom, struct task_struct *t, struct 
 		}
 	}
 
-	/* The running joiner with no CID, see above. */
+	/*
+	 * The running joiner with no CID, see above. A held task takes none,
+	 * as its schedule in does not: it gets one once it is let run.
+	 */
 	if (t == current) {
 		guard(task_rq_lock)(t);
-		if (u->cid == MM_CID_UNSET)
+		if (u->cid == MM_CID_UNSET && !conc_task_unplaced(t))
 			__cid_schedin(dom, t, u);
 	}
 }
@@ -575,22 +609,29 @@ static void cid_user_leave(struct cid_domain *dom, struct task_struct *t, struct
 	cancel_work_sync(&dom->work);
 }
 
-void sched_mm_cid_fork(struct task_struct *t)
+static void sched_mm_cid_fork(struct task_struct *t)
 {
 	if (t->mm)
 		cid_user_join(&t->mm->mm_cid, t, &t->mm_cid);
 }
 
-void sched_mm_cid_exit(struct task_struct *t)
+static void sched_mm_cid_leave(struct task_struct *t)
 {
 	if (t->mm)
 		cid_user_leave(&t->mm->mm_cid, t, &t->mm_cid);
 }
 
-/* Deactivate MM CID allocation across execve() */
+/* Both domains at exit; a failed fork(2) never joined, see sched_post_fork(). */
+void sched_mm_cid_exit(struct task_struct *t)
+{
+	sched_mm_cid_leave(t);
+	sched_cid_leave_ns(t);
+}
+
+/* The mm's domain only: the IPC namespace, and its domain, survive execve(2). */
 void sched_mm_cid_before_execve(struct task_struct *t)
 {
-	sched_mm_cid_exit(t);
+	sched_mm_cid_leave(t);
 }
 
 /* Reactivate MM CID after execve() */
@@ -800,4 +841,169 @@ void mm_init_cid(struct mm_struct *mm, struct task_struct *p)
 {
 	cid_domain_init(&mm->mm_cid, CID_DOMAIN_MM, mm->mm_cid.pcpu, mm_cidmask(mm),
 			mm_cpus_allowed(mm), p);
+}
+/*
+ * The cid domain of an IPC namespace created with CLONE_IPC_CID, see
+ * Documentation/scheduler/sched-max-concurrency.rst. Its members are the
+ * tasks with an mm whose nsproxy names the namespace: they join after
+ * fork(2) and at setns(2) and unshare(2), and leave at exit and when
+ * switching away. A member holds a reference on the namespace, so that
+ * its cached domain pointer stays valid whatever the order of the exit
+ * and namespace paths.
+ */
+struct ns_cid *ns_cid_create(struct ipc_namespace *ns)
+{
+	struct cid_pcpu __percpu *pcpu;
+	unsigned long *cidmask;
+	struct cpumask *cpus;
+	struct ns_cid *nc;
+
+	nc = kzalloc(sizeof(*nc), GFP_KERNEL);
+	pcpu = alloc_percpu(struct cid_pcpu);
+	cidmask = bitmap_zalloc(num_possible_cpus(), GFP_KERNEL);
+	cpus = kzalloc(cpumask_size(), GFP_KERNEL);
+	if (!nc || !pcpu || !cidmask || !cpus) {
+		kfree(cpus);
+		bitmap_free(cidmask);
+		free_percpu(pcpu);
+		kfree(nc);
+		return ERR_PTR(-ENOMEM);
+	}
+	cid_domain_init(&nc->dom, CID_DOMAIN_NS, pcpu, cidmask, cpus, NULL);
+	nc->ns = ns;
+	return nc;
+}
+void ns_cid_destroy(struct ns_cid *nc)
+{
+	if (!nc)
+		return;
+	WARN_ON_ONCE(nc->dom.users);
+	irq_work_sync(&nc->dom.irq_work);
+	cancel_work_sync(&nc->dom.work);
+	conc_dom_destroy(&nc->dom);
+	conc_ns_release(nc);
+	cid_domain_exit(&nc->dom);
+	free_percpu(nc->dom.pcpu);
+	bitmap_free(nc->dom.cidmask);
+	kfree(nc->dom.cpus_allowed);
+	kfree(nc);
+}
+/* The domain pointer is set before the join and cleared after the leave: the
+ * switch paths see an inactive user in between and do nothing with it. */
+static void sched_cid_join_ns(struct task_struct *t, struct ns_cid *nc)
+{
+	get_ipc_ns(nc->ns);
+	task_lock(t);
+	t->ns_dom = &nc->dom;
+	task_unlock(t);
+	cid_user_join(&nc->dom, t, &t->ns_cid);
+}
+static void sched_cid_leave_ns(struct task_struct *t)
+{
+	struct cid_domain *dom = t->ns_dom;
+
+	if (!dom)
+		return;
+	cid_user_leave(dom, t, &t->ns_cid);
+	task_lock(t);
+	t->ns_dom = NULL;
+	task_unlock(t);
+	put_ipc_ns(container_of(dom, struct ns_cid, dom)->ns);
+}
+/* After fork(2): the mm's domain and, when the namespace has one, its domain. */
+void sched_cid_fork(struct task_struct *t)
+{
+	struct ns_cid *nc;
+
+	if (!t->mm)
+		return;
+	sched_mm_cid_fork(t);
+	nc = t->nsproxy->ipc_ns->cid;
+	if (nc && !t->ns_dom)
+		sched_cid_join_ns(t, nc);
+}
+/*
+ * The child's cgroup is final, the child is not visible yet: a namespace
+ * created by this clone freezes its ceiling on it; an inherited one
+ * admits it or refuses the clone, which only CLONE_INTO_CGROUP can hit.
+ */
+int sched_cid_fork_ns(struct task_struct *p)
+{
+	struct ns_cid *nc = p->mm ? p->nsproxy->ipc_ns->cid : NULL;
+
+	if (!nc)
+		return 0;
+	return conc_ns_admit_fork(nc, p) ? 0 : -EBUSY;
+}
+/*
+ * setns(2) validation: the task is admitted now, under the mutex that
+ * migrations take, once the migrations judged before are applied, and
+ * joins when the namespaces are switched; until then, or until the setns
+ * fails, migrations keep it within the bound's subtree through
+ * ns_pending.
+ */
+int sched_cid_setns(struct task_struct *t, struct ipc_namespace *ns)
+{
+	struct ns_cid *nc = t->mm ? ns->cid : NULL;
+
+	if (!nc || &nc->dom == t->ns_dom)
+		return 0;
+	conc_ns_guard();
+	if (!conc_ns_admit_self(nc, t))
+		return -EBUSY;
+	conc_ns_pending_set(t, nc);
+	return 0;
+}
+void sched_cid_setns_done(struct task_struct *t)
+{
+	conc_ns_pending_clear(t);
+}
+/*
+ * The namespaces of @t are switched to @new (NULL at exit): leave the
+ * domain of the old IPC namespace, join the new one's. An unshare(2)
+ * freezes the new namespace's bound here, on the task's own cgroup; a
+ * setns(2) was admitted in sched_cid_setns().
+ *
+ * Only the admission and the join hold conc_mutex. The leave must not: the
+ * last member's leave waits for the domain's work, which takes conc_mutex
+ * for a deferred bound update.
+ */
+void sched_cid_switch_ns(struct task_struct *t, struct nsproxy *new)
+{
+	struct ns_cid *nc = new && t->mm ? new->ipc_ns->cid : NULL;
+
+	if ((nc ? &nc->dom : NULL) == t->ns_dom) {
+		sched_cid_setns_done(t);
+		return;
+	}
+	sched_cid_leave_ns(t);
+	if (nc) {
+		conc_ns_guard();
+		/* Admitted already for a setns(2); an unshare(2) freezes here. */
+		WARN_ON_ONCE(!conc_ns_admit_self(nc, t));
+		sched_cid_join_ns(t, nc);
+	}
+	sched_cid_setns_done(t);
+	/* The ID the task reports changed meaning: refresh it before user space runs. */
+	if (t == current)
+		rseq_force_update();
+}
+/* The bounds of a namespace, for its sysctls: exclusive upper bounds of ns_cid. */
+unsigned int ns_cid_max(struct ipc_namespace *ns)
+{
+	struct ns_cid *nc = ns->cid;
+
+	if (!nc)
+		return nr_cpu_ids;
+	return conc_ns_ceiling(&nc->dom);
+}
+unsigned int ns_cid_cur(struct ipc_namespace *ns)
+{
+	struct ns_cid *nc = ns->cid;
+	unsigned int bound;
+
+	if (!nc)
+		return nr_cpu_ids;
+	bound = READ_ONCE(nc->dom.bound);
+	return bound ?: conc_ns_ceiling(&nc->dom);
 }
