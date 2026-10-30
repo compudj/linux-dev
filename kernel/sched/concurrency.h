@@ -23,18 +23,7 @@ static inline int conc_evict_cpu(struct task_group *tg, int cpu, bool set_move, 
 }
 
 /* Filled in by a later patch. */
-static inline void conc_hold_kick(void)
-{
-}
-
-/* Filled in by a later patch. */
-static inline bool conc_hold_request(struct task_struct *p, u8 why)
-{
-	return false;
-}
-
-/* Filled in by a later patch. */
-static inline bool conc_task_held(struct task_struct *p)
+static inline int conc_make_reachable(struct task_group *tg, const struct cpumask *mask)
 {
 	return false;
 }
@@ -123,6 +112,19 @@ static inline enum conc_claim_result conc_claim(struct task_group *tg, int cpu, 
 }
 
 extern atomic_t conc_nr_held;
+extern void conc_hold_kick(void);
+extern void conc_held_blocks(struct rq *rq, struct task_struct *p);
+extern void conc_unhold(struct rq *rq, struct task_struct *p, bool rehold);
+
+/*
+ * Held off the CPUs, out of its class, see conc_hold(). Under
+ * task_rq(p)->lock. Behind the key: no task stays held once the key is off,
+ * the last reference waits for the held tasks to be placed (conc_key_put()).
+ */
+static inline bool conc_task_held(struct task_struct *p)
+{
+	return static_branch_unlikely(&sched_conc_enabled) && unlikely(p->conc_held);
+}
 
 /*
  * About to be held, see conc_hold_request(): it takes no concurrency ID. A
@@ -188,6 +190,9 @@ static inline void conc_task_release(struct task_struct *p, int cpu)
 
 /* Why a task is to be held at its next return to user space. */
 #define CONC_HOLD_UNPLACED	1	/* it runs without a slot */
+#define CONC_HOLD_EVICT		2	/* its slot is being emptied */
+extern bool conc_hold_request(struct task_struct *p, u8 why);
+
 /*
  * Move @p's slot from @src to @dst. Returns false when the limit refuses
  * @dst, in which case nothing changed and the caller must not migrate,
@@ -279,6 +284,12 @@ static inline bool conc_task_claim(struct task_struct *p, int cpu) { return true
 static inline void conc_task_release(struct task_struct *p, int cpu) { }
 
 static inline bool conc_task_move(struct task_struct *p, int src, int dst, bool must) { return true; }
+
+static inline bool conc_task_held(struct task_struct *p) { return false; }
+
+static inline void conc_held_blocks(struct rq *rq, struct task_struct *p) { }
+
+static inline void conc_unhold(struct rq *rq, struct task_struct *p, bool rehold) { }
 
 static __always_inline bool conc_task_unplaced(struct task_struct *p) { return false; }
 

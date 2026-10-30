@@ -265,7 +265,13 @@ static void rseq_slowpath_update_usr(struct pt_regs *regs)
 	struct rseq_ids ids;
 	bool event;
 
-	if (unlikely(t->flags & PF_EXITING))
+	/*
+	 * A task with SIGKILL pending never returns to user space: the exit
+	 * loop delivers the signal before it leaves. Its IDs need no update,
+	 * and it may hold none: a task without a concurrency slot takes none,
+	 * see conc_task_unplaced().
+	 */
+	if (unlikely(t->flags & PF_EXITING) || fatal_signal_pending(t))
 		return;
 
 	rseq_stat_inc(rseq_stats.slowpath);
