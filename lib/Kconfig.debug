@@ -1363,6 +1363,21 @@ config SCHEDSTATS
 	  application, you can say N to avoid the very slight overhead
 	  this adds.
 
+config SCHED_MAX_CONCURRENCY_DEBUG
+	bool "Check the invariants of the concurrency limit"
+	depends on SCHED_MAX_CONCURRENCY && DEBUG_KERNEL
+	default n
+	help
+	  Warn once when a task that its group counts on a CPU is switched
+	  in or out there while the group has no slot on that CPU, when a
+	  release finds no entity to remove, and when a CPU keeps a
+	  concurrency ID of a bounded domain after a schedule-out although
+	  the domain's group has no slot on it. These are the invariants
+	  that keep a group on no more CPUs than its limit and its IDs below
+	  the bound. A few loads per context switch and per release. Warn
+	  too when a task waits a second for a slot to run on, and report
+	  the longest wait from 10 ms on.
+
 endmenu
 
 config DEBUG_PREEMPT

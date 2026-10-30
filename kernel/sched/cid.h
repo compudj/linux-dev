@@ -289,7 +289,9 @@ static __always_inline void __cid_schedin(struct cid_domain *dom, struct task_st
 		cid_from_cpu(dom, next, u, cpu_cid, mode);
 }
 
-#ifndef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY_DEBUG
+extern void conc_debug_cid_kept(struct cid_domain *dom, struct task_struct *prev);
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 static inline void conc_debug_cid_kept(struct cid_domain *dom, struct task_struct *prev) { }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
@@ -351,6 +353,7 @@ static __always_inline void mm_cid_schedout(struct task_struct *prev)
 	if (likely(prev->mm_cid.cid == MM_CID_UNSET))
 		return;
 	__cid_schedout(&prev->mm->mm_cid, prev, &prev->mm_cid);
+	conc_debug_cid_kept(&prev->mm->mm_cid, prev);
 }
 
 static inline void mm_cid_switch_to(struct task_struct *prev, struct task_struct *next)
