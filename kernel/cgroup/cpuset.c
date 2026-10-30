@@ -4496,6 +4496,37 @@ void cpuset_cpus_allowed_without(struct task_struct *tsk, int cpu,
 }
 
 /**
+ * cpuset_task_cpus_rcu - get the CPUs the cpuset grants a task, without a lock
+ * @tsk: the task
+ * @pmask: the mask to fill
+ *
+ * Fill @pmask with the mask that cpuset_update_tasks_cpumask() applies to
+ * @tsk, before any requested mask. This is the effective CPUs of its
+ * cpuset, or of the parent if that leaves no CPU. For the top cpuset it is
+ * the possible CPUs minus the CPUs of the partitions. A hotplug event
+ * changes this mask when the cpuset code handles it, not when the CPU goes
+ * inactive. Unlike cpuset_cpus_allowed() this takes no lock, so a caller
+ * that holds a raw spinlock can use it. The caller holds the RCU read
+ * lock.
+ */
+void cpuset_task_cpus_rcu(struct task_struct *tsk, struct cpumask *pmask)
+{
+	const struct cpumask *possible_mask = task_cpu_possible_mask(tsk);
+	struct cpuset *cs;
+
+	WARN_ON_ONCE(!rcu_read_lock_held());
+	cs = task_cs(tsk);
+	if (cs == &top_cpuset) {
+		cpumask_andnot(pmask, possible_mask, subpartitions_cpus);
+		return;
+	}
+	/* A hotplug event reaches the effective CPUs later. */
+	cpumask_and(pmask, possible_mask, cs->effective_cpus);
+	if (cpumask_empty(pmask))
+		cpumask_and(pmask, possible_mask, parent_cs(cs)->effective_cpus);
+}
+
+/**
  * cpuset_cpus_allowed_fallback - final fallback before complete catastrophe.
  * @tsk: pointer to task_struct with which the scheduler is struggling
  *

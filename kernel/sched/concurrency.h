@@ -11,6 +11,12 @@
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 /* Filled in by a later patch. */
+static inline bool conc_claim_late(struct task_group *tg, int cpu)
+{
+	return false;
+}
+
+/* Filled in by a later patch. */
 static inline void conc_hold_kick(void)
 {
 }
@@ -27,6 +33,12 @@ static inline bool conc_task_held(struct task_struct *p)
 	return false;
 }
 
+/* Filled in by a later patch. */
+static inline bool conc_task_pinned_offlining(struct task_struct *p)
+{
+	return false;
+}
+
 /*
  * Concurrency accounting primitives, see
  * Documentation/scheduler/sched-max-concurrency.rst.
@@ -38,6 +50,44 @@ DECLARE_STATIC_KEY_FALSE(sched_conc_enabled);
 
 extern enum conc_claim_result conc_claim_slow(struct task_group *tg, int cpu, bool force,
 					  struct task_struct *p);
+
+/*
+ * The CPUs which the concurrency limit lets a task use. It is valid while a
+ * class selects a CPU for a wakeup, a fork or an exec. It is NULL when the
+ * limit does not restrict the task. conc_select_prepare() sets it with
+ * interrupts disabled.
+ */
+DECLARE_PER_CPU(const struct cpumask *, conc_select_cpus);
+
+static inline const struct cpumask *task_select_cpus(struct task_struct *p)
+{
+	const struct cpumask *cpus;
+
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return p->cpus_ptr;
+	cpus = __this_cpu_read(conc_select_cpus);
+	return cpus ?: p->cpus_ptr;
+}
+
+extern void __conc_select_prepare(struct task_struct *p);
+
+static inline void conc_select_prepare(struct task_struct *p)
+{
+	if (static_branch_unlikely(&sched_conc_enabled))
+		__conc_select_prepare(p);
+}
+
+/*
+ * Clear the pointer set by conc_select_prepare(). The static key is tested
+ * here too. The key can turn off between the two calls, and the pointer
+ * then stays set. The pointers of every CPU are reset when the key is
+ * turned on.
+ */
+static inline void conc_select_done(void)
+{
+	if (static_branch_unlikely(&sched_conc_enabled))
+		__this_cpu_write(conc_select_cpus, NULL);
+}
 
 /*
  * Return true if the group of @conc counts. This is an acquire. The state
@@ -212,6 +262,12 @@ static inline void conc_task_commit_move(struct task_struct *p, int src, int cla
 }
 
 extern void __init conc_init_root(void);
+extern int conc_select_cpu(struct task_struct *p, int cpu);
+extern void conc_task_change_group(struct task_struct *p, struct task_group *old_tg);
+extern bool conc_can_move(struct task_struct *p, int cpu);
+extern bool conc_constrain_mask(struct task_struct *p, struct cpumask *mask);
+extern int conc_pick_dest(struct task_struct *p, const struct cpumask *valid,
+			const struct cpumask *allowed, struct affinity_context *ctx);
 
 /* Called from outside concurrency.c. */
 int alloc_conc_sched_group(struct task_group *tg);
@@ -246,6 +302,14 @@ static inline void conc_mm_task_moved(struct task_struct *p) { }
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
 #ifndef CONFIG_SCHED_MAX_CONCURRENCY
+static inline const struct cpumask *task_select_cpus(struct task_struct *p)
+{
+	return p->cpus_ptr;
+}
+
+static inline void conc_select_prepare(struct task_struct *p) { }
+
+static inline void conc_select_done(void) { }
 
 static inline void conc_init_root(void) { }
 
@@ -267,6 +331,20 @@ static inline void conc_task_unclaim_dst(struct task_struct *p, int dst, int cla
 static inline void conc_task_commit_move(struct task_struct *p, int src, int claimed) { }
 
 static __always_inline bool conc_task_unplaced(struct task_struct *p) { return false; }
+
+static inline int conc_select_cpu(struct task_struct *p, int cpu) { return cpu; }
+
+static inline void conc_task_change_group(struct task_struct *p, struct task_group *old_tg) { }
+
+static inline bool conc_can_move(struct task_struct *p, int cpu) { return true; }
+
+static inline bool conc_constrain_mask(struct task_struct *p, struct cpumask *mask) { return true; }
+
+static inline int conc_pick_dest(struct task_struct *p, const struct cpumask *valid,
+			       const struct cpumask *allowed, struct affinity_context *ctx)
+{
+	return cpumask_any_and_distribute(valid, allowed);
+}
 
 static inline int alloc_conc_sched_group(struct task_group *tg) { return 1; }
 

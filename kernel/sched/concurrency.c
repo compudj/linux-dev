@@ -17,6 +17,19 @@
 #include "sched.h"
 #include "smp.h"
 #include <trace/events/sched.h>
+/*
+ * Constants
+ */
+
+/*
+ * Iterate over the active groups, from the group of @p upwards. Stop at
+ * the first group which is not active.
+ */
+#define for_each_conc_level(lvl, p)						\
+	for (lvl = task_group(p); conc_active(&lvl->conc); lvl = lvl->parent)
+/* The active groups from @tg up. */
+#define for_each_conc_level_from(lvl, tg)						\
+	for (lvl = (tg); conc_active(&lvl->conc); lvl = lvl->parent)
 
 /* An ancestor of the top group, outside the moved set, that counts it. */
 struct conc_sm_ancestor {
@@ -47,7 +60,9 @@ struct conc_resv {
  * p->pi_lock and rq->lock, never the other way.
  */
 DEFINE_STATIC_KEY_FALSE(sched_conc_enabled);
-static __maybe_unused DEFINE_PER_CPU(cpumask_var_t, conc_select_mask);
+DEFINE_PER_CPU(const struct cpumask *, conc_select_cpus);
+static DEFINE_PER_CPU(cpumask_var_t, conc_select_mask);
+static DEFINE_PER_CPU(cpumask_var_t, conc_entitled_mask);
 
 /* Serializes configuration: limit writes, activation, eviction and retries. */
 static DEFINE_MUTEX(conc_mutex);
@@ -67,6 +82,8 @@ static void conc_subtree_release(struct cgroup_subsys_state **arr, int n);
 static void conc_irq_work(struct irq_work *work);
 static void conc_cleaner_work(struct work_struct *work);
 static int conc_resv_cpu(struct conc_resv *resv);
+
+static inline bool conc_task_mask_fixed(struct task_struct *t);
 
 #ifdef CONFIG_SCHED_MM_CID
 /*
@@ -135,6 +152,84 @@ void __init conc_init_root(void)
 		int node = cpu_to_node(i);
 
 		zalloc_cpumask_var_node(&per_cpu(conc_select_mask, i), GFP_KERNEL, node);
+		zalloc_cpumask_var_node(&per_cpu(conc_entitled_mask, i), GFP_KERNEL, node);
+	}
+}
+
+/*
+ * Return true when @p's search must skip the unused siblings of the used
+ * CPUs of @conc.
+ *
+ * Slots are sticky, and the siblings of a core share its execution
+ * resources. A slot on the sibling of a used CPU is worth less than a slot
+ * on a core where no CPU is used. So skip the siblings while such a core
+ * exists among the active CPUs of @p's mask.
+ *
+ * A limit at or above the number of CPUs in @p's mask has room for all of
+ * them. Nothing is spread then.
+ *
+ * The masks are read without the group lock. A stale view only places a
+ * slot less well.
+ */
+static inline bool conc_spread(struct task_struct *p, struct tg_concurrency *conc)
+{
+	return sched_smt_active() && conc->effective < p->nr_cpus_allowed &&
+	       cpumask_first_and_and(p->cpus_ptr, conc->unused_cores,
+				     cpu_active_mask) < nr_cpu_ids;
+}
+
+/* Is @cpu the unused sibling of a used CPU of @conc? */
+static inline bool conc_on_used_core(struct tg_concurrency *conc, int cpu)
+{
+	return !cpumask_test_cpu(cpu, conc->used) &&
+	       !cpumask_test_cpu(cpu, conc->unused_cores);
+}
+
+/*
+ * Record the CPUs which the limit lets @p use, in conc_select_cpus, before
+ * a class selects a CPU for @p.
+ *
+ * Walk from @p's group up. Skip the groups without a limit. Stop at the
+ * first group without headroom and record its used set, within @p's mask.
+ * Record nothing if that set is empty. The class then picks a usable CPU,
+ * and conc_select_cpu() rarely has to redirect.
+ *
+ * A group with headroom on the way up spreads its slots over cores, see
+ * conc_spread(). The innermost such group narrows the mask first.
+ */
+void __conc_select_prepare(struct task_struct *p)
+{
+	struct cpumask *mask = this_cpu_cpumask_var_ptr(conc_select_mask);
+	struct task_group *lvl;
+	bool spread = false;
+
+	if (!conc_task_active(p))
+		return;
+	for_each_conc_level(lvl, p) {
+		struct tg_concurrency *conc = &lvl->conc;
+
+		if (!conc->effective)
+			continue;
+		if (READ_ONCE(conc->nr_used) < conc->effective) {
+			if (!spread && conc_spread(p, conc)) {
+				cpumask_or(mask, conc->used, conc->unused_cores);
+				cpumask_and(mask, mask, p->cpus_ptr);
+				__this_cpu_write(conc_select_cpus, mask);
+				spread = true;
+			}
+			continue;
+		}
+		/*
+		 * Keep the part of the spread mask which is in the used
+		 * set. If there is none, use the used set.
+		 */
+		if (spread && cpumask_and(mask, mask, conc->used))
+			return;
+		if (cpumask_and(mask, p->cpus_ptr, conc->used))
+			__this_cpu_write(conc_select_cpus, mask);
+		else
+			__this_cpu_write(conc_select_cpus, NULL);
+		return;
 	}
 }
 
@@ -322,9 +417,360 @@ out:
 	return ret;
 }
 
+/*
+ * Bring @p's mask up to date with its cpuset. Return true if the mask
+ * changed.
+ *
+ * A cpuset change updates the masks of the tasks one by one. The slots of
+ * the group move earlier, with the cpuset as a whole, see
+ * conc_task_entitled(). A task can thus wake up with a mask which is behind
+ * its cpuset. Apply here the mask which the cpuset's pass would apply.
+ *
+ * The caller holds p->pi_lock. @p is not queued.
+ */
+static bool conc_task_mask_behind(struct task_struct *p)
+{
+	struct cpumask *ent = this_cpu_cpumask_var_ptr(conc_entitled_mask);
+	struct affinity_context ac = { .new_mask = ent, .flags = 0 };
+
+	lockdep_assert_held(&p->pi_lock);
+	if (p->on_rq || conc_task_mask_fixed(p) || is_migration_disabled(p) ||
+	    p->migration_pending)
+		return false;
+	scoped_guard(rcu)
+		cpuset_task_cpus_rcu(p, ent);
+	if (p->user_cpus_ptr && cpumask_intersects(ent, p->user_cpus_ptr))
+		cpumask_and(ent, ent, p->user_cpus_ptr);
+	if (cpumask_equal(ent, p->cpus_ptr))
+		return false;
+	/*
+	 * The cpuset was read without its lock, in the middle of a change.
+	 * Do not apply a mask without an active CPU. The pass of the cpuset
+	 * brings the final mask.
+	 */
+	if (!cpumask_intersects(ent, cpu_active_mask))
+		return false;
+	scoped_guard(__task_rq_lock, p)
+		do_set_cpus_allowed(p, &ac);
+	return true;
+}
+
+/*
+ * Mark @p as the holder of the slot claimed for it on @cpu.
+ *
+ * A task being woken up or forked is not queued. p->pi_lock keeps every
+ * other path off its accounting.
+ *
+ * A held task (@held) is queued but out of its class. The selection can end
+ * its hold. A fallback widening (select_fallback_rq(), or the widening of a
+ * pinned task in conc_select_cpu()) changes the mask of a queued task. That
+ * dequeues the task, and the dequeue ends the hold. The task is then back
+ * in its class without a slot, and a new hold is requested. It can run or
+ * move under its runqueue lock alone.
+ *
+ * So take that lock. Give the slot only if the task is still held.
+ * Otherwise release the slot.
+ */
+static void conc_select_account(struct task_struct *p, struct task_group *tg, int cpu,
+			      bool held)
+{
+	if (held) {
+		scoped_guard(__task_rq_lock, p) {
+			if (p->conc_held) {
+				p->conc_accounted = 1;
+				return;
+			}
+		}
+		conc_release(tg, cpu);
+		return;
+	}
+	p->conc_accounted = 1;
+}
+
+/*
+ * Claim a slot for @p after its class chose @cpu, see select_task_rq().
+ * Used for wakeups, forks and the placement of a held task.
+ *
+ * Return the CPU to use. @p holds a slot on it when its group counts,
+ * except when no CPU within the limit was found. Then @p runs without a
+ * slot and a hold is requested, see conc_hold_request(). Return -1 for a
+ * held task which stays held.
+ *
+ * A CPU is usable when @p's group can claim it. It is a CPU of its own used
+ * set, or a CPU of an active ancestor's used set when the group has
+ * headroom.
+ *
+ * The classes already search within the used set. This catches what they
+ * miss:
+ *  - the used set changed during the search;
+ *  - a wakeup took the previous CPU without a search;
+ *  - the rt or deadline search found no used CPU, because its mask is
+ *    narrowed after cpupri_find() or cpudl_find() chose a priority level.
+ */
+int conc_select_cpu(struct task_struct *p, int cpu)
+{
+	struct task_group *tg = task_group(p), *lvl;
+	int prev = task_cpu(p), c, attempt;
+	enum conc_claim_result ret;
+	bool updated = false, widened = false, held = p->conc_held;
+
+	lockdep_assert_held(&p->pi_lock);
+	WARN_ON_ONCE(p->conc_accounted);
+
+again:
+	for (attempt = 0; attempt < 3; attempt++) {
+		ret = conc_claim(tg, cpu, false, p);
+		if (ret != CONC_REFUSED)
+			goto done;
+
+		for_each_conc_level_from(lvl, tg) {
+			/*
+			 * Try the previous CPU first. It is the most likely to
+			 * be cache hot.
+			 */
+			if (prev != cpu && cpumask_test_cpu(prev, lvl->conc.used) &&
+			    cpumask_test_cpu(prev, p->cpus_ptr) && is_cpu_allowed(p, prev)) {
+				ret = conc_claim(tg, prev, false, p);
+				if (ret != CONC_REFUSED) {
+					cpu = prev;
+					goto done;
+				}
+			}
+
+			/* Then an idle CPU of the used set, then any. */
+			for_each_cpu_and(c, lvl->conc.used, p->cpus_ptr) {
+				if (c == cpu || c == prev || !available_idle_cpu(c) ||
+				    !is_cpu_allowed(p, c))
+					continue;
+				ret = conc_claim(tg, c, false, p);
+				if (ret != CONC_REFUSED) {
+					cpu = c;
+					goto done;
+				}
+			}
+			for_each_cpu_wrap(c, lvl->conc.used, prev + 1) {
+				if (c == cpu || c == prev || !cpumask_test_cpu(c, p->cpus_ptr) ||
+				    !is_cpu_allowed(p, c))
+					continue;
+				ret = conc_claim(tg, c, false, p);
+				if (ret != CONC_REFUSED) {
+					cpu = c;
+					goto done;
+				}
+			}
+		}
+
+		/*
+		 * No usable CPU. Try a slot of @p's own group which is
+		 * being evicted or drained. The group's concurrency IDs are
+		 * still on that CPU. @p is then a late arrival there, and
+		 * the eviction deals with it. Otherwise @p would run
+		 * without a slot on a new CPU.
+		 *
+		 * The claim fails when the slot is gone. The used set
+		 * changed then, so select again.
+		 */
+		for_each_cpu_and(c, tg->conc.used, p->cpus_ptr) {
+			if (!is_cpu_allowed(p, c))
+				continue;
+			if (conc_claim_late(tg, c)) {
+				ret = CONC_CLAIMED;
+				cpu = c;
+				goto done;
+			}
+		}
+	}
+
+	/*
+	 * @p's mask may be behind its cpuset, see conc_task_mask_behind().
+	 * Update it and select once more.
+	 */
+	if (!updated && conc_task_mask_behind(p)) {
+		updated = true;
+		if (!cpumask_test_cpu(cpu, p->cpus_ptr) || !is_cpu_allowed(p, cpu))
+			cpu = select_fallback_rq(prev, p);
+		goto again;
+	}
+
+	/*
+	 * Every active CPU of @p's mask is going offline, and @p wakes up
+	 * before the unplug widened its mask. Give it now the mask which
+	 * select_fallback_rq() would give it once those CPUs are gone. It
+	 * can then join a used CPU. Otherwise it would add a slot over the
+	 * limit on a CPU going offline, and take a concurrency ID above the
+	 * bound there.
+	 */
+	if (!widened && conc_task_pinned_offlining(p)) {
+		widened = true;
+		if (!cpuset_cpus_allowed_fallback(p) || conc_task_pinned_offlining(p))
+			set_cpus_allowed_force(p, task_cpu_fallback_mask(p));
+		if (!cpumask_test_cpu(cpu, p->cpus_ptr) || !is_cpu_allowed(p, cpu) ||
+		    cpumask_test_cpu(cpu, &conc_offlining_cpus))
+			cpu = select_fallback_rq(prev, p);
+		goto again;
+	}
+
+	/*
+	 * No CPU within the limit was found. @p's mask misses the used sets
+	 * and the group may not add a slot.
+	 *
+	 * A held task stays held.
+	 *
+	 * Any other task runs without a slot and takes no concurrency ID.
+	 * It runs on the class's choice, or on another allowed CPU if that
+	 * one is going offline. It finishes its kernel-mode work and is
+	 * held at its return to user space, see conc_hold_request().
+	 */
+	if (p->conc_held)
+		return -1;
+	if (cpumask_test_cpu(cpu, &conc_offlining_cpus)) {
+		for_each_cpu_and(c, p->cpus_ptr, cpu_active_mask) {
+			if (c != cpu && conc_cpu_usable(c) && is_cpu_allowed(p, c)) {
+				cpu = c;
+				break;
+			}
+		}
+	}
+	conc_hold_request(p, CONC_HOLD_UNPLACED);
+	return cpu;
+done:
+	if (ret == CONC_CLAIMED)
+		conc_select_account(p, tg, cpu, held);
+	return cpu;
+}
+
+/*
+ * Move @p's slot from @old_tg to its new group. Called from
+ * sched_move_task() after task_group(p) changed. The task is dequeued. The
+ * caller holds p->pi_lock and the runqueue lock.
+ */
+void conc_task_change_group(struct task_struct *p, struct task_group *old_tg)
+{
+	int cpu = task_cpu(p);
+
+	if (p->conc_accounted) {
+		p->conc_accounted = 0;
+		conc_release(old_tg, cpu);
+	}
+	/*
+	 * A held task claims nothing. The new group may have room for it,
+	 * so kick the placement work.
+	 */
+	if (p->conc_held) {
+		conc_hold_kick();
+		return;
+	}
+	/*
+	 * Only a present task claims a slot. It is queued, or it is between
+	 * its selection and its enqueue.
+	 */
+	if (!conc_task_active(p) ||
+	    (!task_on_rq_queued(p) && READ_ONCE(p->__state) != TASK_WAKING))
+		return;
+	/*
+	 * If the new group has no room, hold @p at its next return to user
+	 * space.
+	 */
+	switch (conc_claim(task_group(p), cpu, false, p)) {
+	case CONC_CLAIMED:
+		p->conc_accounted = 1;
+		break;
+	case CONC_REFUSED:
+		conc_hold_request(p, CONC_HOLD_UNPLACED);
+		break;
+	default:
+		break;
+	}
+}
+
 static inline bool conc_tg_has_headroom(struct task_group *tg)
 {
 	return !tg->conc.effective || READ_ONCE(tg->conc.nr_used) < tg->conc.effective;
+}
+
+/*
+ * Return false if @p is held, or if the limit would refuse a move of @p to
+ * @cpu. This is a lockless check for the load balancer. conc_task_move()
+ * validates the move itself.
+ */
+bool conc_can_move(struct task_struct *p, int cpu)
+{
+	struct task_group *tg;
+
+	if (conc_task_held(p))
+		return false;
+	if (!conc_task_active(p))
+		return true;
+	tg = task_group(p);
+	if (atomic_read(per_cpu_ptr(tg->conc.present, cpu)) >= 0)
+		return true;
+	if (!conc_tg_has_headroom(tg))
+		return false;
+	/* A new slot: one per core first, see conc_spread(). */
+	return !conc_on_used_core(&tg->conc, cpu) || !conc_spread(p, &tg->conc);
+}
+
+/*
+ * Restrict the CPU search mask @mask of @p by the limit of its group.
+ * Return false if no CPU is left.
+ *
+ * Without headroom, keep the used set. With headroom, drop the unused
+ * siblings of the used CPUs, see conc_spread().
+ */
+bool conc_constrain_mask(struct task_struct *p, struct cpumask *mask)
+{
+	struct tg_concurrency *conc;
+	int cpu;
+
+	if (!conc_task_active(p))
+		return true;
+	conc = &task_group(p)->conc;
+	if (!conc_tg_has_headroom(task_group(p)))
+		return cpumask_and(mask, mask, conc->used);
+	/*
+	 * Spread over cores, see conc_spread(). Do it only if a CPU is left
+	 * afterwards. An rt or deadline task takes the sibling of a used
+	 * CPU rather than wait.
+	 */
+	if (conc_spread(p, conc) && (cpumask_intersects(mask, conc->used) ||
+				 cpumask_intersects(mask, conc->unused_cores))) {
+		for_each_cpu(cpu, mask) {
+			if (conc_on_used_core(conc, cpu))
+				__cpumask_clear_cpu(cpu, mask);
+		}
+	}
+	return true;
+}
+
+/*
+ * Return the destination CPU for an affinity change of @p. It is in
+ * @allowed and in @valid. Prefer the CPU reserved for the change, then a
+ * used CPU of @p's group, then a CPU which is not going offline.
+ */
+int conc_pick_dest(struct task_struct *p, const struct cpumask *valid,
+		 const struct cpumask *allowed, struct affinity_context *ctx)
+{
+	int cpu;
+
+	if (conc_task_active(p)) {
+		struct task_group *tg = task_group(p);
+
+		for_each_cpu_and(cpu, allowed, tg->conc.used) {
+			int v = atomic_read(per_cpu_ptr(tg->conc.present, cpu));
+
+			/* A reserved slot must not run anything yet. */
+			if (cpumask_test_cpu(cpu, valid) && !conc_slot_reserved(v))
+				return cpu;
+		}
+	}
+	/* Not a CPU going offline, when there is any other. */
+	if (cpumask_intersects(valid, &conc_offlining_cpus)) {
+		for_each_cpu_and(cpu, valid, allowed) {
+			if (!cpumask_test_cpu(cpu, &conc_offlining_cpus))
+				return cpu;
+		}
+	}
+	return cpumask_any_and_distribute(valid, allowed);
 }
 
 static void conc_irq_work(struct irq_work *work)
@@ -1080,6 +1526,18 @@ static void conc_notify_tree(struct task_group *top)
 		}
 	}
 	rcu_read_unlock();
+}
+
+/*
+ * Return true if the limit never changes the mask of @t on its own. This
+ * holds for kernel threads, for tasks whose affinity cannot be set, and
+ * for deadline tasks. The bandwidth of a deadline task is admitted per
+ * root domain. It would have to be checked again for a mask which reaches
+ * another root domain, see dl_task_check_affinity().
+ */
+static inline bool conc_task_mask_fixed(struct task_struct *t)
+{
+	return t->flags & (PF_KTHREAD | PF_NO_SETAFFINITY) || dl_task(t);
 }
 
 static __maybe_unused int conc_resv_cpu(struct conc_resv *resv)

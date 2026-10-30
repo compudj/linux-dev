@@ -3320,6 +3320,13 @@ static int find_later_rq(struct task_struct *task)
 		return -1;
 
 	/*
+	 * Keep the CPUs which the concurrency limit of the task's group
+	 * allows, see conc_constrain_mask().
+	 */
+	if (!conc_constrain_mask(task, later_mask))
+		return -1;
+
+	/*
 	 * If we are here, some targets have been found, including
 	 * the most suitable which is, among the runqueues where the
 	 * current tasks have later deadlines than the task's one, the
@@ -3563,10 +3570,11 @@ retry:
 		goto retry;
 	}
 
-	move_queued_task_locked(rq, later_rq, next_task);
-	ret = 1;
-
-	resched_curr(later_rq);
+	/* The concurrency limit may still refuse the destination. */
+	if (move_queued_task_locked(rq, later_rq, next_task)) {
+		ret = 1;
+		resched_curr(later_rq);
+	}
 
 	double_unlock_balance(rq, later_rq);
 
@@ -3648,8 +3656,7 @@ static void pull_dl_task(struct rq *this_rq)
 
 			if (is_migration_disabled(p)) {
 				push_task = get_push_task(src_rq);
-			} else {
-				move_queued_task_locked(src_rq, this_rq, p);
+			} else if (move_queued_task_locked(src_rq, this_rq, p)) {
 				dmin = p->dl.deadline;
 				resched = true;
 			}

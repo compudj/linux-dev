@@ -1809,6 +1809,13 @@ static int find_lowest_rq(struct task_struct *task)
 		return -1; /* No targets found */
 
 	/*
+	 * Keep the CPUs which the concurrency limit of the task's group
+	 * allows, see conc_constrain_mask().
+	 */
+	if (!conc_constrain_mask(task, lowest_mask))
+		return -1;
+
+	/*
 	 * At this point we have built a mask of CPUs representing the
 	 * lowest priority tasks in the system.  Now we want to elect
 	 * the best one based on our affinity and topology.
@@ -2067,9 +2074,11 @@ retry:
 		goto retry;
 	}
 
-	move_queued_task_locked(rq, lowest_rq, next_task);
-	resched_curr(lowest_rq);
-	ret = 1;
+	/* The concurrency limit may still refuse the destination. */
+	if (move_queued_task_locked(rq, lowest_rq, next_task)) {
+		resched_curr(lowest_rq);
+		ret = 1;
+	}
 
 	double_unlock_balance(rq, lowest_rq);
 out:
@@ -2342,8 +2351,7 @@ static void pull_rt_task(struct rq *this_rq)
 
 			if (is_migration_disabled(p)) {
 				push_task = get_push_task(src_rq);
-			} else {
-				move_queued_task_locked(src_rq, this_rq, p);
+			} else if (move_queued_task_locked(src_rq, this_rq, p)) {
 				resched = true;
 			}
 			/*

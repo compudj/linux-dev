@@ -78,6 +78,7 @@ extern void cpuset_unlock(void);
 extern void lockdep_assert_cpuset_lock_held(void);
 extern void cpuset_cpus_allowed_locked(struct task_struct *p, struct cpumask *mask);
 extern void cpuset_cpus_allowed(struct task_struct *p, struct cpumask *mask);
+extern void cpuset_task_cpus_rcu(struct task_struct *p, struct cpumask *mask);
 extern bool cpuset_cpus_allowed_fallback(struct task_struct *p);
 extern void cpuset_cpus_allowed_without(struct task_struct *p, int cpu,
 					struct cpumask *mask);
