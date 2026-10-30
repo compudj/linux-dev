@@ -2,6 +2,7 @@
 test_core
 test_cpu
 test_cpu_concurrency
+test_cpu_concurrency_stress
 test_cpuset
 test_freezer
 test_hugetlb_memcg

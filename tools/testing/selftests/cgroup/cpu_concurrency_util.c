@@ -21,6 +21,88 @@ __u32 rseq_field(const struct rseq *r, size_t offset)
 	return *(volatile const __u32 *)((const char *)r + offset);
 }
 
+/*
+ * The length glibc registered its area with, for a thread whose area
+ * rseq_ext_register() unregistered. 0 otherwise.
+ */
+static __thread unsigned int glibc_rseq_len;
+
+/* Register the area of glibc again, see rseq_ext_register(). */
+static void rseq_glibc_restore(void)
+{
+	if (!glibc_rseq_len)
+		return;
+	if (!syscall(__NR_rseq, thread_rseq(), glibc_rseq_len, 0, RSEQ_SIG))
+		glibc_rseq_len = 0;
+}
+
+/*
+ * Register an rseq area which holds the ns_cid field. glibc registers 32
+ * bytes for a thread, and ns_cid lies past them. Unregister the area of
+ * glibc and register a larger one, with the size and the alignment which
+ * the auxiliary vector gives. Keep the area of glibc when it is large
+ * enough. Return the area. Set @lenp to its registered length, or to 0
+ * for the area of glibc. Return NULL when the kernel has no ns_cid field,
+ * or when the area cannot be replaced. While the area of glibc is
+ * unregistered, its sched_getcpu() falls back to the getcpu system call.
+ * rseq_ext_unregister() registers the area of glibc again.
+ */
+struct rseq *rseq_ext_register(size_t *lenp)
+{
+	unsigned long feat = getauxval(AT_RSEQ_FEATURE_SIZE);
+	unsigned long align = getauxval(AT_RSEQ_ALIGN);
+	size_t len, try[3];
+	struct rseq *area;
+	int i;
+
+	if (feat < RSEQ_NS_CID_OFFSET + sizeof(__u32) || !align)
+		return NULL;
+	if (__rseq_size >= RSEQ_NS_CID_OFFSET + sizeof(__u32)) {
+		*lenp = 0;
+		return thread_rseq();
+	}
+	len = (feat + align - 1) & ~(align - 1);
+	/* glibc registered with one of these lengths, if at all. */
+	try[0] = __rseq_size;
+	try[1] = 32;
+	try[2] = len;
+	for (i = 0; __rseq_size && i < 3; i++) {
+		if (!syscall(__NR_rseq, thread_rseq(), (unsigned int)try[i],
+			     RSEQ_FLAG_UNREGISTER, RSEQ_SIG))
+			break;
+	}
+	if (__rseq_size && i == 3)
+		return NULL;
+	if (__rseq_size)
+		glibc_rseq_len = try[i];
+	area = aligned_alloc(align, len);
+	if (!area) {
+		rseq_glibc_restore();
+		return NULL;
+	}
+	memset(area, 0, len);
+	if (syscall(__NR_rseq, area, (unsigned int)len, 0, RSEQ_SIG)) {
+		free(area);
+		rseq_glibc_restore();
+		return NULL;
+	}
+	*lenp = len;
+	return area;
+}
+
+void rseq_ext_unregister(struct rseq *area, size_t len)
+{
+	if (!len)
+		return;
+	syscall(__NR_rseq, area, (unsigned int)len, RSEQ_FLAG_UNREGISTER, RSEQ_SIG);
+	free(area);
+	/*
+	 * Give the thread the area of glibc back. A thread or a process
+	 * created from it later relies on that area, as glibc does.
+	 */
+	rseq_glibc_restore();
+}
+
 /* Print the reason why a test does not apply. Return KSFT_SKIP. */
 int skip(const char *fmt, ...)
 {
@@ -83,6 +165,11 @@ long long ns_since(const struct timespec *from)
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	return (now.tv_sec - from->tv_sec) * 1000000000LL + (now.tv_nsec - from->tv_nsec);
+}
+
+long us_since(const struct timespec *from)
+{
+	return ns_since(from) / 1000;
 }
 
 /* Spin for @ns nanoseconds. */

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Helpers shared by the tests of cpu.concurrency.max.
+ * Helpers shared by the tests of cpu.concurrency.max and by their
+ * stress variants.
  */
 #ifndef CPU_CONCURRENCY_UTIL_H
 #define CPU_CONCURRENCY_UTIL_H
@@ -44,7 +45,10 @@
 
 #define MAX_THREADS	64
 
+/* Offsets of fields in struct rseq, read through rseq_field(). */
+#define RSEQ_CPU_ID_OFFSET	offsetof(struct rseq, cpu_id)
 #define RSEQ_MM_CID_OFFSET	offsetof(struct rseq, mm_cid)
+#define RSEQ_NS_CID_OFFSET	offsetof(struct rseq, ns_cid)
 
 struct spinner {
 	pthread_t thread;
@@ -85,12 +89,15 @@ struct conc_stat {
 struct rseq *thread_rseq(void);
 int rseq_has_mm_cid(void);
 __u32 rseq_field(const struct rseq *r, size_t offset);
+struct rseq *rseq_ext_register(size_t *lenp);
+void rseq_ext_unregister(struct rseq *area, size_t len);
 int skip(const char *fmt, ...);
 int need_cpus(int n);
 long read_sysctl(const char *name);
 int ts_before(const struct timespec *a, const struct timespec *b);
 void ts_add_ms(struct timespec *t, long ms);
 long long ns_since(const struct timespec *from);
+long us_since(const struct timespec *from);
 void spin_ns(long long ns);
 void *spin(void *arg);
 void stress_all_cpus(cpu_set_t *set);
