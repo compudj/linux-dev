@@ -247,6 +247,9 @@ static inline bool conc_judged_stale(struct task_struct *p, struct affinity_cont
 	       (READ_ONCE(p->conc_move_seq) != ctx->conc.move_seq || READ_ONCE(conc_limit_gen) != ctx->conc.gen);
 }
 
+extern int conc_tg_prepare(struct task_group *tg, struct task_group *parent);
+extern int conc_scx_enable(void);
+extern void conc_scx_disable(void);
 extern void conc_cpu_deactivate(unsigned int cpu);
 extern void conc_cpu_activate(unsigned int cpu);
 extern void conc_cpu_offline(unsigned int cpu);
@@ -261,6 +264,27 @@ void conc_task_released(struct task_struct *p);
 void conc_attach_record_srcs(struct cgroup_taskset *tset);
 
 void conc_attach_finish(struct cgroup_taskset *tset, bool retry);
+
+int conc_tg_take_ceiling(struct task_group *tg, struct task_group *parent);
+
+void conc_tg_drop_ceiling(struct task_group *tg);
+
+void conc_tg_online(struct task_group *tg);
+
+void conc_tg_offline(struct task_group *tg);
+
+int cpu_concurrency_max_show(struct seq_file *sf, void *v);
+int cpu_concurrency_ceiling_show(struct seq_file *sf, void *v);
+
+ssize_t cpu_concurrency_max_write(struct kernfs_open_file *of,
+					 char *buf, size_t nbytes, loff_t off);
+
+int cpu_concurrency_child_ceiling_show(struct seq_file *sf, void *v);
+
+ssize_t cpu_concurrency_child_ceiling_write(struct kernfs_open_file *of,
+						    char *buf, size_t nbytes, loff_t off);
+
+int cpu_concurrency_effective_show(struct seq_file *sf, void *v);
 
 int conc_attach_check(struct cgroup_taskset *tset);
 
@@ -365,6 +389,12 @@ static inline bool conc_judged_stale(struct task_struct *p, struct affinity_cont
 	return false;
 }
 
+static inline int conc_tg_prepare(struct task_group *tg, struct task_group *parent) { return 0; }
+
+static inline int conc_scx_enable(void) { return 0; }
+
+static inline void conc_scx_disable(void) { }
+
 static inline void conc_cpu_deactivate(unsigned int cpu) { }
 
 static inline void conc_cpu_activate(unsigned int cpu) { }
@@ -374,6 +404,14 @@ static inline void conc_cpu_offline(unsigned int cpu) { }
 static inline int alloc_conc_sched_group(struct task_group *tg) { return 1; }
 
 static inline void free_conc_sched_group(struct task_group *tg) { }
+
+static inline int conc_tg_take_ceiling(struct task_group *tg, struct task_group *parent) { return 0; }
+
+static inline void conc_tg_drop_ceiling(struct task_group *tg) { }
+
+static inline void conc_tg_online(struct task_group *tg) { }
+
+static inline void conc_tg_offline(struct task_group *tg) { }
 
 static inline void conc_mm_task_moved(struct task_struct *p) { }
 
