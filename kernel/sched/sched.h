@@ -498,6 +498,10 @@ struct cfs_bandwidth {
 #define CONC_SLOT_DRAINING	(-2)
 #define CONC_SLOT_RESERVE_BIAS	(1 << 29)
 #define CONC_SLOT_EVICT_BIAS	(1 << 30)
+static inline bool conc_slot_evicting(int v)
+{
+	return v < -CONC_SLOT_RESERVE_BIAS;
+}
 static inline bool conc_slot_reserved(int v)
 {
 	return v < CONC_SLOT_DRAINING && v >= -CONC_SLOT_RESERVE_BIAS;
