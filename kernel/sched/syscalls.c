@@ -1135,8 +1135,10 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 
 int __sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
 {
+	const struct cpumask *requested = ctx->new_mask;
 	int retval;
 	cpumask_var_t cpus_allowed, new_mask;
+	bool conc_locked;
 
 	if (!alloc_cpumask_var(&cpus_allowed, GFP_KERNEL))
 		return -ENOMEM;
@@ -1146,8 +1148,14 @@ int __sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
 		goto out_free_cpus_allowed;
 	}
 
+	/*
+	 * Judged and applied with no cpuset write, limit start or migration
+	 * of @p between, else judged again.
+	 */
+again:
+	conc_locked = conc_affinity_lock(p, ctx);
 	cpuset_cpus_allowed(p, cpus_allowed);
-	cpumask_and(new_mask, ctx->new_mask, cpus_allowed);
+	cpumask_and(new_mask, requested, cpus_allowed);
 
 	ctx->new_mask = new_mask;
 	ctx->flags |= SCA_CHECK;
@@ -1156,7 +1164,20 @@ int __sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
 	if (retval)
 		goto out_free_new_mask;
 
+	/*
+	 * Would the mask exceed a cgroup's requested concurrency? Judged on
+	 * the mask the task would be configured to run on with it, as the
+	 * classes are.
+	 */
+	retval = conc_check_affinity(p, requested);
+	if (retval)
+		goto out_free_new_mask;
+
 	retval = __set_cpus_allowed_ptr(p, ctx);
+	if (retval == -EAGAIN && conc_judged_stale(p, ctx)) {
+		conc_affinity_unlock(p, conc_locked);
+		goto again;
+	}
 	if (retval)
 		goto out_free_new_mask;
 
@@ -1188,6 +1209,7 @@ int __sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
 	}
 
 out_free_new_mask:
+	conc_affinity_unlock(p, conc_locked);
 	free_cpumask_var(new_mask);
 out_free_cpus_allowed:
 	free_cpumask_var(cpus_allowed);

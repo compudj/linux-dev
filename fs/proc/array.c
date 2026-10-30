@@ -404,10 +404,30 @@ static inline void task_context_switch_counts(struct seq_file *m,
 
 static void task_cpus_allowed(struct seq_file *m, struct task_struct *task)
 {
+	cpumask_var_t requested;
+	bool has_requested = false;
+
 	seq_printf(m, "Cpus_allowed:\t%*pb\n",
 		   cpumask_pr_args(&task->cpus_mask));
 	seq_printf(m, "Cpus_allowed_list:\t%*pbl\n",
 		   cpumask_pr_args(&task->cpus_mask));
+	/*
+	 * The mask the task asked for with sched_setaffinity(2), which its
+	 * cpuset may cut: what Cpus_allowed is made of.
+	 */
+	if (!zalloc_cpumask_var(&requested, GFP_KERNEL))
+		return;
+	scoped_guard(raw_spinlock_irq, &task->pi_lock) {
+		if (task->user_cpus_ptr) {
+			cpumask_copy(requested, task->user_cpus_ptr);
+			has_requested = true;
+		}
+	}
+	if (has_requested) {
+		seq_printf(m, "Cpus_requested:\t%*pb\n", cpumask_pr_args(requested));
+		seq_printf(m, "Cpus_requested_list:\t%*pbl\n", cpumask_pr_args(requested));
+	}
+	free_cpumask_var(requested);
 }
 
 static inline void task_core_dumping(struct seq_file *m, struct task_struct *task)

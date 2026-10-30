@@ -3160,6 +3160,15 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 		goto out;
 	}
 
+	/*
+	 * A migration of @p judged its old mask since the new one was judged
+	 * for the group @p was in: judged again, see conc_affinity_lock().
+	 */
+	if (conc_judged_stale(p, ctx)) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
 	if (!(ctx->flags & SCA_MIGRATE_ENABLE)) {
 		if (cpumask_equal(&p->cpus_mask, ctx->new_mask)) {
 			if (ctx->flags & SCA_USER)
@@ -3209,6 +3218,14 @@ int __set_cpus_allowed_ptr(struct task_struct *p, struct affinity_context *ctx)
 {
 	struct rq_flags rf;
 	struct rq *rq;
+	int ret;
+
+	/*
+	 * A sole presence that must leave its CPU is relocated as a whole,
+	 * before the mask changes; see conc_prepare_affinity().
+	 */
+	if (!(ctx->flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)))
+		conc_prepare_affinity(p, ctx);
 
 	rq = task_rq_lock(p, &rf);
 	/*
@@ -3220,7 +3237,17 @@ int __set_cpus_allowed_ptr(struct task_struct *p, struct affinity_context *ctx)
 	    cpumask_and(rq->scratch_mask, ctx->new_mask, p->user_cpus_ptr))
 		ctx->new_mask = rq->scratch_mask;
 
-	return __set_cpus_allowed_ptr_locked(p, ctx, rq, &rf);
+	ret = __set_cpus_allowed_ptr_locked(p, ctx, rq, &rf);
+
+	/*
+	 * A mask change can make a concurrency limit feasible again or relax
+	 * it; migrate_disable()/enable() are not mask changes and cannot
+	 * sleep.
+	 */
+	if (!(ctx->flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)))
+		conc_task_affinity_changed(p, ctx, ret);
+
+	return ret;
 }
 
 int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
@@ -4970,6 +4997,7 @@ int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
 
 void sched_cancel_fork(struct task_struct *p)
 {
+	conc_fork_done(p);
 	scx_cancel_fork(p);
 }
 
@@ -9709,6 +9737,7 @@ static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
 
 static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
 {
+	int ret;
 #ifdef CONFIG_RT_GROUP_SCHED
 	struct task_struct *task;
 	struct cgroup_subsys_state *css;
@@ -9722,7 +9751,21 @@ static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
 	}
 scx_check:
 #endif /* CONFIG_RT_GROUP_SCHED */
-	return scx_cgroup_can_attach(tset);
+	ret = scx_cgroup_can_attach(tset);
+	if (ret)
+		return ret;
+	/*
+	 * Refused below, the cpu controller is the subsystem that failed:
+	 * cgroup core calls no cancel_attach() of its own, so sched_ext's
+	 * preparation is cancelled here.
+	 */
+	ret = conc_attach_check(tset);
+	if (ret) {
+		scx_cgroup_cancel_attach(tset);
+		return ret;
+	}
+	conc_attach_record_srcs(tset);
+	return 0;
 }
 
 static void cpu_cgroup_attach(struct cgroup_taskset *tset)
@@ -9732,13 +9775,23 @@ static void cpu_cgroup_attach(struct cgroup_taskset *tset)
 
 	cgroup_taskset_for_each(task, css, tset)
 		sched_move_task(task, false);
+
+	/* Retry the limits on both sides: a move never fails, it relaxes. */
+	conc_attach_finish(tset, true);
 }
 
 static void cpu_cgroup_cancel_attach(struct cgroup_taskset *tset)
 {
+	conc_attach_finish(tset, false);
 	scx_cgroup_cancel_attach(tset);
 }
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+static __maybe_unused void cpu_cgroup_release(struct task_struct *task)
+{
+	conc_task_released(task);
+}
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 static void cpu_util_update_eff(struct cgroup_subsys_state *css)
 {

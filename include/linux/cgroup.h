@@ -201,6 +201,8 @@ struct task_struct *cgroup_taskset_first(struct cgroup_taskset *tset,
 					 struct cgroup_subsys_state **dst_cssp);
 struct task_struct *cgroup_taskset_next(struct cgroup_taskset *tset,
 					struct cgroup_subsys_state **dst_cssp);
+struct cgroup_subsys_state *cgroup_taskset_cur_dst_css(struct cgroup_taskset *tset,
+						       int ssid);
 
 void css_task_iter_start(struct cgroup_subsys_state *css, unsigned int flags,
 			 struct css_task_iter *it);

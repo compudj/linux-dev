@@ -11,9 +11,33 @@
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 /* Filled in by a later patch. */
+static inline bool conc_cpuset_fixed(struct cgroup_subsys_state *css, struct task_group *starting)
+{
+	return false;
+}
+
+/* Filled in by a later patch. */
 static inline unsigned int conc_ns_clamp(struct cid_domain *dom, unsigned int bound)
 {
 	return bound;
+}
+
+/* Filled in by a later patch. */
+static inline int conc_pin_check(struct cgroup_taskset *tset)
+{
+	return 0;
+}
+
+/* Filled in by a later patch. */
+static inline int conc_pin_fork_check(struct task_struct *p, struct kernel_clone_args *kargs)
+{
+	return 0;
+}
+
+/* Filled in by a later patch. */
+static inline bool conc_task_ns_allows(struct task_struct *t, struct task_group *tg)
+{
+	return false;
 }
 
 /*
@@ -204,9 +228,31 @@ extern bool conc_can_move(struct task_struct *p, int cpu);
 extern bool conc_constrain_mask(struct task_struct *p, struct cpumask *mask);
 extern int conc_pick_dest(struct task_struct *p, const struct cpumask *valid,
 			const struct cpumask *allowed, struct affinity_context *ctx);
+extern void conc_task_affinity_changed(struct task_struct *p, struct affinity_context *ctx,
+				     int ret);
+extern void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx);
 extern void conc_task_mask_changed(struct task_struct *p, struct affinity_context *ctx);
 extern void conc_task_fork(struct task_struct *p);
 struct kernel_clone_args;
+extern int conc_fork_check(struct task_struct *p, struct kernel_clone_args *kargs);
+extern void conc_fork_done(struct task_struct *p);
+extern int conc_check_affinity(struct task_struct *p, const struct cpumask *mask);
+extern bool conc_affinity_lock(struct task_struct *p, struct affinity_context *ctx);
+extern void conc_affinity_unlock(struct task_struct *p, bool locked);
+
+/*
+ * A migration of @p judged its mask after @ctx's change was judged, see
+ * conc_affinity_lock(): the change must be judged again. Under p->pi_lock,
+ * or once it was true, as the count only grows.
+ */
+extern unsigned int conc_limit_gen;
+
+static inline bool conc_judged_stale(struct task_struct *p, struct affinity_context *ctx)
+{
+	return (ctx->flags & SCA_CC_JUDGED) &&
+	       (READ_ONCE(p->conc_move_seq) != ctx->conc.move_seq || READ_ONCE(conc_limit_gen) != ctx->conc.gen);
+}
+
 extern void conc_cpu_deactivate(unsigned int cpu);
 extern void conc_cpu_activate(unsigned int cpu);
 extern void conc_cpu_offline(unsigned int cpu);
@@ -215,6 +261,14 @@ extern void conc_cpu_offline(unsigned int cpu);
 int alloc_conc_sched_group(struct task_group *tg);
 
 void free_conc_sched_group(struct task_group *tg);
+
+void conc_task_released(struct task_struct *p);
+
+void conc_attach_record_srcs(struct cgroup_taskset *tset);
+
+void conc_attach_finish(struct cgroup_taskset *tset, bool retry);
+
+int conc_attach_check(struct cgroup_taskset *tset);
 
 #ifdef CONFIG_SCHED_MM_CID
 unsigned int conc_dom_bound(struct cid_domain *dom);
@@ -282,11 +336,40 @@ static inline int conc_pick_dest(struct task_struct *p, const struct cpumask *va
 	return cpumask_any_and_distribute(valid, allowed);
 }
 
+static inline void conc_task_affinity_changed(struct task_struct *p, struct affinity_context *ctx,
+					    int ret) { }
+
+static inline void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx) { }
+
 static inline void conc_task_mask_changed(struct task_struct *p, struct affinity_context *ctx) { }
 
 static inline void conc_task_fork(struct task_struct *p) { }
 
 struct kernel_clone_args;
+
+static inline int conc_fork_check(struct task_struct *p, struct kernel_clone_args *kargs)
+{
+	return 0;
+}
+
+static inline void conc_fork_done(struct task_struct *p) { }
+
+static inline int conc_check_affinity(struct task_struct *p, const struct cpumask *mask)
+{
+	return 0;
+}
+
+static inline bool conc_affinity_lock(struct task_struct *p, struct affinity_context *ctx)
+{
+	return false;
+}
+
+static inline void conc_affinity_unlock(struct task_struct *p, bool locked) { }
+
+static inline bool conc_judged_stale(struct task_struct *p, struct affinity_context *ctx)
+{
+	return false;
+}
 
 static inline void conc_cpu_deactivate(unsigned int cpu) { }
 
@@ -299,6 +382,12 @@ static inline int alloc_conc_sched_group(struct task_group *tg) { return 1; }
 static inline void free_conc_sched_group(struct task_group *tg) { }
 
 static inline void conc_mm_task_moved(struct task_struct *p) { }
+
+static inline void conc_attach_record_srcs(struct cgroup_taskset *tset) { }
+
+static inline void conc_attach_finish(struct cgroup_taskset *tset, bool retry) { }
+
+static inline int conc_attach_check(struct cgroup_taskset *tset) { return 0; }
 
 #ifdef CONFIG_SCHED_MM_CID
 static inline void conc_bounds_lock(void) { }

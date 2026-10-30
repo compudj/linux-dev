@@ -960,12 +960,20 @@ struct task_struct {
 	u8				conc_hold_pending;
 	/* Held: out of its class, queued for the core, in TASK_RUNNING, on conc_held_list. */
 	u8				conc_held;
+	/* Forked into another cgroup, judged and not registered yet, see conc_fork_check(). */
+	u8				conc_fork_pending;
 	/* Running a cgroup migration it judged, see conc_wait_attach(). */
 	u8				conc_attaching;
 	/* Its applied mask misses the one it is registered by, see conc_task_set_outside(). */
 	u8				conc_outside;
 	/* The CPU of a slot reserved for this task's arrival, -1 when none. */
 	int				conc_resv_cpu;
+	/*
+	 * Odd from the cpu controller's judgement of a migration of the task
+	 * to the migration's end, see conc_affinity_lock(). Written under
+	 * p->pi_lock.
+	 */
+	unsigned int			conc_move_seq;
 	/* The entry its affinity mask is registered under in its own group. */
 	struct conc_class			*conc_class;
 	struct callback_head		conc_hold_work;

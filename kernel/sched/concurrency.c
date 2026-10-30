@@ -82,6 +82,16 @@ struct conc_resv {
 };
 
 /*
+ * cgroup migration: the source groups are recorded in can_attach(), while
+ * the tasks still belong to them, and both sides are retried in attach().
+ * Serialized by cgroup_mutex.
+ */
+struct conc_attach_src {
+	struct list_head	node;
+	struct task_group	*tg;
+};
+
+/*
  * Globals and forward declarations
  */
 
@@ -235,9 +245,69 @@ static DECLARE_DELAYED_WORK(conc_hold_work, conc_hold_work_fn);
 static void conc_hold_irq_work_fn(struct irq_work *work);
 static struct irq_work conc_hold_irq_work = IRQ_WORK_INIT_HARD(conc_hold_irq_work_fn);
 
+/*
+ * sched_setaffinity(2) on a task of a counting group judges the requested
+ * mask (conc_check_affinity()) and applies it under cpuset_mutex: a cpuset
+ * write holds it from its judgement to its end, and a limit from its check
+ * to its start, so neither comes between. Taken settled, since the change
+ * waits for migrations to be applied (conc_prepare_affinity()).
+ *
+ * A task of a group that does not count judges nothing and takes no lock
+ * at all, so that a limit elsewhere costs it nothing. Two events can make
+ * its judgement stale before the change is applied, and each is checked
+ * where the change applies, under p->pi_lock
+ * (__set_cpus_allowed_ptr_locked(), conc_judged_stale()); the change then
+ * backs out and the call judges it again:
+ *
+ *  - a migration of the task, judged by the cpu controller on the
+ *    requested mask it reads under p->pi_lock (conc_attach_check()). Its
+ *    judgement makes p->conc_move_seq odd until the migration ends
+ *    (conc_attach_finish()); the call waits for an odd count, then records
+ *    it, so that the group it read is the one the task stays in until the
+ *    change applies, or the count changed;
+ *  - a limit starting over the task's group (conc_set_request()), which
+ *    reads the masks it starts over under p->pi_lock: it bumps
+ *    conc_limit_gen first, under conc_mutex, and the call records the
+ *    generation it judged under.
+ *
+ * A thread migrating alone by itself takes no threadgroup lock, and the
+ * call takes none either: cgroup_mutex orders the migrations among
+ * themselves, the sequence orders them against the call.
+ */
+unsigned int conc_limit_gen;
+static LIST_HEAD(conc_attach_srcs);
+
 static inline bool conc_cpu_usable(int cpu)
 {
 	return cpu_active(cpu) && !cpumask_test_cpu(cpu, &conc_offlining_cpus);
+}
+
+/*
+ * Attaches and affinity changes in flight have judged the used sets: a
+ * set-move waits for them to be applied, see conc_attach_begin() and
+ * conc_prepare_affinity(). So do a limit starting and a cpuset write being
+ * judged, which judge the tasks where they are. Those wait under
+ * cpuset_mutex, which none in flight needs any more: one between cpusets
+ * goes through cpuset_attach() first, which they wait for when they take
+ * it (cpuset_lock_settled()).
+ */
+
+/* A migration judged by the cpu controller, pending until conc_attach_finish(). */
+static void conc_attach_begin(void)
+{
+	lockdep_assert_held(&conc_mutex);
+	atomic_inc(&conc_attach_pending);
+	current->conc_attaching = 1;
+}
+
+/* The fork of @p judged, its child registered, or the fork failed. */
+void conc_fork_done(struct task_struct *p)
+{
+	if (!p->conc_fork_pending)
+		return;
+	p->conc_fork_pending = 0;
+	if (atomic_dec_and_test(&conc_forks_pending))
+		wake_up(&conc_attach_wq);
 }
 
 /*
@@ -1847,7 +1917,7 @@ static void conc_task_update_bounds(struct task_struct *t)
 }
 
 /* Refresh the CID bounds of the tasks being attached. */
-static __maybe_unused void conc_update_tset_mm_bounds(struct cgroup_taskset *tset)
+static void conc_update_tset_mm_bounds(struct cgroup_taskset *tset)
 {
 	struct cgroup_subsys_state *css;
 	struct task_struct *task;
@@ -1880,7 +1950,7 @@ static void conc_update_mm_bounds(struct task_group *top)
 	rcu_read_unlock();
 }
 
-static __maybe_unused void conc_attach_drop_idle_cids(struct cgroup_taskset *tset)
+static void conc_attach_drop_idle_cids(struct cgroup_taskset *tset)
 {
 	struct cgroup_subsys_state *css;
 	struct task_struct *task;
@@ -1927,7 +1997,7 @@ static __maybe_unused void conc_attach_drop_idle_cids(struct cgroup_taskset *tse
 	mutex_unlock(&conc_mutex);
 }
 
-static __maybe_unused void conc_attach_forget_mms(void)
+static void conc_attach_forget_mms(void)
 {
 	struct cid_domain **doms;
 	int i, n;
@@ -1948,11 +2018,11 @@ static __maybe_unused void conc_attach_forget_mms(void)
 #else /* !CONFIG_SCHED_MM_CID */
 static void conc_slot_removed(struct task_group *tg, int cpu) { }
 
-static __maybe_unused void conc_update_tset_mm_bounds(struct cgroup_taskset *tset) { }
+static void conc_update_tset_mm_bounds(struct cgroup_taskset *tset) { }
 
-static __maybe_unused void conc_attach_drop_idle_cids(struct cgroup_taskset *tset) { }
+static void conc_attach_drop_idle_cids(struct cgroup_taskset *tset) { }
 
-static __maybe_unused void conc_attach_forget_mms(void) { }
+static void conc_attach_forget_mms(void) { }
 
 static void conc_update_mm_bounds(struct task_group *top) { }
 #endif /* !CONFIG_SCHED_MM_CID */
@@ -2610,10 +2680,33 @@ retry:
 }
 
 /*
+ * Is a task's requested mask @req taken under a limit: within @conf, the
+ * CPUs its cpuset is configured to grant, or naming every CPU the task
+ * can run on, which follows the cpuset whatever it becomes? Any other
+ * request the cpuset cuts, and gives back what it cut when it grows,
+ * which removing a partition root's cgroup does without a write any
+ * limit could refuse. Unless the cpuset is one of the limited subtree
+ * naming CPUs (@fixed, see cpuset_css_cpus_fixed_rcu()): granted all it
+ * names by the subtree's own rule (cpuset_conc_literal()), it grows by no
+ * give-back, only by a write the limit judges, and the request it cuts
+ * stays cut, registered as the intersection. @tmp is scratch.
+ */
+static bool conc_request_taken(struct task_struct *t, const struct cpumask *req,
+			     const struct cpumask *conf, bool fixed, struct cpumask *tmp)
+{
+	const struct cpumask *possible = task_cpu_possible_mask(t);
+
+	if (fixed || cpumask_subset(possible, req))
+		return true;
+	cpumask_and(tmp, req, possible);
+	return cpumask_subset(tmp, conf);
+}
+
+/*
  * The width of the masks a level allows: the effective limit, or the
  * effective ceiling when no limit applies, 0 when neither does.
  */
-static __maybe_unused unsigned int conc_class_cap(struct tg_concurrency *conc)
+static unsigned int conc_class_cap(struct tg_concurrency *conc)
 {
 	unsigned int cap = READ_ONCE(conc->effective), ceiling = READ_ONCE(conc->ceiling_effective);
 
@@ -2623,7 +2716,7 @@ static __maybe_unused unsigned int conc_class_cap(struct tg_concurrency *conc)
 }
 
 /* The same against the requested limit, for sched_setaffinity(2). */
-static __maybe_unused unsigned int conc_class_cap_requested(struct tg_concurrency *conc)
+static unsigned int conc_class_cap_requested(struct tg_concurrency *conc)
 {
 	unsigned int cap = READ_ONCE(conc->request), ceiling = READ_ONCE(conc->ceiling_effective);
 
@@ -4772,7 +4865,7 @@ static void __conc_retry(struct task_group *tg)
 	conc_hold_kick();
 }
 
-static __maybe_unused void conc_retry(struct task_group *tg)
+static void conc_retry(struct task_group *tg)
 {
 	if (!READ_ONCE(tg->conc.active))
 		return;
@@ -5149,6 +5242,170 @@ registered:
 	kvfree(tops);
 }
 
+/*
+ * Before an affinity change, from __set_cpus_allowed_ptr(): when the new
+ * mask leaves @p no used CPU of its group to join, @p needs a new CPU and
+ * its group would grow by one. Vacate @p's current CPU instead: the other
+ * tasks there join used CPUs and the rest, @p among them, is set-moved to
+ * a CPU of the new mask, so that the migration which follows finds @p
+ * already in place and no slot is added behind the limit's back. When
+ * that is not possible the migration takes place without a slot and @p
+ * is held at its next return to user space, see conc_task_move().
+ */
+void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx)
+{
+	const struct cpumask *new_mask = ctx->new_mask;
+	struct task_group *tg = NULL;
+	cpumask_var_t eff, ent;
+	struct conc_class **pre = NULL;
+	bool have_eff = false, have_ent;
+	int src, c, round, npre = 0;
+
+	ctx->conc.resv = NULL;
+	ctx->conc.prealloc = NULL;
+	ctx->conc.nr_prealloc = 0;
+	ctx->conc.pending = false;
+	/*
+	 * Judged in the group read with the count (conc_affinity_lock()): a
+	 * migration judging the old mask since leaves nothing to prepare,
+	 * the change backs out where it is applied.
+	 */
+	scoped_guard(raw_spinlock_irq, &p->pi_lock) {
+		if (!conc_judged_stale(p, ctx))
+			tg = conc_pin_task_group(p);
+	}
+	if (!tg)
+		return;
+	have_ent = alloc_cpumask_var(&ent, GFP_KERNEL);
+	/*
+	 * A change from the kernel side (cpuset) is masked by the requested
+	 * mask when they intersect, see __set_cpus_allowed_ptr(): judge the
+	 * mask that will apply.
+	 */
+	if (!(ctx->flags & SCA_USER) && alloc_cpumask_var(&eff, GFP_KERNEL)) {
+		bool same;
+
+		have_eff = true;
+		scoped_guard(raw_spinlock_irq, &p->pi_lock) {
+			if (p->user_cpus_ptr && cpumask_and(eff, ctx->new_mask, p->user_cpus_ptr))
+				new_mask = eff;
+			same = cpumask_equal(new_mask, &p->cpus_mask);
+		}
+		/*
+		 * Nothing changes, which is what cpuset_fork() asks of every
+		 * child in a cpuset but the top one: the change returns early
+		 * (__set_cpus_allowed_ptr_locked()), with no class to register
+		 * and no CPU to vacate, and needs no global conc_mutex. A change
+		 * of the configured CPUs alone registers its tasks itself
+		 * (conc_cpuset_update()). Should the mask move before the change
+		 * is applied, the change registers the class without entries
+		 * of its own, as a forced change does (__conc_task_mask_changed()).
+		 */
+		if (same) {
+			free_cpumask_var(eff);
+			if (have_ent)
+				free_cpumask_var(ent);
+			css_put(&tg->css);
+			return;
+		}
+	}
+	/*
+	 * Its class needs entries twice: registered ahead below (@pre), and
+	 * at the change itself, under the runqueue lock where nothing can
+	 * be allocated, when the configured mask moved meanwhile
+	 * (ctx->conc.prealloc, freed by conc_task_affinity_changed()).
+	 */
+	if (conc_mask_counts(p, new_mask)) {
+		ctx->conc.nr_prealloc = conc_chain_depth(p);
+		ctx->conc.prealloc = conc_class_prealloc(ctx->conc.nr_prealloc, GFP_KERNEL);
+		npre = ctx->conc.nr_prealloc;
+		pre = conc_class_prealloc(npre, GFP_KERNEL);
+	}
+	src = task_cpu(p);
+	mutex_lock(&conc_mutex);
+	/*
+	 * Register the class of the mask that will apply now rather than
+	 * when it does: headroom made below for @p is kept for a class no
+	 * used CPU hits, see __conc_room_for(), while a wakeup in between
+	 * would take headroom that no class protects, leaving @p to wake up
+	 * to no CPU and be held.
+	 */
+	if (have_ent) {
+		scoped_guard(raw_spinlock_irq, &p->pi_lock) {
+			__conc_task_class_mask(p, ctx->flags & SCA_USER ? ctx->user_mask : p->user_cpus_ptr, ent);
+			if (!conc_task_registered_with(p, ent, new_mask)) {
+				conc_task_class_del(p);
+				if (conc_mask_counts(p, ent) && READ_ONCE(tg->conc.active))
+					conc_task_class_add(p, ent, new_mask, pre, npre);
+			}
+		}
+	}
+	conc_class_prealloc_free(pre, npre);
+	/* A join is possible: conc_pick_dest() or the wakeup will take it. */
+	for_each_cpu_and(c, new_mask, tg->conc.used) {
+		if (cpu_active(c) && atomic_read(per_cpu_ptr(tg->conc.present, c)) >= 0)
+			goto pending;
+	}
+	if (!tg->conc.active)
+		goto pending;
+	/*
+	 * No CPU of the mask can take a slot, every one of them offline or
+	 * going offline: there is no room to make. Offline, the change is
+	 * refused (__set_cpus_allowed_ptr_locked()); going offline, it is
+	 * honoured, and the unplug widens or holds the task. The rounds below
+	 * would only sleep, under conc_mutex and, for sched_setaffinity(2),
+	 * cpuset_mutex, which every other change, the placement of the held
+	 * tasks and cpuset's hotplug pass wait for.
+	 */
+	for_each_cpu(c, new_mask) {
+		if (conc_cpu_usable(c))
+			break;
+	}
+	if (c >= nr_cpu_ids)
+		goto pending;
+	/*
+	 * Transients such as a thread in its last microseconds of exit, left
+	 * behind by a cgroup migration with its slot, or a claim in flight,
+	 * can refuse both ways below; they clear within a few jiffies.
+	 */
+	for (round = 0; round < CONC_EVICT_ROUNDS; round++) {
+		/* Not present: it wakes up later and must find a CPU of the mask then. */
+		if (!READ_ONCE(p->conc_accounted) || task_cpu(p) != src) {
+			if (!conc_make_reachable(tg, new_mask))
+				goto pending;
+		} else {
+			/* First choice: vacate the CPU, set-moving its presence with @p. */
+			if (!conc_evict_cpu(tg, src, true, false, p, new_mask, NULL))
+				goto pending;
+			/*
+			 * Otherwise @p alone needs a new CPU: make headroom and
+			 * reserve it; the migration that follows lands there,
+			 * see conc_pick_dest(), and fills it, see conc_claim_slow().
+			 */
+			ctx->conc.resv = conc_resv_make(tg, new_mask);
+			if (ctx->conc.resv) {
+				scoped_guard(raw_spinlock_irq, &p->pi_lock)
+					p->conc_resv_cpu = conc_resv_cpu(ctx->conc.resv);
+				goto pending;
+			}
+		}
+		schedule_timeout_uninterruptible(1);
+	}
+pending:
+	/*
+	 * What was judged above holds until the change is applied: set-moves
+	 * wait for it, see conc_wait_attach(); conc_task_affinity_changed() ends it.
+	 */
+	atomic_inc(&conc_attach_pending);
+	ctx->conc.pending = true;
+	mutex_unlock(&conc_mutex);
+	if (have_eff)
+		free_cpumask_var(eff);
+	if (have_ent)
+		free_cpumask_var(ent);
+	css_put(&tg->css);
+}
+
 /* Is a limit covering @tg stalled or relaxed, so that a retry can matter? */
 static bool conc_needs_retry(struct task_group *tg)
 {
@@ -5160,6 +5417,606 @@ static bool conc_needs_retry(struct task_group *tg)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * An affinity change in a counting group, from __set_cpus_allowed_ptr().
+ * A change of the requested mask (@user) can change the registered
+ * masks; any change can unstall a shrink or undo a relaxation. Nothing
+ * else needs the walk.
+ */
+void conc_task_affinity_changed(struct task_struct *p, struct affinity_context *ctx, int ret)
+{
+	struct task_group *tg = conc_pin_task_group(p);
+
+	/*
+	 * Refused (no valid CPU in the new mask, a CPU going offline being
+	 * its only one): conc_prepare_affinity() registered the new mask's
+	 * class ahead, and the task keeps its mask. Register that one again,
+	 * with the entries prepared for the change: a stale class counts in
+	 * the width and keeps headroom for CPUs its task cannot run on, which
+	 * the task itself, held, may then wait for.
+	 */
+	if (ret && tg) {
+		scoped_guard(raw_spinlock_irq, &p->pi_lock) {
+			struct cpumask *ent = this_cpu_cpumask_var_ptr(conc_class_scratch);
+
+			__conc_task_class_mask(p, p->user_cpus_ptr, ent);
+			__conc_task_mask_changed(p, ent, &p->cpus_mask, ctx->conc.prealloc,
+					       ctx->conc.nr_prealloc);
+		}
+	}
+
+	if (ctx->conc.pending) {
+		ctx->conc.pending = false;
+		if (atomic_dec_and_test(&conc_attach_pending))
+			wake_up(&conc_attach_wq);
+	}
+	if (ctx->conc.resv) {
+		scoped_guard(raw_spinlock_irq, &p->pi_lock)
+			p->conc_resv_cpu = -1;
+		mutex_lock(&conc_mutex);
+		conc_resv_finish(ctx->conc.resv);
+		mutex_unlock(&conc_mutex);
+		ctx->conc.resv = NULL;
+	}
+	conc_class_prealloc_free(ctx->conc.prealloc, ctx->conc.nr_prealloc);
+	ctx->conc.prealloc = NULL;
+	/* Held: the new mask may reach a used CPU, see conc_hold_work_fn(). */
+	if (READ_ONCE(p->conc_held))
+		conc_hold_kick();
+	if (!tg)
+		return;
+	if ((ctx->flags & SCA_USER) || conc_needs_retry(tg))
+		conc_retry(tg);
+	css_put(&tg->css);
+}
+
+/*
+ * cpuset_mutex orders the judgements and the changes of the masks against
+ * the limit writes. Without cpusets its helpers take nothing: a mutex of
+ * the limit's own stands in for it.
+ */
+static inline void conc_cfg_lock(void) { cpuset_lock(); }
+
+static inline void conc_cfg_lock_settled(void) { cpuset_lock_settled(); }
+
+static inline void conc_cfg_unlock(void) { cpuset_unlock(); }
+
+bool conc_affinity_lock(struct task_struct *p, struct affinity_context *ctx)
+{
+	unsigned int seq;
+	bool counts;
+
+	for (;;) {
+		ctx->conc.gen = READ_ONCE(conc_limit_gen);
+		scoped_guard(raw_spinlock_irq, &p->pi_lock) {
+			seq = p->conc_move_seq;
+			counts = static_branch_unlikely(&sched_conc_enabled) &&
+				 READ_ONCE(task_group(p)->conc.active);
+		}
+		if (!(seq & 1))
+			break;
+		wait_event(conc_attach_wq, READ_ONCE(p->conc_move_seq) != seq);
+	}
+	ctx->conc.move_seq = seq;
+	ctx->flags |= SCA_CC_JUDGED;
+	if (!counts)
+		return false;
+	conc_cfg_lock_settled();
+	return true;
+}
+
+void conc_affinity_unlock(struct task_struct *p, bool locked)
+{
+	if (locked)
+		conc_cfg_unlock();
+}
+
+/*
+ * sched_setaffinity(2): refuse a @requested mask that would raise the
+ * width of the masks (see conc_masks_width()) above the requested limit of
+ * the task's group or of an ancestor. Judged on the mask the task would
+ * be configured to run on with it, as the masks are registered. This
+ * depends on configuration only, never on placement or on which CPUs are
+ * online. Refuse too a mask its cpuset would cut, unless the cpuset names
+ * its CPUs: see conc_request_taken().
+ */
+int conc_check_affinity(struct task_struct *p, const struct cpumask *requested)
+{
+	struct task_group *tg = conc_pin_task_group(p), *lvl;
+	cpumask_var_t ent, cur;
+	bool had = false, fixed;
+	int ret = 0;
+
+	if (!tg)
+		return 0;
+	if (!alloc_cpumask_var(&ent, GFP_KERNEL)) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	if (!alloc_cpumask_var(&cur, GFP_KERNEL)) {
+		ret = -ENOMEM;
+		goto out_ent;
+	}
+	scoped_guard(rcu) {
+		cpuset_task_cpus_configured_rcu(p, ent);
+		fixed = conc_cpuset_fixed(task_css(p, cpuset_cgrp_id), NULL);
+	}
+	if (!conc_request_taken(p, requested, ent, fixed, cur)) {
+		trace_sched_conc_refuse(p, "sched_setaffinity", "a request the cpuset would cut",
+				      -EINVAL);
+		ret = -EINVAL;
+		goto out_cur;
+	}
+	scoped_guard(raw_spinlock_irq, &p->pi_lock) {
+		__conc_task_class_mask(p, requested, ent);
+		if (conc_task_class_mask(p)) {
+			cpumask_copy(cur, conc_task_class_mask(p));
+			had = true;
+		}
+	}
+	/* Restricting nothing, or no change: the width cannot grow. */
+	if (!conc_mask_counts(p, ent) || (had && cpumask_equal(cur, ent)))
+		goto out_cur;
+	mutex_lock(&conc_mutex);
+	for (lvl = tg; lvl->conc.active; lvl = lvl->parent) {
+		unsigned int req = conc_class_cap_requested(&lvl->conc);
+
+		if (req && conc_level_width(&lvl->conc, had ? cur : NULL, ent, GFP_KERNEL) > req) {
+			trace_sched_conc_refuse(p, "sched_setaffinity", "the width above the limit",
+					      -EINVAL);
+			ret = -EINVAL;
+			break;
+		}
+	}
+	mutex_unlock(&conc_mutex);
+out_cur:
+	free_cpumask_var(cur);
+out_ent:
+	free_cpumask_var(ent);
+out:
+	css_put(&tg->css);
+	return ret;
+}
+
+/* Task exit, through the cpu controller's release callback. */
+void conc_task_released(struct task_struct *p)
+{
+	struct task_group *tg;
+
+	conc_debug_hold_end(p, "exited");
+	/* Its class leaves whatever the state of its group, which may be going away. */
+	scoped_guard(raw_spinlock_irq, &p->pi_lock)
+		conc_task_class_del(p);
+	tg = conc_pin_task_group(p);
+	if (!tg)
+		return;
+	/* Only when a limit is relaxed or stalled can an exit change anything. */
+	if (conc_needs_retry(tg))
+		conc_retry(tg);
+	css_put(&tg->css);
+}
+
+void conc_attach_record_srcs(struct cgroup_taskset *tset)
+{
+	struct cgroup_subsys_state *css;
+	struct task_struct *task;
+
+	/* Counted as pending by conc_attach_check(), until conc_attach_finish(). */
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return;
+
+	conc_attach_drop_idle_cids(tset);
+
+	cgroup_taskset_for_each(task, css, tset) {
+		struct task_group *tg = conc_pin_task_group(task);
+		struct conc_attach_src *src;
+
+		if (!tg)
+			continue;
+		list_for_each_entry(src, &conc_attach_srcs, node) {
+			if (src->tg == tg)
+				break;
+		}
+		if (&src->node != &conc_attach_srcs) {
+			css_put(&tg->css);
+			continue;
+		}
+		src = kmalloc(sizeof(*src), GFP_KERNEL);
+		if (!src) {
+			css_put(&tg->css);
+			continue;
+		}
+		src->tg = tg;
+		list_add(&src->node, &conc_attach_srcs);
+	}
+}
+
+void conc_attach_finish(struct cgroup_taskset *tset, bool retry)
+{
+	struct cgroup_subsys_state *css, *last = NULL;
+	struct conc_attach_src *src, *tmp;
+	struct task_struct *task;
+	bool judged = false;
+
+	/*
+	 * The threads are in place: their classes join the new chains
+	 * before the limits are re-evaluated, and while set-moves, which
+	 * may change a mask under the runqueue lock alone, still wait.
+	 */
+	if (retry && static_branch_unlikely(&sched_conc_enabled)) {
+		cgroup_taskset_for_each(task, css, tset) {
+			struct conc_class **pre;
+			int n;
+
+			n = conc_chain_depth(task);
+			if (!n)
+				continue;
+			pre = conc_class_prealloc(n, GFP_KERNEL);
+			scoped_guard(raw_spinlock_irq, &task->pi_lock)
+				conc_task_register(task, pre, n);
+			conc_class_prealloc_free(pre, n);
+		}
+	}
+
+	/*
+	 * In place, with their classes: the affinity changes waiting for
+	 * them judge them where they are, see conc_affinity_lock().
+	 */
+	cgroup_taskset_for_each(task, css, tset) {
+		/*
+		 * Odd only from this migration's judgement, under cgroup_mutex
+		 * like this: no lock to read it, for a migration with no limit
+		 * anywhere to cost nothing more.
+		 */
+		if (!(READ_ONCE(task->conc_move_seq) & 1))
+			continue;
+		scoped_guard(raw_spinlock_irq, &task->pi_lock)
+			WRITE_ONCE(task->conc_move_seq, task->conc_move_seq + 1);
+		judged = true;
+	}
+
+	/* The retries below may set-move again. */
+	current->conc_attaching = 0;
+	if (atomic_dec_and_test(&conc_attach_pending) || judged)
+		wake_up(&conc_attach_wq);
+
+	if (retry && static_branch_unlikely(&sched_conc_enabled)) {
+		cgroup_taskset_for_each(task, css, tset) {
+			if (css == last)
+				continue;
+			last = css;
+			if (READ_ONCE(css_tg(css)->conc.active))
+				conc_retry(css_tg(css));
+		}
+	}
+	list_for_each_entry_safe(src, tmp, &conc_attach_srcs, node) {
+		if (retry)
+			conc_retry(src->tg);
+		css_put(&src->tg->css);
+		list_del(&src->node);
+		kfree(src);
+	}
+	/*
+	 * The move's effect on per-mm CID bounds is visible when the write
+	 * returns. With no group counting there is none: a limit starting
+	 * waited for this migration, then applies the bounds itself. Between
+	 * configuration walks, as every bound, see conc_bounds_lock().
+	 */
+	if (retry && static_branch_unlikely(&sched_conc_enabled)) {
+		guard(mutex)(&conc_mutex);
+		conc_update_tset_mm_bounds(tset);
+	}
+	conc_attach_forget_mms();
+}
+
+/* Is @tg in the subtree of @top? */
+static bool conc_tg_below(struct task_group *tg, struct task_group *top)
+{
+	for (; tg; tg = tg->parent) {
+		if (tg == top)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * can_attach(): would the migrating tasks, with the masks their new
+ * cpuset is configured to give them, raise the width of the masks above
+ * what their chain allows? The cpu controller checks the tasks whose
+ * group changes, taking each one's destination cpuset from the migration
+ * (cgroup_taskset_cur_dst_css()): the cpuset may sit below the cpu group.
+ * The cpuset controller (@cpuset) checks the tasks whose cpuset alone
+ * changes, a move between cpusets under one cpu group, for which the cpu
+ * controller is not called. The source side needs no check: masks
+ * leaving a subtree never widen it. Every active level of each
+ * destination chain is recounted with the migrating tasks bound for its
+ * subtree left out of where they still are and their new masks counted
+ * in. Returns -EBUSY when one would exceed, as when a task would leave the
+ * cgroup subtree the ceiling of its IPC namespace's concurrency IDs was
+ * frozen on, or when a task bound for an active group has a requested
+ * mask its new cpuset would cut (see conc_request_taken()).
+ */
+static int __conc_attach_check(struct cgroup_taskset *tset, bool cpuset)
+{
+	struct cgroup_subsys_state *css, *cpu_css, *cs_css, *last = NULL;
+	struct task_struct *task, **tasks, **sub;
+	struct task_group **tgs, *lvl;
+	char *masks, *submasks;
+	cpumask_var_t snap;
+	bool fixed = false;
+	int n = 0, i, j, k, ret = 0;
+
+	/*
+	 * The cpu controller's side: no group counted any more since the key
+	 * was read (conc_attach_check()): the migration is only counted as
+	 * pending, under conc_mutex, where a limit starting reads the count.
+	 */
+	if (!cpuset) {
+		guard(mutex)(&conc_mutex);
+		if (!static_branch_unlikely(&sched_conc_enabled)) {
+			conc_attach_begin();
+			return 0;
+		}
+	} else if (!static_branch_unlikely(&sched_conc_enabled)) {
+		return 0;
+	}
+	cgroup_taskset_for_each(task, css, tset)
+		n++;
+	tasks = kvcalloc(n, sizeof(*tasks), GFP_KERNEL);
+	sub = kvcalloc(n, sizeof(*sub), GFP_KERNEL);
+	tgs = kvcalloc(n, sizeof(*tgs), GFP_KERNEL);
+	masks = kvmalloc_array(n, cpumask_size(), GFP_KERNEL);
+	submasks = kvmalloc_array(n, cpumask_size(), GFP_KERNEL);
+	if (!tasks || !sub || !tgs || !masks || !submasks ||
+	    !alloc_cpumask_var(&snap, GFP_KERNEL)) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	mutex_lock(&conc_mutex);
+	/*
+	 * The masks the tasks will get, from one snapshot of each
+	 * destination's cpuset: a cpuset write landing between two reads
+	 * would make the old and the new mask two masks of the trial.
+	 */
+	i = 0;
+	cgroup_taskset_for_each(task, css, tset) {
+		struct cpumask *m = (struct cpumask *)(masks + i * cpumask_size());
+
+		if (cpuset) {
+			bool moves;
+
+			cs_css = css;
+			cpu_css = cgroup_taskset_cur_dst_css(tset, cpu_cgrp_id);
+			rcu_read_lock();
+			moves = cpu_css != task_css(task, cpu_cgrp_id);
+			rcu_read_unlock();
+			/* Its group changes: the cpu controller checks it. */
+			if (moves)
+				continue;
+		} else {
+			cpu_css = css;
+			cs_css = cgroup_taskset_cur_dst_css(tset, cpuset_cgrp_id);
+		}
+		if (!i || cs_css != last) {
+			scoped_guard(rcu) {
+				cpuset_css_cpus_configured_rcu(cs_css, snap);
+				fixed = conc_cpuset_fixed(cs_css, NULL);
+			}
+			last = cs_css;
+		}
+		scoped_guard(raw_spinlock_irq, &task->pi_lock) {
+			const struct cpumask *user = task->user_cpus_ptr;
+
+			/* Under a limit, a request the cpuset would cut is refused. */
+			if (user && READ_ONCE(css_tg(cpu_css)->conc.active) &&
+			    !conc_request_taken(task, user, snap, fixed, m)) {
+				trace_sched_conc_refuse(task, "cgroup migration",
+						      "a request the cpuset would cut", -EBUSY);
+				ret = -EBUSY;
+			}
+			/* As registered there, see cpuset_task_cpus_configured_rcu(). */
+			cpumask_and(m, snap, task_cpu_possible_mask(task));
+			if (user && cpumask_intersects(m, user))
+				cpumask_and(m, m, user);
+			/* Judged by this mask until it lands, see conc_affinity_lock(). */
+			if (!ret && !cpuset)
+				WRITE_ONCE(task->conc_move_seq, task->conc_move_seq + 1);
+		}
+		if (ret)
+			break;
+		tasks[i] = task;
+		tgs[i] = css_tg(cpu_css);
+		i++;
+	}
+	n = i;
+	if (!ret && !cpuset) {
+		for (i = 0; i < n; i++) {
+			if (!conc_task_ns_allows(tasks[i], tgs[i])) {
+				trace_sched_conc_refuse(tasks[i], "cgroup migration",
+						      "an IPC namespace with IDs it would leave",
+						      -EBUSY);
+				ret = -EBUSY;
+				break;
+			}
+		}
+	}
+	/* Every active level of each destination chain, once. */
+	for (i = 0; !ret && i < n; i++) {
+		for (lvl = tgs[i]; !ret && lvl && READ_ONCE(lvl->conc.active); lvl = lvl->parent) {
+			unsigned int limit = conc_class_cap(&lvl->conc), width;
+
+			if (!limit)
+				continue;
+			for (j = 0; j < i; j++) {
+				if (conc_tg_below(tgs[j], lvl))
+					break;
+			}
+			if (j < i)
+				continue;
+			/* The migrating tasks bound for its subtree. */
+			for (j = k = 0; j < n; j++) {
+				if (!conc_tg_below(tgs[j], lvl))
+					continue;
+				sub[k] = tasks[j];
+				memcpy(submasks + k * cpumask_size(), masks + j * cpumask_size(),
+				       cpumask_size());
+				k++;
+			}
+			width = __conc_recount_width(lvl, NULL, NULL, sub, k, submasks, k);
+			if (width > limit) {
+				trace_sched_conc_refuse(tasks[i], "cgroup migration",
+						      "the width above the limit", -EBUSY);
+				ret = -EBUSY;
+			}
+		}
+	}
+	/* Judged: pending in the same section, see conc_wait_attach(). */
+	if (!ret && !cpuset)
+		conc_attach_begin();
+	mutex_unlock(&conc_mutex);
+	/* Refused: no attach() nor cancel_attach() ends what was judged. */
+	if (ret && !cpuset && n) {
+		for (i = 0; i < n; i++) {
+			scoped_guard(raw_spinlock_irq, &tasks[i]->pi_lock)
+				WRITE_ONCE(tasks[i]->conc_move_seq, tasks[i]->conc_move_seq + 1);
+		}
+		wake_up(&conc_attach_wq);
+	}
+	free_cpumask_var(snap);
+out:
+	kvfree(tasks);
+	kvfree(sub);
+	kvfree(tgs);
+	kvfree(masks);
+	kvfree(submasks);
+	return ret;
+}
+
+/*
+ * Under cpuset_mutex, which a cpuset write holds from its judgement to its
+ * end (cpuset_conc_judge()): the configured CPUs the migration is judged by
+ * are not about to change. cpuset_can_attach(), before this, released it.
+ */
+int conc_attach_check(struct cgroup_taskset *tset)
+{
+	int ret;
+
+	ret = conc_pin_check(tset);
+	if (ret)
+		return ret;
+	/*
+	 * With no group counting, the migration is only counted as pending,
+	 * with no lock: a limit starting turns the key on, then reads the
+	 * count (conc_set_request()), each with a full barrier in between, so
+	 * that either it waits for this migration or this migration sees the
+	 * key on and is judged below.
+	 */
+	atomic_inc(&conc_attach_pending);
+	/* Pairs with the smp_mb() of conc_set_request(). */
+	smp_mb__after_atomic();
+	if (!static_key_enabled(&sched_conc_enabled)) {
+		current->conc_attaching = 1;
+		return 0;
+	}
+	/* Judged under the locks, which count it again. */
+	if (atomic_dec_and_test(&conc_attach_pending))
+		wake_up(&conc_attach_wq);
+	conc_cfg_lock();
+	ret = __conc_attach_check(tset, false);
+	conc_cfg_unlock();
+	return ret;
+}
+
+/*
+ * clone3(2) with CLONE_INTO_CGROUP: the child is judged as a migration
+ * into its cgroup is (__conc_attach_check()), its requested mask, inherited,
+ * against the cpuset it is born into; refused with -EBUSY. A fork into
+ * its parent's cgroup needs nothing, its mask being its parent's. The
+ * fork is pending until its child is registered (sched_post_fork()) or it
+ * fails (sched_cancel_fork()), see conc_wait_judged(). Under cpuset_mutex,
+ * plain: cpuset_can_fork() counted a fork into another cpuset as an
+ * attach in flight, which cpuset_lock_settled() waits for.
+ */
+int conc_fork_check(struct task_struct *p, struct kernel_clone_args *kargs)
+{
+	struct cgroup_subsys_state *cs_css = NULL;
+	struct task_group *tg, *lvl;
+	cpumask_var_t mask, tmp;
+	bool fixed = false;
+	int ret = 0;
+
+	if (!kargs->cgrp)
+		return 0;
+	ret = conc_pin_fork_check(p, kargs);
+	if (ret)
+		return ret;
+	/*
+	 * With no group counting, the fork is only counted as pending, with
+	 * no lock: a limit starting turns the key on, then reads the count
+	 * (conc_set_request()), each with a full barrier in between, so that
+	 * either it waits for this fork or this fork sees the key on and is
+	 * judged below. As conc_attach_check() does.
+	 */
+	atomic_inc(&conc_forks_pending);
+	p->conc_fork_pending = 1;
+	/* Pairs with the smp_mb() of conc_set_request(). */
+	smp_mb__after_atomic();
+	if (!static_key_enabled(&sched_conc_enabled))
+		return 0;
+	/* Judged under the locks, which count it again. */
+	p->conc_fork_pending = 0;
+	if (atomic_dec_and_test(&conc_forks_pending))
+		wake_up(&conc_attach_wq);
+	if (!alloc_cpumask_var(&mask, GFP_KERNEL))
+		return -ENOMEM;
+	if (!alloc_cpumask_var(&tmp, GFP_KERNEL)) {
+		free_cpumask_var(mask);
+		return -ENOMEM;
+	}
+	tg = css_tg(kargs->cset->subsys[cpu_cgrp_id]);
+	cs_css = kargs->cset->subsys[cpuset_cgrp_id];
+	conc_cfg_lock();
+	mutex_lock(&conc_mutex);
+	if (static_branch_unlikely(&sched_conc_enabled) && READ_ONCE(tg->conc.active)) {
+		scoped_guard(rcu) {
+			cpuset_css_cpus_configured_rcu(cs_css, mask);
+			fixed = conc_cpuset_fixed(cs_css, NULL);
+		}
+		/* As the child will be registered, see cpuset_task_cpus_configured_rcu(). */
+		cpumask_and(mask, mask, task_cpu_possible_mask(p));
+		scoped_guard(raw_spinlock_irq, &p->pi_lock) {
+			const struct cpumask *user = p->user_cpus_ptr;
+
+			if (user && !conc_request_taken(p, user, mask, fixed, tmp)) {
+				trace_sched_conc_refuse(p, "clone3", "a request the cpuset would cut",
+						      -EBUSY);
+				ret = -EBUSY;
+			} else if (user && cpumask_intersects(mask, user)) {
+				cpumask_and(mask, mask, user);
+			}
+		}
+		for (lvl = tg; !ret && lvl && READ_ONCE(lvl->conc.active); lvl = lvl->parent) {
+			unsigned int limit = conc_class_cap(&lvl->conc);
+
+			if (!limit)
+				continue;
+			if (__conc_recount_width(lvl, NULL, NULL, &p, 1, (const char *)mask, 1) > limit) {
+				trace_sched_conc_refuse(p, "clone3", "the width above the limit", -EBUSY);
+				ret = -EBUSY;
+			}
+		}
+	}
+	if (!ret) {
+		atomic_inc(&conc_forks_pending);
+		p->conc_fork_pending = 1;
+	}
+	mutex_unlock(&conc_mutex);
+	conc_cfg_unlock();
+	free_cpumask_var(tmp);
+	free_cpumask_var(mask);
+	return ret;
 }
 
 #ifdef CONFIG_SCHED_MM_CID
