@@ -86,6 +86,18 @@ static void conc_task_entitled(struct task_struct *t, struct cpumask *mask);
 
 #ifdef CONFIG_SCHED_MM_CID
 /*
+ * The domains of a cgroup migration in flight, from can_attach() to the
+ * end of attach(). Their threads leave the source groups' css_sets before
+ * the cpu controller switches their task_group, so a slot of a source
+ * group drained in that window finds no task of theirs; their IDs on the
+ * CPU are dropped all the same. Under conc_mutex.
+ */
+static struct cid_domain **conc_attach_doms;
+static int conc_nr_attach_doms;
+
+static void conc_dom_update_bound(struct cid_domain *dom);
+
+/*
  * Before the threads of a migration leave their groups: the IDs their
  * domains cached on CPUs where the source group has an idle slot, or
  * none, would be orphaned, since the group drains those slots later
@@ -106,6 +118,14 @@ static inline bool conc_cpu_usable(int cpu)
 {
 	return cpu_active(cpu) && !cpumask_test_cpu(cpu, &conc_offlining_cpus);
 }
+
+#ifndef CONFIG_SCHED_MM_CID
+void conc_mm_task_moved(struct task_struct *p)
+{
+	if (p->mm)
+		conc_dom_task_moved(&p->mm->mm_cid);
+}
+#endif /* !CONFIG_SCHED_MM_CID */
 
 int alloc_conc_sched_group(struct task_group *tg)
 {
@@ -1091,6 +1111,240 @@ static void __conc_remove_slot(struct task_group *tg, int cpu)
 	conc_hold_kick();
 }
 
+#ifdef CONFIG_SCHED_MM_CID
+/* A reference on the object a domain is embedded in. */
+static void cid_domain_put(struct cid_domain *dom)
+{
+	mmdrop(cid_domain_mm(dom));
+}
+
+/*
+ * The domains of @t, each with a reference held: its mm's. Returns their
+ * number.
+ */
+static int conc_task_domains(struct task_struct *t, struct cid_domain **doms)
+{
+	int n = 0;
+
+	task_lock(t);
+	if (t->mm) {
+		mmgrab(t->mm);
+		doms[n++] = &t->mm->mm_cid;
+	}
+	task_unlock(t);
+	return n;
+}
+
+static void conc_drop_cid_on_cpu(struct cid_domain *dom, int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+
+	/* Nothing cached: the lock would find nothing to drop. */
+	if (!cid_on_cpu(READ_ONCE(per_cpu_ptr(dom->pcpu, cpu)->cid)))
+		return;
+	/* Remote access to the per-CPU storage requires rq_lock */
+	guard(rq_lock_irq)(rq);
+	/*
+	 * The task running here owns the cached ID while it is present. One
+	 * that blocked already, still current while the runqueue picks its
+	 * successor with the lock dropped (sched_balance_newidle()), gave its
+	 * slot back: the slot may be going away with the ID, which the
+	 * task's switch-out would drop too late for a CPU that allocates in
+	 * between.
+	 */
+	if (!cid_task_in_domain(rq->curr, dom) || !task_on_rq_queued(rq->curr))
+		cid_drop_on_cpu(dom, per_cpu_ptr(dom->pcpu, cpu));
+}
+
+/*
+ * A slot is going away: drop the CPU-owned CIDs that the domains of @tg's
+ * tasks cache on @cpu, so that a CPU outside the used set never holds an
+ * ID and the space below the bound cannot be exhausted by stale caches.
+ * Child groups are drained before their parent, so their tasks were
+ * handled already.
+ */
+static void conc_slot_removed(struct task_group *tg, int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	struct cid_pcpu *pcp, *tmp;
+	int i;
+
+	lockdep_assert_held(&conc_mutex);
+	for (i = 0; i < conc_nr_attach_doms; i++)
+		conc_drop_cid_on_cpu(conc_attach_doms[i], cpu);
+
+	/*
+	 * The domains whose CID the CPU owns, rather than the tasks of the
+	 * group: the CIDs of the other groups' domains are dropped too, which
+	 * costs them an allocation at their next schedule-in here, where a
+	 * walk of the group's tasks would cost every slot drain O(tasks).
+	 */
+	guard(rq_lock_irq)(rq);
+	list_for_each_entry_safe(pcp, tmp, per_cpu_ptr(&cid_cpu_doms, cpu), node) {
+		struct cid_domain *dom = pcp->dom;
+
+		if (!cid_task_in_domain(rq->curr, dom) || !task_on_rq_queued(rq->curr))
+			cid_drop_on_cpu(dom, pcp);
+	}
+}
+
+/* Refresh the CID bounds of the domains of @t. */
+static void conc_task_update_bounds(struct task_struct *t)
+{
+	struct cid_domain *doms[2];
+	int i, n = conc_task_domains(t, doms);
+
+	for (i = 0; i < n; i++) {
+		conc_dom_update_bound(doms[i]);
+		cid_domain_put(doms[i]);
+	}
+}
+
+/* Refresh the CID bounds of the tasks being attached. */
+static __maybe_unused void conc_update_tset_mm_bounds(struct cgroup_taskset *tset)
+{
+	struct cgroup_subsys_state *css;
+	struct task_struct *task;
+
+	cgroup_taskset_for_each(task, css, tset)
+		conc_task_update_bounds(task);
+}
+
+/* Refresh the CID bounds of every domain with a task in the subtree of @top. */
+static void conc_update_mm_bounds(struct task_group *top)
+{
+	struct cgroup_subsys_state *css;
+
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &top->css) {
+		struct css_task_iter it;
+		struct task_struct *t;
+
+		/* The reference pins the position across the sleep. */
+		if (!css_tryget_online(css))
+			continue;
+		rcu_read_unlock();
+		css_task_iter_start(css, 0, &it);
+		while ((t = css_task_iter_next(&it)))
+			conc_task_update_bounds(t);
+		css_task_iter_end(&it);
+		rcu_read_lock();
+		css_put(css);
+	}
+	rcu_read_unlock();
+}
+
+static __maybe_unused void conc_attach_drop_idle_cids(struct cgroup_taskset *tset)
+{
+	struct cgroup_subsys_state *css;
+	struct task_struct *task;
+	struct cid_domain **doms;
+	int n = 0, cap = 0;
+
+	cgroup_taskset_for_each(task, css, tset)
+		cap += 2;
+	doms = kvcalloc(cap, sizeof(*doms), GFP_KERNEL);
+
+	cgroup_taskset_for_each(task, css, tset) {
+		struct task_group *tg = conc_pin_task_group(task);
+		struct cid_domain *tdoms[2];
+		int cpu, i, k, nt;
+
+		if (!tg)
+			continue;
+		nt = conc_task_domains(task, tdoms);
+		for (k = 0; k < nt; k++) {
+			struct cid_domain *dom = tdoms[k];
+
+			for_each_possible_cpu(cpu) {
+				int v = atomic_read(per_cpu_ptr(tg->conc.present, cpu));
+
+				if (v != 0 && v != CONC_SLOT_UNUSED)
+					continue;
+				conc_drop_cid_on_cpu(dom, cpu);
+			}
+			/* Remembered until the migration is over, see conc_slot_removed(). */
+			for (i = 0; doms && i < n; i++) {
+				if (doms[i] == dom)
+					break;
+			}
+			if (doms && i == n && n < cap)
+				doms[n++] = dom;
+			else
+				cid_domain_put(dom);
+		}
+		css_put(&tg->css);
+	}
+	mutex_lock(&conc_mutex);
+	conc_attach_doms = doms;
+	conc_nr_attach_doms = doms ? n : 0;
+	mutex_unlock(&conc_mutex);
+}
+
+static __maybe_unused void conc_attach_forget_mms(void)
+{
+	struct cid_domain **doms;
+	int i, n;
+
+	/* Set and cleared by the migrations alone, serialized by cgroup_mutex. */
+	if (!READ_ONCE(conc_attach_doms))
+		return;
+	mutex_lock(&conc_mutex);
+	doms = conc_attach_doms;
+	n = conc_nr_attach_doms;
+	conc_attach_doms = NULL;
+	conc_nr_attach_doms = 0;
+	mutex_unlock(&conc_mutex);
+	for (i = 0; i < n; i++)
+		cid_domain_put(doms[i]);
+	kvfree(doms);
+}
+#else /* !CONFIG_SCHED_MM_CID */
+static void conc_slot_removed(struct task_group *tg, int cpu) { }
+
+static __maybe_unused void conc_update_tset_mm_bounds(struct cgroup_taskset *tset) { }
+
+static __maybe_unused void conc_attach_drop_idle_cids(struct cgroup_taskset *tset) { }
+
+static __maybe_unused void conc_attach_forget_mms(void) { }
+
+static void conc_update_mm_bounds(struct task_group *top) { }
+#endif /* !CONFIG_SCHED_MM_CID */
+
+/*
+ * Apply the concurrency bounds of every domain with a task in @top's
+ * subtree, then let the effective files of the subtree show the values
+ * the bounds follow now: a drop recorded meanwhile (conc_report_drop())
+ * keeps its floor for the cleaner's next pass. Under conc_mutex.
+ */
+static void conc_bounds_apply(struct task_group *top)
+{
+	struct cgroup_subsys_state *css;
+
+	lockdep_assert_held(&conc_mutex);
+
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &top->css) {
+		struct tg_concurrency *conc = &css_tg(css)->conc;
+
+		guard(raw_spinlock_irqsave)(&conc->lock);
+		conc->bounds_pending = false;
+	}
+	rcu_read_unlock();
+
+	conc_update_mm_bounds(top);
+
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &top->css) {
+		struct tg_concurrency *conc = &css_tg(css)->conc;
+
+		guard(raw_spinlock_irqsave)(&conc->lock);
+		if (!conc->bounds_pending)
+			conc->shown_floor = 0;
+	}
+	rcu_read_unlock();
+}
+
 /*
  * Remove the (@tg, @cpu) slot if it is idle through the whole hierarchy:
  * child groups using the CPU are drained first, since their slots are
@@ -1361,7 +1615,7 @@ static void conc_activate_tasks(struct task_group *tg)
 }
 
 /* What cpu.concurrency.effective reports: 0 is "max". */
-static __maybe_unused unsigned int conc_effective_report(struct task_group *tg)
+static unsigned int conc_effective_report(struct task_group *tg)
 {
 	struct tg_concurrency *conc = &tg->conc;
 	unsigned int eff = READ_ONCE(conc->effective);
@@ -1966,6 +2220,20 @@ static inline void conc_debug_hold_arm(void) { }
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 
 /*
+ * The IDs @p, current, took none of while a hold was pending. Given
+ * outside a context switch, they reach user space only through the rseq
+ * update forced here: the exit to user space writes changed IDs after a
+ * context switch only, and clears the change otherwise.
+ */
+static __maybe_unused void conc_cid_refresh(struct task_struct *p)
+{
+#ifdef CONFIG_SCHED_MM_CID
+	mm_cid_schedin(p);
+	rseq_force_update();
+#endif
+}
+
+/*
  * The usable CPUs changed: the live part of every mask follows, and the
  * classes and the unhit ones are counted again from them. A sleeping task
  * pinned to CPUs that went away keeps its mask, as it would without a
@@ -2141,6 +2409,47 @@ registered:
 
 #ifdef CONFIG_SCHED_MM_CID
 /*
+ * Glue between the cgroup concurrency limit and the cid domains, see
+ * Documentation/scheduler/sched-max-concurrency.rst. The bound of a
+ * domain is the effective limit of the innermost counting group at or
+ * above the lowest common ancestor of its users' groups when there is
+ * one (an mm's threads, usually), else the sum over the topmost counting
+ * groups covering the users (a namespace's members, usually).
+ */
+static unsigned int conc_tg_depth(struct task_group *tg)
+{
+	unsigned int d = 0;
+
+	for (; tg->parent; tg = tg->parent)
+		d++;
+	return d;
+}
+
+static struct task_group *conc_tg_lca(struct task_group *a, struct task_group *b)
+{
+	unsigned int da = conc_tg_depth(a), db = conc_tg_depth(b);
+
+	for (; da > db; da--)
+		a = a->parent;
+	for (; db > da; db--)
+		b = b->parent;
+	while (a != b) {
+		a = a->parent;
+		b = b->parent;
+	}
+	return a;
+}
+
+static bool conc_tg_is_ancestor(struct task_group *anc, struct task_group *tg)
+{
+	for (; tg; tg = tg->parent) {
+		if (tg == anc)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Is @t pinned to its cpu cgroup? Its mm is read under task_lock(), as
  * execve(2) replaces it. A kernel thread borrowing an mm is not.
  */
@@ -2154,5 +2463,353 @@ static __maybe_unused bool conc_task_pinned(struct task_struct *t)
 	pinned = t->mm && READ_ONCE(t->mm->conc_pin);
 	task_unlock(t);
 	return pinned;
+}
+
+/* The innermost counting group at or above the domain's common ancestor. */
+static struct task_group *conc_dom_group(struct cid_domain *dom)
+{
+	struct task_group *tg;
+
+	for (tg = dom->lca; tg; tg = tg->parent) {
+		if (READ_ONCE(tg->conc.active))
+			return tg;
+	}
+	return NULL;
+}
+
+/*
+ * The bound of a domain: the effective limit of the innermost counting
+ * group at or above the lowest common ancestor of its users' groups when
+ * there is one. Otherwise the users span several counting subtrees, or
+ * some are in none: the sum of the effective limits of the topmost
+ * counting groups covering them, since each bounds the presence of its
+ * own subtree, and no bound at all as soon as a user is uncovered.
+ * Called with the domain's lock held when it has users.
+ */
+static unsigned int __conc_dom_bound(struct cid_domain *dom)
+{
+	struct task_group *tg = conc_dom_group(dom), *stack_tops[8], **tops = stack_tops;
+	struct cid_user *u;
+	unsigned int sum = 0, cap = ARRAY_SIZE(stack_tops);
+	int n = 0, i;
+
+	/*
+	 * What is enforced so far, see conc_effective_report(): a decrease
+	 * reaches the IDs once the group is within the new limit, not while
+	 * its excess is still being evicted.
+	 */
+	if (tg)
+		return conc_effective_report(tg);
+	if (!dom->users)
+		return 0;
+	lockdep_assert_held(&dom->lock);
+	if (dom->nr_tops > cap) {
+		tops = dom->tops;
+		cap = dom->nr_tops;
+	}
+	hlist_for_each_entry(u, &dom->user_list, node) {
+		struct task_struct *t = cid_user_task(dom, u);
+		struct task_group *g = READ_ONCE(t->sched_task_group), *top = NULL;
+
+		for (; g && READ_ONCE(g->conc.active); g = g->parent)
+			top = g;
+		if (!top)
+			return 0;
+		for (i = 0; i < n; i++) {
+			if (tops[i] == top)
+				break;
+		}
+		if (i < n)
+			continue;
+		if (n == cap) {
+			/*
+			 * More topmost groups than the buffer holds, which
+			 * cannot grow under this raw lock: keep the bound as
+			 * it is and have cid_apply_bound() grow it and compute
+			 * again.
+			 */
+			dom->tops_wanted = cap * 2;
+			if (!dom->bound_update) {
+				dom->bound_update = 1;
+				irq_work_queue(&dom->irq_work);
+			}
+			return dom->bound;
+		}
+		tops[n++] = top;
+		sum += conc_effective_report(top);
+	}
+	return sum;
+}
+
+unsigned int conc_dom_bound(struct cid_domain *dom)
+{
+	return __conc_dom_bound(dom);
+}
+
+/* Give the scan above the room it asked for. Process context, the domain's mutex held. */
+void conc_dom_grow_tops(struct cid_domain *dom)
+{
+	struct task_group **tops, **old;
+	unsigned int want = READ_ONCE(dom->tops_wanted);
+
+	lockdep_assert_held(&dom->mutex);
+	if (want <= dom->nr_tops)
+		return;
+	tops = kvmalloc_array(want, sizeof(*tops), GFP_KERNEL);
+	if (!tops)
+		return;
+	scoped_guard(raw_spinlock_irq, &dom->lock) {
+		old = dom->tops;
+		dom->tops = tops;
+		dom->nr_tops = want;
+	}
+	kvfree(old);
+}
+
+/* The domain goes away. */
+void conc_dom_destroy(struct cid_domain *dom)
+{
+	kvfree(dom->tops);
+	dom->tops = NULL;
+	dom->nr_tops = 0;
+}
+
+void conc_dom_init(struct cid_domain *dom, struct task_struct *p)
+{
+	dom->lca = p ? task_group(p) : NULL;
+	dom->bound = conc_dom_bound(dom);
+}
+
+/*
+ * A user is about to be added. The first user of an mm (fork(2) or
+ * execve(2)) sets the ancestor exactly, since the task may have been
+ * placed in a cgroup other than its parent's; a later user can only widen
+ * it, and the bound can only widen with it, so no fixup is needed. The
+ * bound is computed once the user is linked, see cid_add_user().
+ */
+void conc_dom_fork(struct cid_domain *dom, struct task_struct *t)
+{
+	struct task_group *tg = task_group(t);
+
+	lockdep_assert_held(&dom->lock);
+	if (!dom->users)
+		dom->lca = tg;
+	else if (!dom->lca || !conc_tg_is_ancestor(dom->lca, tg))
+		dom->lca = dom->lca ? conc_tg_lca(dom->lca, tg) : tg;
+}
+
+/* Recompute the ancestor of all users; task groups are read racily. */
+static void conc_dom_recompute_lca(struct cid_domain *dom)
+{
+	struct task_group *lca = NULL;
+	struct cid_user *u;
+
+	lockdep_assert_held(&dom->lock);
+	hlist_for_each_entry(u, &dom->user_list, node) {
+		struct task_group *tg = READ_ONCE(cid_user_task(dom, u)->sched_task_group);
+
+		lca = lca ? conc_tg_lca(lca, tg) : tg;
+	}
+	if (lca)
+		dom->lca = lca;
+}
+
+/*
+ * A task of @prev's group left this CPU for good, or @prev blocks as the
+ * last present task of its group here: a CPU-owned ID would stay behind
+ * on a CPU the group may give up without any user of the domain left in
+ * the group to visit at that point. Drop it; the next user here
+ * allocates again. Under the rq lock.
+ */
+void conc_cid_left_cpu(struct cid_domain *dom, struct task_struct *prev)
+{
+	struct task_group *tg;
+
+	if (!conc_task_active(prev))
+		return;
+	tg = task_group(prev);
+	if (atomic_read(per_cpu_ptr(tg->conc.present, smp_processor_id())) <= 0)
+		cid_drop_on_cpu(dom, this_cpu_ptr(dom->pcpu));
+}
+
+void conc_dom_user_exited(struct cid_domain *dom, struct task_struct *t)
+{
+	struct task_group *old = dom->lca;
+
+	lockdep_assert_held(&dom->lock);
+	/*
+	 * The ID this CPU owns: the exiting task cannot drop it at its last
+	 * schedule-out, when its mm is gone, see conc_cid_left_cpu(). Drop it
+	 * now when the domain is bounded; a user queued here allocates
+	 * again.
+	 */
+	if (t == current && cid_on_cpu(dom->mode) && conc_dom_group(dom))
+		cid_drop_on_cpu(dom, this_cpu_ptr(dom->pcpu));
+	if (!dom->users || task_group(t) == old)
+		return;
+	conc_dom_recompute_lca(dom);
+	if (dom->lca == old || dom->bound_update)
+		return;
+	dom->bound_update = 1;
+	irq_work_queue(&dom->irq_work);
+}
+
+/*
+ * A task changed group: recompute the ancestor of each of its domains
+ * and defer the bound update, since sched_move_task() holds the runqueue
+ * lock. The cgroup attach path applies it synchronously right after, see
+ * conc_attach_finish(); the deferred work covers the other callers.
+ */
+static void conc_dom_task_moved(struct cid_domain *dom)
+{
+	guard(raw_spinlock)(&dom->lock);
+	if (!dom->users)
+		return;
+	conc_dom_recompute_lca(dom);
+	if (dom->bound_update)
+		return;
+	dom->bound_update = 1;
+	irq_work_queue(&dom->irq_work);
+}
+
+void conc_mm_task_moved(struct task_struct *p)
+{
+	if (p->mm)
+		conc_dom_task_moved(&p->mm->mm_cid);
+}
+
+/*
+ * Drop CPU-owned CIDs that are at or above max_cids, or cached on a CPU
+ * outside the used set of the domain's group. Called with the domain's
+ * mutex held and no transition in progress.
+ */
+void conc_dom_drop_stale_cids(struct cid_domain *dom)
+{
+	unsigned int max_cids = READ_ONCE(dom->max_cids);
+	struct task_group *tg = conc_dom_group(dom);
+	int cpu;
+
+	lockdep_assert_held(&dom->mutex);
+
+	for_each_possible_cpu(cpu) {
+		struct cid_pcpu *pcp = per_cpu_ptr(dom->pcpu, cpu);
+		struct rq *rq = cpu_rq(cpu);
+
+		/* Nothing cached: the lock would find nothing to drop. */
+		if (!cid_on_cpu(READ_ONCE(pcp->cid)))
+			continue;
+		/* Remote access to the per-CPU storage requires rq_lock */
+		guard(rq_lock_irq)(rq);
+		if (!cid_on_cpu(pcp->cid))
+			continue;
+		if (cid_task_in_domain(rq->curr, dom) && task_on_rq_queued(rq->curr))
+			continue;
+		if (cpu_cid_to_cid(pcp->cid) >= max_cids ||
+		    (tg && !cpumask_test_cpu(cpu, tg->conc.used)))
+			cid_drop_on_cpu(dom, pcp);
+	}
+}
+
+/* Diagnostics for an ID handed out above the bound: who holds the others? */
+void conc_cid_violation(struct cid_domain *dom, unsigned int cid)
+{
+	struct task_group *tg = conc_dom_group(dom);
+	const struct cpumask *used = tg ? tg->conc.used : cpu_none_mask;
+	unsigned int live = tg ? conc_effective_report(tg) : dom->bound;
+	unsigned long flags;
+	static int reported;
+	int cpu;
+
+	/*
+	 * A limit increase is visible to placement before the bounds of the
+	 * subtree are refreshed; an ID below the live limit is fine. With no
+	 * counting group over the users' common ancestor, the live bound is a
+	 * sum over the groups covering them, or none once one is uncovered,
+	 * as when a limit is removed: computed afresh, or no report when the
+	 * domain's lock is taken (the caller may hold it), rather than one
+	 * against a cached bound such a removal leaves stale.
+	 */
+	if (!tg) {
+		if (!raw_spin_trylock_irqsave(&dom->lock, flags))
+			return;
+		live = __conc_dom_bound(dom);
+		raw_spin_unlock_irqrestore(&dom->lock, flags);
+	}
+	if (!live || cid < live)
+		return;
+	/* Under the runqueue lock: the console output is deferred. */
+	printk_deferred_enter();
+	if (!IS_ENABLED(CONFIG_SCHED_MAX_CONCURRENCY_DEBUG)) {
+		WARN_ONCE(1, "%s cid %u above bound %u\n",
+			  dom->kind == CID_DOMAIN_MM ? "mm" : "ns", cid, live);
+		printk_deferred_exit();
+		return;
+	}
+	if (reported++ > 2) {
+		printk_deferred_exit();
+		return;
+	}
+	pr_warn("%s cid %u above bound %u (max_cids %u, users %u, mode %#x) on CPU %d, %s/%d\n",
+		dom->kind == CID_DOMAIN_MM ? "mm" : "ns", cid, dom->bound, dom->max_cids,
+		dom->users, dom->mode, raw_smp_processor_id(), current->comm, current->pid);
+	pr_warn("  group used=%*pbl eff=%u nr_used=%u nr_evicting=%u unhit=%u\n",
+		cpumask_pr_args(used),
+		tg ? tg->conc.effective : 0, tg ? tg->conc.nr_used : 0,
+		tg ? tg->conc.nr_evicting : 0, tg ? tg->conc.unhit : 0);
+	for_each_possible_cpu(cpu) {
+		unsigned int v = per_cpu_ptr(dom->pcpu, cpu)->cid;
+		int slot = tg ? atomic_read(per_cpu_ptr(tg->conc.present, cpu)) : 0;
+
+		if (cid_on_cpu(v) || cid_in_transit(v) || slot != CONC_SLOT_UNUSED)
+			pr_warn("  cpu%d pcp=%#x slot=%d\n", cpu, v, slot);
+	}
+	pr_warn("  cidmask=%*pbl\n", (int)num_possible_cpus(), dom->cidmask);
+	dump_stack();
+	printk_deferred_exit();
+}
+
+/*
+ * A limit write, a retry or a cgroup migration changed effective values
+ * or the domain's group: refresh @dom's bound. Even with the bound
+ * unchanged, a migration can leave IDs cached on CPUs the new group does
+ * not use: the old group drains those slots later without finding the
+ * domain.
+ */
+static void conc_dom_update_bound(struct cid_domain *dom)
+{
+	bool changed;
+
+	guard(mutex)(&dom->mutex);
+	if (!dom->users)
+		return;
+	scoped_guard(raw_spinlock_irq, &dom->lock) {
+		/* The scan may ask for a deferred update itself: read the flag after it. */
+		unsigned int bound = conc_dom_bound(dom);
+
+		changed = dom->bound_update || dom->bound != bound;
+	}
+	if (changed)
+		cid_apply_bound(dom);
+	else
+		conc_dom_drop_stale_cids(dom);
+}
+
+/*
+ * A bound is applied between configuration walks. In the middle of one, a
+ * group counts before its present tasks have a slot or a hold
+ * (conc_activate_tasks()), and the ID of a CPU such a task runs on would be
+ * kept past the bound applied, the task taken for its owner
+ * (conc_dom_drop_stale_cids()). The walks hold conc_mutex and apply the bounds
+ * themselves once over (conc_bounds_apply()); a deferred update and a
+ * migration's refresh take it too.
+ */
+void conc_bounds_lock(void)
+{
+	mutex_lock(&conc_mutex);
+}
+
+void conc_bounds_unlock(void)
+{
+	mutex_unlock(&conc_mutex);
 }
 #endif /* CONFIG_SCHED_MM_CID */

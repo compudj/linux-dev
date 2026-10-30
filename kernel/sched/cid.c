@@ -143,20 +143,32 @@
  * that no CID related to that MM is owned by a CPU anymore.
  */
 
-/*
- * Update the CID range properties when the constraints change. Invoked via
- * fork(), exit() and affinity changes
- */
+/* The concurrency bound of the cgroup limit, or no bound at all. */
+static inline unsigned int cid_bound(struct cid_domain *dom)
+{
+	return dom->bound ?: num_possible_cpus();
+}
+
+/* The maximum CIDs of @dom under the concurrency bound @bound (0: none). */
+static unsigned int cid_max_for(struct cid_domain *dom, unsigned int bound)
+{
+	unsigned int opt_cids;
+
+	bound = bound ?: num_possible_cpus();
+	/* Calculate the new optimal constraint */
+	opt_cids = min3(dom->nr_cpus_allowed, dom->users, bound);
+
+	/*
+	 * Adjust the maximum CIDs to +25% limited by the number of possible
+	 * CPUs. The concurrency bound caps the slack too: user space sizes
+	 * its data by the bound.
+	 */
+	return min3(opt_cids + (opt_cids / 4), num_possible_cpus(), bound);
+}
+
 static void __cid_update_max(struct cid_domain *dom)
 {
-	unsigned int opt_cids, max_cids;
-
-	/* Calculate the new optimal constraint */
-	opt_cids = min(dom->nr_cpus_allowed, dom->users);
-
-	/* Adjust the maximum CIDs to +25% limited by the number of possible CPUs */
-	max_cids = min(opt_cids + (opt_cids / 4), num_possible_cpus());
-	WRITE_ONCE(dom->max_cids, max_cids);
+	WRITE_ONCE(dom->max_cids, cid_max_for(dom, dom->bound));
 }
 
 static inline unsigned int cid_calc_pcpu_thrs(struct cid_domain *dom)
@@ -183,8 +195,12 @@ static bool cid_update_max(struct cid_domain *dom)
 		if (dom->users > dom->max_cids)
 			dom->pcpu_thrs = cid_calc_pcpu_thrs(dom);
 	} else {
-		/* Switch back to per task if user count under threshold */
-		if (dom->users < dom->pcpu_thrs)
+		/*
+		 * Switch back to per task if user count under threshold. Per
+		 * task mode needs an ID per user, which a concurrency bound
+		 * below the user count cannot provide.
+		 */
+		if (dom->users < dom->pcpu_thrs && dom->users <= dom->max_cids)
 			dom->pcpu_thrs = 0;
 	}
 
@@ -204,13 +220,19 @@ static bool cid_update_max(struct cid_domain *dom)
 }
 
 /* A user's allowed CPUs changed: the domain's union can only grow. */
-static void cid_update_cpus_allowed(struct cid_domain *dom, const struct cpumask *affmsk)
+void cid_update_cpus_allowed(struct cid_domain *dom, const struct cpumask *affmsk)
 {
 	unsigned int weight;
 
-	if (!READ_ONCE(dom->users))
+	if (!dom || !READ_ONCE(dom->users))
 		return;
 	guard(raw_spinlock)(&dom->lock);
+	/*
+	 * The last user left meanwhile and synchronized the work: queue none
+	 * after it, the domain of an IPC namespace may be freed next.
+	 */
+	if (!dom->users)
+		return;
 	weight = cpumask_weighted_or(dom->cpus_allowed, dom->cpus_allowed, affmsk);
 	if (weight == dom->nr_cpus_allowed)
 		return;
@@ -257,7 +279,7 @@ static inline void cid_transit_to_task(struct cid_user *u, struct cid_pcpu *pcp)
 		unsigned int cid = cpu_cid_to_cid(u->cid);
 
 		u->cid = cid_to_transit_cid(cid);
-		pcp->cid = u->cid;
+		cid_pcpu_write(pcp, u->cid);
 	}
 }
 
@@ -303,7 +325,7 @@ static void cid_fixup_cpus_to_tasks(struct cid_domain *dom)
 			if (cid != MM_CID_UNSET && !cid_in_transit(cid)) {
 				cid = cid_to_transit_cid(cid);
 				cu->cid = cid;
-				pcp->cid = cid;
+				cid_pcpu_write(pcp, cid);
 			}
 		}
 	}
@@ -314,7 +336,7 @@ static inline void cid_transit_to_cpu(struct cid_user *u, struct cid_pcpu *pcp)
 {
 	if (cid_on_task(u->cid)) {
 		u->cid = cid_to_transit_cid(u->cid);
-		pcp->cid = u->cid;
+		cid_pcpu_write(pcp, u->cid);
 	}
 }
 
@@ -351,25 +373,57 @@ static void cid_fixup_tasks_to_cpus(struct cid_domain *dom)
 
 static bool cid_add_user(struct cid_domain *dom, struct cid_user *u)
 {
+	unsigned int bound;
+
 	lockdep_assert_held(&dom->lock);
 
 	u->active = 1;
 	hlist_add_head(&u->node, &dom->user_list);
 	dom->users++;
+	/*
+	 * A bound summed over the topmost limited groups of the users counts
+	 * the new user's: compute it with the user linked. The first user
+	 * sets it, no ID taken yet; a later one raises it at once, but never
+	 * lowers it: a lower one is a decrease on its way, which its cause
+	 * applies once its configuration walk is over (conc_bounds_apply(), or
+	 * the deferred update of a move or an exit), through cid_apply_bound()
+	 * and its order: the mode switched under the old bound, then the IDs
+	 * above the new one dropped. Applied here, it would leave those IDs
+	 * where they are, and the decrease would find the bound in place and
+	 * nothing to do.
+	 */
+	bound = conc_dom_bound(dom);
+	if (dom->users == 1 || (dom->bound && (!bound || bound > dom->bound)))
+		dom->bound = bound;
 	return cid_update_max(dom);
 }
 
 /*
- * @t joins @dom: fork(2), and execve(2) for the new mm or, when the
- * execve fails, for the old one again.
+ * A section that may write this CPU's record of @dom (cid_pcpu_write()):
+ * under its runqueue lock, which the other writers of the record hold,
+ * taken before the domain's lock as sched_move_task() takes them.
+ */
+DEFINE_LOCK_GUARD_1(cid_local, struct cid_domain,
+		    local_irq_disable();
+		    _T->rq = this_rq();
+		    raw_spin_rq_lock(_T->rq);
+		    raw_spin_lock(&_T->lock->lock),
+		    raw_spin_unlock(&_T->lock->lock);
+		    raw_spin_rq_unlock(_T->rq);
+		    local_irq_enable(),
+		    struct rq *rq)
+
+/*
+ * @t joins @dom: fork(2) and execve(2) for the mm, setns(2) and
+ * unshare(2) for a namespace.
  *
  * In per CPU mode a joining user takes no ID of its own: it borrows the
  * one of the CPU it runs on at its schedule in. A task that joins while
  * it is running reaches user space before any schedule in, so it takes
- * its ID here instead, the way one would. That is the failure path of
- * execve(2), which rejoins an mm whose other threads are users still; a
- * fork(2) child does not run yet and a successful execve(2) joins the
- * new mm as its first user.
+ * its ID here instead, the way one would. That is setns(2), and the
+ * failure path of execve(2) which rejoins an mm whose other threads are
+ * users still; a fork(2) child does not run yet, and execve(2) and
+ * unshare(2) otherwise join a domain they create, as its first user.
  */
 static void cid_user_join(struct cid_domain *dom, struct task_struct *t, struct cid_user *u)
 {
@@ -378,7 +432,7 @@ static void cid_user_join(struct cid_domain *dom, struct task_struct *t, struct 
 	WARN_ON_ONCE(u->cid != MM_CID_UNSET);
 
 	guard(mutex)(&dom->mutex);
-	scoped_guard(raw_spinlock_irq, &dom->lock) {
+	scoped_guard(cid_local, dom) {
 		struct cid_pcpu *pcp = this_cpu_ptr(dom->pcpu);
 
 		/* First user ? */
@@ -482,8 +536,11 @@ static void cid_user_leave(struct cid_domain *dom, struct task_struct *t, struct
 	scoped_guard(mutex, &dom->mutex) {
 		/* The mutex is sufficient to protect dom::users */
 		if (likely(dom->users > 1)) {
-			scoped_guard(raw_spinlock_irq, &dom->lock) {
-				if (!__cid_user_leave(dom, t, u))
+			scoped_guard(cid_local, dom) {
+				bool flip = __cid_user_leave(dom, t, u);
+
+				conc_dom_user_exited(dom, t);
+				if (!flip)
 					return;
 				/*
 				 * Mode change. The task has the CID unset
@@ -497,7 +554,7 @@ static void cid_user_leave(struct cid_domain *dom, struct task_struct *t, struct
 			return;
 		}
 		/* Last user */
-		scoped_guard(raw_spinlock_irq, &dom->lock) {
+		scoped_guard(cid_local, dom) {
 			/* Required across execve() */
 			if (t == current)
 				cid_transit_to_task(u, this_cpu_ptr(dom->pcpu));
@@ -542,15 +599,86 @@ void sched_mm_cid_after_execve(struct task_struct *t)
 	sched_mm_cid_fork(t);
 }
 
-static void cid_work_fn(struct work_struct *work)
+/*
+ * Switch @dom to per CPU mode, the users being about to outnumber its
+ * CIDs, with current's CID transferred, as cid_user_join() does: the
+ * fixup that follows skips current. Under dom->lock, and this CPU's rq
+ * lock for its record (cid_local).
+ */
+static void cid_switch_to_cpus(struct cid_domain *dom)
 {
-	struct cid_domain *dom = container_of(work, struct cid_domain, work);
+	lockdep_assert_held(&dom->lock);
+	dom->pcpu_thrs = cid_calc_pcpu_thrs(dom);
+	WRITE_ONCE(dom->mode, dom->mode ^ (MM_CID_TRANSIT | MM_CID_ONCPU));
+	/* As in cid_update_max(): the store before the fixups' rq locks. */
+	smp_mb();
+	if (cid_task_in_domain(current, dom))
+		cid_transit_to_cpu(cid_task_user(dom, current), this_cpu_ptr(dom->pcpu));
+}
+
+/*
+ * Apply the concurrency bound of the cgroup limit: recompute max_cids,
+ * switch owner mode when the user count crosses it, then drop CPU-owned
+ * CIDs that are above the bound or cached on CPUs the group does not use.
+ *
+ * A decrease that leaves fewer CIDs than users switches to per CPU mode
+ * first, under the bound as it was. Under the new one, the switch would
+ * run short: until the fixup reaches a user that is not running, its task
+ * owned CID stays taken, and another user scheduling in on the way, its
+ * own CID dropped at its schedule out as the transition requires, would
+ * find none below the bound. Under the old bound every user had a CID of
+ * its own below it. The bound then drops on per CPU mode, where a user
+ * scheduling in converges below it (cid_from_cpu()).
+ */
+void cid_apply_bound(struct cid_domain *dom)
+{
+	bool percpu, flip;
 
 	lockdep_assert_held(&dom->mutex);
+	/*
+	 * IDs cached on CPUs the domain's group does not use first, before
+	 * the fixups below allocate for the CPUs it does: a cgroup migration
+	 * leaves such IDs behind on the old group's CPUs.
+	 */
+	conc_dom_drop_stale_cids(dom);
+	conc_dom_grow_tops(dom);
+	scoped_guard(cid_local, dom) {
+		unsigned int bound = conc_dom_bound(dom);
+
+		flip = !cid_on_cpu(dom->mode) && dom->users > cid_max_for(dom, bound);
+		if (flip)
+			cid_switch_to_cpus(dom);
+	}
+	if (flip)
+		cid_fixup_tasks_to_cpus(dom);
+	scoped_guard(cid_local, dom) {
+		dom->bound_update = 0;
+		dom->bound = conc_dom_bound(dom);
+		percpu = cid_on_cpu(dom->mode);
+		flip = cid_update_max(dom);
+		/* The bound moved meanwhile: current transfers here too. */
+		if (flip && !percpu && cid_task_in_domain(current, dom))
+			cid_transit_to_cpu(cid_task_user(dom, current), this_cpu_ptr(dom->pcpu));
+	}
+	if (flip) {
+		if (percpu)
+			cid_fixup_cpus_to_tasks(dom);
+		else
+			cid_fixup_tasks_to_cpus(dom);
+	}
+	conc_dom_drop_stale_cids(dom);
+}
+
+static void __cid_work_fn(struct cid_domain *dom, bool bounds)
+{
 	guard(mutex)(&dom->mutex);
 	/* Did the last user leave already? */
 	if (!dom->users)
 		return;
+
+	/* A cgroup change or a limit write deferred a bound update. */
+	if (bounds && READ_ONCE(dom->bound_update))
+		cid_apply_bound(dom);
 
 	scoped_guard(raw_spinlock_irq, &dom->lock) {
 		/* Have a join or a leave handled it already? */
@@ -566,6 +694,21 @@ static void cid_work_fn(struct work_struct *work)
 	cid_fixup_cpus_to_tasks(dom);
 }
 
+static void cid_work_fn(struct work_struct *work)
+{
+	struct cid_domain *dom = container_of(work, struct cid_domain, work);
+	bool bounds = READ_ONCE(dom->bound_update);
+
+	/*
+	 * A deferred bound update waits for the configuration walks, see
+	 * conc_bounds_lock(). One set meanwhile requeues this work.
+	 */
+	if (bounds)
+		conc_bounds_lock();
+	__cid_work_fn(dom, bounds);
+	if (bounds)
+		conc_bounds_unlock();
+}
 static void cid_irq_work(struct irq_work *work)
 {
 	struct cid_domain *dom = container_of(work, struct cid_domain, irq_work);
@@ -580,11 +723,47 @@ static void cid_irq_work(struct irq_work *work)
 
 /*
  * Set up a domain: @pcpu, @cidmask and @cpus_allowed are the caller's
- * storage (the mm's trailing storage); @p seeds the allowed CPUs.
+ * storage (the mm's trailing storage, a namespace's allocations); @p, when
+ * given, seeds the allowed CPUs and the common ancestor group.
  */
-void cid_domain_init(struct cid_domain *dom, struct cid_pcpu __percpu *pcpu,
+DEFINE_PER_CPU(struct list_head, cid_cpu_doms);
+
+void __init cid_init_cpus(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		INIT_LIST_HEAD(per_cpu_ptr(&cid_cpu_doms, cpu));
+}
+
+/* The domain goes: off the lists of the CPUs that still own one of its CIDs. */
+void cid_domain_exit(struct cid_domain *dom)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct cid_pcpu *pcp = per_cpu_ptr(dom->pcpu, cpu);
+
+		if (list_empty(&pcp->node))
+			continue;
+		guard(rq_lock_irq)(cpu_rq(cpu));
+		list_del_init(&pcp->node);
+	}
+}
+
+void cid_domain_init(struct cid_domain *dom, unsigned int kind, struct cid_pcpu __percpu *pcpu,
 		     unsigned long *cidmask, struct cpumask *cpus_allowed, struct task_struct *p)
 {
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct cid_pcpu *pcp = per_cpu_ptr(pcpu, cpu);
+
+		pcp->cpu = cpu;
+		pcp->dom = dom;
+		INIT_LIST_HEAD(&pcp->node);
+	}
+	dom->kind = kind;
 	dom->pcpu = pcpu;
 	dom->cidmask = cidmask;
 	dom->cpus_allowed = cpus_allowed;
@@ -593,18 +772,32 @@ void cid_domain_init(struct cid_domain *dom, struct cid_pcpu __percpu *pcpu,
 	dom->users = 0;
 	dom->pcpu_thrs = 0;
 	dom->update_deferred = 0;
+	dom->bound = 0;
+	dom->bound_update = 0;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	dom->lca = NULL;
+	dom->tops = NULL;
+	dom->nr_tops = 0;
+	dom->tops_wanted = 0;
+#endif
 	raw_spin_lock_init(&dom->lock);
 	mutex_init(&dom->mutex);
 	dom->irq_work = IRQ_WORK_INIT_HARD(cid_irq_work);
 	INIT_WORK(&dom->work, cid_work_fn);
 	INIT_HLIST_HEAD(&dom->user_list);
-	cpumask_copy(cpus_allowed, &p->cpus_mask);
-	dom->nr_cpus_allowed = p->nr_cpus_allowed;
+	if (p) {
+		cpumask_copy(cpus_allowed, &p->cpus_mask);
+		dom->nr_cpus_allowed = p->nr_cpus_allowed;
+	} else {
+		cpumask_clear(cpus_allowed);
+		dom->nr_cpus_allowed = 0;
+	}
 	bitmap_zero(cidmask, num_possible_cpus());
+	conc_dom_init(dom, p);
 }
 
 void mm_init_cid(struct mm_struct *mm, struct task_struct *p)
 {
-	cid_domain_init(&mm->mm_cid, mm->mm_cid.pcpu, mm_cidmask(mm),
+	cid_domain_init(&mm->mm_cid, CID_DOMAIN_MM, mm->mm_cid.pcpu, mm_cidmask(mm),
 			mm_cpus_allowed(mm), p);
 }

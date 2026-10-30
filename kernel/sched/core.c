@@ -9052,6 +9052,8 @@ void __init sched_init(void)
 	list_add(&root_task_group.list, &task_groups);
 	INIT_LIST_HEAD(&root_task_group.children);
 	INIT_LIST_HEAD(&root_task_group.siblings);
+	cid_init_cpus();
+	conc_init_root();
 	autogroup_init(&init_task);
 #endif /* CONFIG_CGROUP_SCHED */
 

@@ -8,6 +8,8 @@
 
 #ifdef CONFIG_RSEQ
 struct rseq;
+struct task_group;
+struct ipc_namespace;
 
 /*
  * rseq_event::has_rseq contains the ABI version number so preserving it
@@ -137,8 +139,17 @@ struct rseq_data { };
 #define MM_CID_ONCPU	BIT(30)
 #define MM_CID_TRANSIT	BIT(29)
 
+/*
+ * A cid domain hands out concurrency IDs to the tasks of its users that
+ * run at the same time: the mm of a process (mm_cid) or an IPC namespace
+ * (ns_cid). See Documentation/scheduler/sched-max-concurrency.rst.
+ */
+enum cid_domain_kind {
+	CID_DOMAIN_MM,
+	CID_DOMAIN_NS,
+};
 /**
- * struct cid_user - Storage for per task CID data
+ * struct cid_user - Storage for per task CID data, one per domain kind
  * @active:	The task is a user of the domain
  * @cid:	The CID associated to the task either permanently or
  *		borrowed from the CPU
@@ -155,8 +166,18 @@ struct cid_user {
  * @cid:	The CID associated to the CPU either permanently or
  *		while a task with a CID is running
  */
+struct cid_domain;
+/*
+ * @cid: the CID the CPU owns (MM_CID_ONCPU), caches or hands over
+ * @cpu, @dom: the CPU and the domain this record belongs to
+ * @node: on the CPU's list of the domains whose CID it owns, see
+ *	  cid_pcpu_write(); written under the CPU's runqueue lock
+ */
 struct cid_pcpu {
-	unsigned int	cid;
+	unsigned int		cid;
+	int			cpu;
+	struct cid_domain	*dom;
+	struct list_head	node;
 }____cacheline_aligned_in_smp;
 
 /**
@@ -166,6 +187,7 @@ struct cid_pcpu {
  * @max_cids:		The exclusive maximum CID value for allocation and convergence
  * @cidmask:		The allocation bitmap, num_possible_cpus() bits
  * @cpus_allowed:	Union of the users' allowed CPUs, growth only
+ * @kind:		Which task field holds the users' state (enum cid_domain_kind)
  * @irq_work:		irq_work to handle the affinity mode change case
  * @work:		Regular work to handle the affinity mode change case
  * @lock:		Spinlock to protect against affinity setting which can't take @mutex
@@ -177,6 +199,14 @@ struct cid_pcpu {
  *			by other entities which do not actually share the MM.
  * @pcpu_thrs:		Threshold for switching back from per CPU mode
  * @update_deferred:	A deferred switch back to per task mode is pending.
+ * @bound:		Concurrency bound from cpu.concurrency.max, 0 if none.
+ *			See Documentation/scheduler/sched-max-concurrency.rst
+ * @bound_update:	A deferred bound update is pending
+ * @lca:		Lowest common ancestor task group of the users
+ * @tops:		Buffer for the topmost limited groups of the users, when
+ *			they span several; grown in process context
+ * @nr_tops:		Its capacity
+ * @tops_wanted:	The capacity the last scan needed
  */
 struct cid_domain {
 	/* Hotpath read mostly members */
@@ -185,6 +215,7 @@ struct cid_domain {
 	unsigned int		max_cids;
 	unsigned long		*cidmask;
 	struct cpumask		*cpus_allowed;
+	unsigned int		kind;
 
 	/* Rarely used. Moves @lock and @mutex into the second cacheline */
 	struct irq_work		irq_work;
@@ -199,7 +230,30 @@ struct cid_domain {
 	unsigned int		users;
 	unsigned int		pcpu_thrs;
 	unsigned int		update_deferred;
+	unsigned int		bound;
+	unsigned int		bound_update;
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	struct task_group	*lca;
+	struct task_group	**tops;
+	unsigned int		nr_tops;
+	unsigned int		tops_wanted;
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 } ____cacheline_aligned;
+/**
+ * struct ns_cid - The cid domain of an IPC namespace created with CLONE_IPC_CID
+ * @dom:	The domain
+ * @ns:		The namespace, referenced by each member while it is one
+ * @ceiling_css:	The cpu css of the innermost cgroup with a ceiling of the first
+ *		member, whose subtree no member may leave; NULL when there
+ *		was none
+ * @ceiling:	The ceiling, frozen at the first admission: the effective
+ *		ceiling of @ceiling_css's cgroup then, or the number of
+ *		possible CPUs
+ * @frozen:	The first admission happened
+ *
+ * See Documentation/scheduler/sched-max-concurrency.rst
+ */
+struct cgroup_subsys_state;
 #else /* CONFIG_SCHED_MM_CID */
 struct cid_domain { };
 struct cid_user { };
