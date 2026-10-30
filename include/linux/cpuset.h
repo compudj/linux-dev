@@ -81,10 +81,12 @@ extern void lockdep_assert_cpuset_lock_held(void);
 extern void cpuset_cpus_allowed_locked(struct task_struct *p, struct cpumask *mask);
 extern void cpuset_cpus_allowed(struct task_struct *p, struct cpumask *mask);
 extern void cpuset_task_cpus_rcu(struct task_struct *p, struct cpumask *mask);
+struct cgroup_subsys_state;
 extern void cpuset_task_cpus_configured_rcu(struct task_struct *p, struct cpumask *mask);
 extern void cpuset_css_cpus_configured_rcu(struct cgroup_subsys_state *css,
 					   struct cpumask *mask);
 extern bool cpuset_css_cpus_fixed_rcu(struct cgroup_subsys_state *css);
+extern int cpuset_conc_check_subtree(struct cgroup *cgrp);
 extern bool cpuset_cpus_allowed_fallback(struct task_struct *p);
 extern int cpuset_num_cpus(struct cgroup *cgroup);
 extern nodemask_t cpuset_mems_allowed(struct task_struct *p);

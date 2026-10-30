@@ -11,7 +11,19 @@
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 /* Filled in by a later patch. */
-static inline bool conc_cpuset_fixed(struct cgroup_subsys_state *css, struct task_group *starting)
+static inline int conc_pin_check(struct cgroup_taskset *tset)
+{
+	return 0;
+}
+
+/* Filled in by a later patch. */
+static inline int conc_pin_fork_check(struct task_struct *p, struct kernel_clone_args *kargs)
+{
+	return 0;
+}
+
+/* Filled in by a later patch. */
+static inline bool conc_task_ns_allows(struct task_struct *t, struct task_group *tg)
 {
 	return false;
 }
