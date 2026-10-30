@@ -4,6 +4,7 @@
  */
 #include <linux/slab.h>
 #include <linux/completion.h>
+#include <linux/resume_user_mode.h>
 #include <linux/sched/task.h>
 #include <linux/sched/vhost_task.h>
 #include <linux/sched/signal.h>
@@ -36,6 +37,15 @@ static int vhost_task_fn(void *data)
 
 			if (get_signal(&ksig))
 				break;
+		}
+
+		/*
+		 * The task never returns to user space: run the work queued
+		 * for that return here, as io-wq workers do.
+		 */
+		if (test_thread_flag(TIF_NOTIFY_RESUME)) {
+			__set_current_state(TASK_RUNNING);
+			resume_user_mode_work(NULL);
 		}
 
 		/* mb paired w/ vhost_task_stop */
