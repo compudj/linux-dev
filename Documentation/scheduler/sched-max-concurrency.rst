@@ -64,8 +64,10 @@ Interface
     reads a value and sizes data by it, alone or with others in shared
     memory, must never see it grow, which would overflow the data, nor
     shrink, which would let a reader miss IDs that held data before. That
-    is what lets a process that pins itself to its cpu cgroup size its
-    ``mm_cid`` data by it (see `Pinned processes`_); otherwise the bound of ``mm_cid`` follows the cgroup a
+    is what lets an IPC namespace freeze a ceiling of its ``ns_cid`` on
+    it (see `Cross-process concurrency IDs`_), and a process that pins
+    itself to its cpu cgroup size its ``mm_cid`` data by it (see `Pinned
+    processes`_); otherwise the bound of ``mm_cid`` follows the cgroup a
     process is moved to, so data indexed by ``mm_cid`` is sized by the
     number of possible CPUs.
 
@@ -1185,6 +1187,165 @@ unchanged. Three things change in the slow path:
 A thread pool whose size hovers around the limit switches modes more
 often than before because the slack is capped; the existing hysteresis
 limits the cost.
+
+Cross-process concurrency IDs
+=============================
+
+A second ID, ``ns_cid``, exposed through a new 32-bit ``struct rseq``
+field placed after ``slice_ctrl`` (replacing the reserved byte, as that
+byte's comment foresaw), unique among the tasks of a *cid domain* that
+are running at the same instant and below the domain's bound. It lets
+processes of a container index shared memory by concurrency.
+
+Decisions:
+
+* The domain is an IPC namespace created with a creation flag, a new
+  clone3/unshare flag valid only together with ``CLONE_NEWIPC``. The
+  privilege is that of ``CLONE_NEWIPC``: ``CAP_SYS_ADMIN`` in the user
+  namespace that owns the new namespace, so an unprivileged user gets it
+  through a user namespace and a container runtime holds it anyway. The
+  IPC namespace is flat, every runtime creates one per container,
+  ``setns(2)`` and ``unshare(2)`` already define joining and leaving, and
+  it is the kernel's definition of who can share memory: System V shared
+  memory, POSIX message queues and the runtimes' ``/dev/shm`` are scoped
+  by it. A dedicated cid namespace type would decouple the two at the
+  cost of a clone flag, an nsfs type, ``setns`` support, ucount limits and
+  runtime support; the engine is written against ``struct cid_domain``
+  with membership maintained where ``nsproxy`` changes, so that promotion
+  stays mechanical.
+* The choice is made at creation and holds for the namespace's lifetime.
+  There is no runtime toggle, and ns_cid never switches meaning under a
+  running workload. A namespace created with the flag always runs the
+  engine: ns_cid is an engine ID below the namespace's bound, sized like
+  mm_cid by the union of the members' allowed CPUs (what a cpuset
+  narrows), the member count and the cgroup bound, the engine's internal
+  owner-mode switches staying invisible. A namespace created without the
+  flag, the initial namespace included, reports the CPU number, a valid
+  concurrency ID below the CPU count that is already maintained for
+  ``struct rseq``, and costs nothing: the context switch does no ns_cid
+  work for its tasks.
+* Membership is every task with an mm whose ``nsproxy`` names the
+  namespace, maintained at fork, exit, ``setns(2)`` and ``unshare(2)``;
+  kernel threads are not members. The domain keeps the member list the
+  engine needs for its fixup passes, and ``task_struct`` caches the
+  domain pointer so the hot path never walks ``nsproxy``.
+* The bound of a domain comes from the cgroup limits that apply to its
+  members, never from a configuration of its own. Two values, as for a
+  cgroup. The *ceiling* is taken once, at creation: the effective
+  ceiling of the creator's cgroup, or the number of possible CPUs
+  when no ceiling applies there. It never changes afterwards, which
+  the fixed ceilings make possible without tracking: the
+  members are kept in the subtree of the nearest cgroup with a ceiling
+  value, the creator's own or an ancestor, where no effective ceiling
+  is larger, and the only ways to outgrow the bound, a member moving out
+  of that subtree, or ``setns(2)`` into the namespace from outside it,
+  are refused with ``EBUSY``. The nearest such cgroup and not the
+  outermost: limits nest, a host capping all its containers at 60 CPUs
+  and each container at 2, and the ceiling the processes of a container
+  size their tables by is the container's. The *current target* is the
+  cgroup bound of the members, computed as for an mm, at most the ceiling
+  bound; it moves as the limits do, and the IDs in use are
+  compacted further by the cpuset union and the member count. A
+  namespace sized by the CPU count behaves like an mm whose threads sit
+  in no limited cgroup. The ceiling is taken at creation, and a
+  cgroup has its ceiling from its own creation, before any namespace
+  is created in it.
+* Userspace reads the ceiling of its own namespace from
+  ``/proc/sys/kernel/ns_cid_max`` and the current current target from
+  ``/proc/sys/kernel/ns_cid_cur``, both read-only, and sizes its tables
+  by the former. For ``mm_cid`` the ceiling stays the number of
+  possible CPUs, since a process moves between cgroups freely, unless
+  the process gives that up (see `Pinned processes`_); its current target
+  is the effective limit of its cgroup as before.
+* The engine is ``struct mm_mm_cid`` generalised into a cid domain
+  (bitmap, per-CPU storage, task-owned and CPU-owned modes, the same
+  ``max_cids`` formula with ``users`` being the member count) that the
+  mm embeds and the namespace embeds. The hot path becomes a second
+  schedin/schedout call for tasks whose domain pointer is set. The
+  set-move stopper hands over, and slot removals drop, the IDs of both
+  domains of the tasks concerned.
+* ``struct rseq`` and ``AT_RSEQ_FEATURE_SIZE`` are extended the way
+  ``node_id`` and ``mm_cid`` were; the field is written for every
+  registration large enough to hold it, which is what the feature size
+  advertises, on every architecture. The RSEQ ABI V2 mode, which the
+  architecture decides and not user space, gates the time slice
+  extension because that needs the generic entry code; it must not gate
+  an ID, or ``ns_cid`` would stay 0 on the architectures that have rseq
+  without it while the feature size claims the field.
+
+How it is built:
+
+* The flag is ``CLONE_IPC_CID`` for clone3(2), and ``UNSHARE_IPC_CID``
+  for unshare(2), which aliases ``CLONE_CHILD_SETTID`` the way
+  ``UNSHARE_EMPTY_MNTNS`` aliases ``CLONE_PARENT_SETTID``; both need
+  ``CLONE_NEWIPC`` (EINVAL otherwise). The domain, ``struct ns_cid``, is
+  allocated with the namespace and freed with it; a namespace without
+  one costs a NULL pointer.
+* Membership is driven by the namespace switch itself:
+  ``switch_task_namespaces()`` leaves the old domain and joins the new
+  one before the nsproxy changes hands, ``sched_post_fork()`` joins the
+  child, exit leaves with the mm. A member holds a reference on its
+  namespace, so that ``task_struct::ns_dom`` stays valid whatever the
+  order of the exit and namespace paths, and a joining task widens the
+  domain's allowed CPUs with its own mask, since the members of a
+  namespace come from anywhere.
+* The ceiling is frozen at the *first admission*, which is the
+  creation in practice: for clone3(2) in ``sched_cgroup_fork()``, where
+  the child's cgroup is final (``CLONE_INTO_CGROUP``) and the child is
+  not visible yet; for unshare(2) when the creator joins. It is the
+  effective ceiling of that cgroup, which its innermost ancestor
+  with a ceiling, the cgroup itself included, has too; the domain pins that
+  ancestor with a css reference. With no ceiling on the path, it is
+  the number of possible CPUs, and then nothing is ever refused.
+  The first admission, the setns(2) admissions and the migrations'
+  checks hold ``conc_mutex``. A setns(2) admission and an unshare(2)
+  join, which no cgroup lock orders against a migration of the task,
+  first wait for the migrations judged before to be applied
+  (``conc_wait_attach()``): one in flight did not see the admission and
+  would move the task out of the subtree afterwards; waited for, the
+  cgroup the admission reads is the one the task lands in, and a
+  migration judged later sees ``ns_pending`` or the membership. A
+  fork(2) child of a namespace whose bound
+  is frozen, every new thread of a member included, is admitted without
+  it, since nothing that admission reads can change: the child's cgroup
+  is final, no migration sees the child yet, and a frozen bound stays
+  as it is. The frozen flag is set with release semantics after the
+  bound it publishes, and read with acquire semantics there and by the
+  sysctls. A leave holds no ``conc_mutex``: the last member's leave waits
+  for the domain's work, which takes it for a deferred bound update.
+* The refusals: ``conc_attach_check()`` refuses a migration that would
+  take a task out of the frozen subtree of a namespace it is a member
+  of, is joining, or was born into and joins once forked (a child
+  between ``cgroup_post_fork()`` and ``sched_post_fork()``). A setns(2)
+  is admitted in the namespace's install step, before the point of no
+  return, which marks the task with ``ns_pending`` so that a migration
+  in the window up to the switch is checked against the new namespace
+  too; the mark is cleared when the switch joins, or when the setns
+  fails. A clone3(2) with ``CLONE_INTO_CGROUP`` outside the subtree
+  fails with EBUSY.
+* The bound of the domain is the cgroup bound computed for an mm
+  (innermost counting group above the members' common ancestor, else
+  the sum over the topmost ones), clamped to the ceiling, so that it
+  never reads 0 (no bound) in a ceiling-bounded namespace; ``cid_get()``'s
+  violation check thus covers the ceiling too.
+* The sysctls are entries of the per-namespace ``kernel`` table of IPC
+  sysctls, read-only, resolved through the reader's namespace like
+  ``shmmax``; both are exclusive upper bounds, and a namespace without a
+  domain reports ``nr_cpu_ids`` for both since ``ns_cid`` is the CPU
+  number there.
+* ``ns_cid`` is written to the rseq area of every registration larger
+  than the original 32 bytes, the only lengths ``rseq(2)`` admits being
+  that one and the ones that hold the whole field, validated like
+  ``mm_cid`` in debug mode, reset at unregistration, and carried in
+  ``struct rseq_ids`` so that a change raises the IDs update; a
+  namespace switch forces one.
+* A task that joins a domain while it is running, which only
+  ``setns(2)`` does, takes its ID in the join itself, the way a schedule
+  in would: in per CPU mode a joining user takes none, borrowing the ID
+  of the CPU it runs on at its next schedule in, and a running joiner
+  reaches user space before that. ``unshare(2)`` and ``execve(2)`` join
+  the domain they create, where the first user takes an ID of its own,
+  and a ``fork(2)`` child does not run before its first schedule in.
 
 Pinned processes
 ================
