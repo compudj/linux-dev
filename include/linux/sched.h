@@ -960,6 +960,8 @@ struct task_struct {
 	u8				conc_hold_pending;
 	/* Held: out of its class, queued for the core, in TASK_RUNNING, on conc_held_list. */
 	u8				conc_held;
+	/* Running a cgroup migration it judged, see conc_wait_attach(). */
+	u8				conc_attaching;
 	/* Its applied mask misses the one it is registered by, see conc_task_set_outside(). */
 	u8				conc_outside;
 	/* The CPU of a slot reserved for this task's arrival, -1 when none. */
