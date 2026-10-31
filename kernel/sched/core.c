@@ -11060,12 +11060,17 @@ static bool sched_mm_cid_add_user(struct task_struct *t, struct mm_struct *mm)
  * child does not run yet and a successful execve(2) joins the new mm as
  * its first user.
  */
+/*
+ * A user worker (io_uring's, vhost's) takes no ID: it never returns to
+ * user space and has no rseq area, and an ID of its would be one fewer for
+ * the threads that report theirs.
+ */
 static void sched_mm_cid_fork(struct task_struct *t)
 {
 	struct mm_struct *mm = t->mm;
 	bool percpu = false, flip = false;
 
-	if (!mm)
+	if (!mm || (t->flags & PF_USER_WORKER))
 		return;
 
 	WARN_ON_ONCE(t->mm_cid.cid != MM_CID_UNSET);
