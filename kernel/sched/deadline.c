@@ -3564,6 +3564,8 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
 	dec_dl_tasks_cs(p);
 
 	if (!task_on_rq_queued(p)) {
+		bool released = false;
+
 		if (p->dl.dl_non_contending) {
 			/*
 			 * Inactive timer is armed. However, p is leaving
@@ -3576,12 +3578,18 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
 			 * release total_bw via __dl_sub().
 			 */
 			sub_running_bw(&p->dl, &rq->dl);
-		} else {
+		} else if (p->dl.dl_runtime && !dl_entity_is_special(&p->dl)) {
 			/*
 			 * No pending inactive timer: the task never ran as
 			 * DEADLINE or the timer already fired while still
 			 * DEADLINE (only dropping running_bw at that time).
 			 * Nobody else will release total_bw, do it now.
+			 *
+			 * Not for a task without parameters of its own, one
+			 * deboosted from priority inheritance, whose mask may
+			 * have no active CPU for dl_task_root_domain_cpu(),
+			 * nor for a special one: neither has bandwidth in
+			 * total_bw.
 			 */
 			unsigned int cpu = dl_task_root_domain_cpu(p);
 			struct dl_bw *dl_b = &cpu_rq(cpu)->rd->dl_bw;
@@ -3589,8 +3597,20 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
 			raw_spin_lock(&dl_b->lock);
 			__dl_sub(dl_b, p->dl.dl_bw, dl_bw_cpus(cpu));
 			raw_spin_unlock(&dl_b->lock);
+			released = true;
 		}
 		sub_rq_bw(&p->dl, &rq->dl);
+		/*
+		 * Released: reset the parameters, as inactive_task_timer()
+		 * does. Kept, they would make the task one with bandwidth to
+		 * task_contending() and task_non_contending() once priority
+		 * inheritance boosts it, and a deboost while it sleeps would
+		 * release that bandwidth again. So would the inactive timer's
+		 * handler when it runs late, dl_non_contending cleared under
+		 * it by migrate_task_rq_dl(): it finds !dl_task(p).
+		 */
+		if (released)
+			__dl_clear_params(&p->dl);
 	}
 
 	/*
