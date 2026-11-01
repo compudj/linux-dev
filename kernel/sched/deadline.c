@@ -1232,10 +1232,17 @@ static enum hrtimer_restart dl_task_timer(struct hrtimer *timer)
 
 	/*
 	 * The task might have changed its scheduling policy to something
-	 * different than SCHED_DEADLINE (through switched_from_dl()).
+	 * different than SCHED_DEADLINE (through switched_from_dl()). It
+	 * keeps its parameters until its 0-lag time and may come back to
+	 * SCHED_DEADLINE before then, switched_to_dl() cancelling the
+	 * inactive timer: it must not come back throttled, since this was
+	 * its replenishment. Its deadline has passed: the enqueue starts a
+	 * new period.
 	 */
-	if (!dl_task(p))
+	if (!dl_task(p)) {
+		dl_se->dl_throttled = 0;
 		goto unlock;
+	}
 
 	/*
 	 * The task might have been boosted by someone else and might be in the
