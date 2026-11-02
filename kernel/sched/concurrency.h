@@ -243,6 +243,8 @@ extern void conc_fork_done(struct task_struct *p);
 extern int conc_check_affinity(struct task_struct *p, const struct cpumask *mask);
 extern bool conc_affinity_lock(struct task_struct *p, struct affinity_context *ctx);
 extern void conc_affinity_unlock(struct task_struct *p, bool locked);
+extern int conc_dl_admit(struct task_struct *p);
+extern void conc_dl_wait(struct task_struct *p);
 
 /*
  * A migration of @p judged its mask after @ctx's change was judged, see
@@ -393,6 +395,10 @@ static inline bool conc_affinity_lock(struct task_struct *p, struct affinity_con
 }
 
 static inline void conc_affinity_unlock(struct task_struct *p, bool locked) { }
+
+static inline int conc_dl_admit(struct task_struct *p) { return 0; }
+
+static inline void conc_dl_wait(struct task_struct *p) { }
 
 static inline bool conc_judged_stale(struct task_struct *p, struct affinity_context *ctx)
 {

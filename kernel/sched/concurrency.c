@@ -3571,11 +3571,26 @@ bool conc_cgroup_limited(struct cgroup *cgrp)
 }
 
 /*
+ * A SCHED_DEADLINE task is admitted against every CPU of its root domain
+ * (sched_dl_overflow()), which is why none may have an affinity narrower
+ * than that domain (dl_task_check_affinity()). A limit takes CPUs from it
+ * the same way, unseen by that admission: no deadline task may be in a
+ * subtree that counts. As for the affinity, not where deadline admission
+ * is off, nor for the special tasks it never sees. Priority inheritance
+ * into the deadline class is the kernel's own, and transient: it is not
+ * refused. Under p->pi_lock or task_rq(p)->lock.
+ */
+static inline bool conc_dl_task(struct task_struct *p)
+{
+	return task_has_dl_policy(p) && dl_bandwidth_enabled() && !dl_entity_is_special(&p->dl);
+}
+
+/*
  * May the subtree of @tg start counting? Every cpuset in it must grant
  * what it names (cpuset_conc_check_subtree()), and every task's requested
  * mask must be taken (conc_request_taken()): the limit could not
- * hold what they become without a write it judges. cpuset_mutex and
- * conc_mutex held.
+ * hold what they become without a write it judges. No task may be a
+ * deadline one (conc_dl_task()). cpuset_mutex and conc_mutex held.
  */
 static int conc_subtree_literal(struct task_group *tg)
 {
@@ -3613,6 +3628,10 @@ static int conc_subtree_literal(struct task_group *tg)
 			    !conc_request_taken(t, t->user_cpus_ptr, conf, fixed, tmp)) {
 				trace_sched_conc_refuse(t, "cpu.concurrency.max",
 						      "a request its cpuset cuts", -EBUSY);
+				ret = -EBUSY;
+			} else if (conc_dl_task(t)) {
+				trace_sched_conc_refuse(t, "cpu.concurrency.max",
+						      "a SCHED_DEADLINE task", -EBUSY);
 				ret = -EBUSY;
 			}
 		}
@@ -6878,6 +6897,44 @@ void conc_affinity_unlock(struct task_struct *p, bool locked)
 		conc_cfg_unlock();
 }
 
+/**
+ * conc_dl_admit - may @p become a SCHED_DEADLINE task?
+ * @p: the task, from __sched_setscheduler() under task_rq_lock() and
+ *     cpuset_lock(), for a user request of the deadline policy that its
+ *     admission sees (not SCHED_FLAG_SUGOV, admission on)
+ *
+ * Not in a group that counts, see conc_dl_task(): -EPERM, as for an
+ * affinity narrower than the root domain. -EAGAIN while a migration of
+ * @p judged with its old policy has not landed (p->conc_move_seq odd,
+ * see conc_affinity_lock()): its destination may count; the caller drops
+ * its locks, waits for it (conc_dl_wait()) and checks again. A limit
+ * starting is serialized by cpuset_mutex, and finds the task deadline or
+ * not (conc_subtree_literal()); a migration judged after this reads the
+ * new policy (__conc_attach_check()).
+ */
+int conc_dl_admit(struct task_struct *p)
+{
+	lockdep_assert_held(&p->pi_lock);
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return 0;
+	if (READ_ONCE(task_group(p)->conc.active)) {
+		trace_sched_conc_refuse(p, "sched_setattr", "SCHED_DEADLINE under a limit", -EPERM);
+		return -EPERM;
+	}
+	if (p->conc_move_seq & 1)
+		return -EAGAIN;
+	return 0;
+}
+
+/* The wait conc_dl_admit() asks for, with no lock held. */
+void conc_dl_wait(struct task_struct *p)
+{
+	unsigned int seq = READ_ONCE(p->conc_move_seq);
+
+	if (seq & 1)
+		wait_event(conc_attach_wq, READ_ONCE(p->conc_move_seq) != seq);
+}
+
 /*
  * sched_setaffinity(2): refuse a @requested mask that would raise the
  * width of the masks (see conc_masks_width()) above the requested limit of
@@ -7579,6 +7636,18 @@ static int __conc_attach_check(struct cgroup_taskset *tset, bool cpuset)
 			    !conc_request_taken(task, user, snap, fixed, m)) {
 				trace_sched_conc_refuse(task, "cgroup migration",
 						      "a request the cpuset would cut", -EBUSY);
+				ret = -EBUSY;
+			}
+			/*
+			 * Nor a deadline task, see conc_dl_task(). Only a group
+			 * change brings one under a limit; its policy is read
+			 * here, and a later change waits for this migration to
+			 * land (conc_dl_admit()).
+			 */
+			if (!ret && !cpuset && READ_ONCE(css_tg(cpu_css)->conc.active) &&
+			    conc_dl_task(task)) {
+				trace_sched_conc_refuse(task, "cgroup migration",
+						      "a SCHED_DEADLINE task", -EBUSY);
 				ret = -EBUSY;
 			}
 			/* As registered there, see cpuset_task_cpus_configured_rcu(). */

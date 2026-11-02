@@ -643,6 +643,21 @@ change:
 				retval = -EPERM;
 				goto unlock;
 			}
+			/*
+			 * Nor in a cgroup under a concurrency limit, which
+			 * takes CPUs of the root domain from it as well.
+			 */
+			retval = conc_dl_admit(p);
+			if (retval == -EAGAIN) {
+				task_rq_unlock(rq, p, &rf);
+				if (cpuset_locked)
+					cpuset_unlock();
+				cpuset_locked = false;
+				conc_dl_wait(p);
+				goto recheck;
+			}
+			if (retval)
+				goto unlock;
 		}
 	}
 
