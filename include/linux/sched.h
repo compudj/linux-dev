@@ -1022,6 +1022,12 @@ struct task_struct {
 	u8				conc_rotated;
 	/* The CPU of a slot reserved for this task's arrival, -1 when none. */
 	int				conc_resv_cpu;
+	/*
+	 * Odd from the time the cpu controller checks a migration of the task
+	 * until the migration ends. See __conc_attach_check(). Written under
+	 * p->pi_lock.
+	 */
+	unsigned int			conc_move_seq;
 	struct list_head		conc_hold_node;
 	/* The start of the current hold, see conc_stat_hold_start(). */
 	u64				conc_hold_at;

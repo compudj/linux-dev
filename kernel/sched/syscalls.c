@@ -659,6 +659,24 @@ change:
 				retval = -EPERM;
 				goto unlock;
 			}
+			/*
+			 * A concurrency limit also gives the task fewer CPUs
+			 * than its root domain has. Check it, see
+			 * conc_dl_admit().
+			 */
+			retval = conc_dl_admit(p);
+			if (retval == -EAGAIN) {
+				task_rq_unlock(rq, p, &rf);
+				if (cpuset_locked) {
+					dl_accounting_unlock();
+					cpuset_unlock();
+				}
+				cpuset_locked = false;
+				conc_dl_wait(p);
+				goto recheck;
+			}
+			if (retval)
+				goto unlock;
 		}
 	}
 

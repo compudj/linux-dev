@@ -1907,6 +1907,62 @@ static void conc_subtree_release(struct cgroup_subsys_state **arr, int n)
 }
 
 /*
+ * Return true if @p is a deadline task which the deadline admission accounts
+ * for. It has the SCHED_DEADLINE policy, admission is on, and it is not a
+ * special task.
+ *
+ * Such a task is admitted against every CPU of its root domain
+ * (sched_dl_overflow()). This is why its affinity may not be narrower than
+ * that domain (dl_task_check_affinity()). A limit gives the task fewer CPUs
+ * in the same way, and that admission does not see it. So the callers refuse
+ * such a task in a subtree which counts.
+ *
+ * Priority inheritance into the deadline class is not refused. The kernel
+ * does it, it is transient, and it does not change the policy.
+ *
+ * Call under p->pi_lock or task_rq(p)->lock.
+ */
+static inline bool conc_dl_task(struct task_struct *p)
+{
+	return task_has_dl_policy(p) && dl_bandwidth_enabled() && !dl_entity_is_special(&p->dl);
+}
+
+/*
+ * Check the deadline tasks of the subtree of @tg, on which a limit starts.
+ * Return 0 if the limit may start, or a negative error code. The caller
+ * holds cpuset_mutex and conc_mutex.
+ *
+ * A deadline task (conc_dl_task()) is refused.
+ */
+static int conc_subtree_dl_start(struct task_group *tg)
+{
+	struct cgroup_subsys_state **csses;
+	struct css_task_iter it;
+	struct task_struct *t;
+	int ret, nr_css, k;
+
+	ret = conc_subtree_snapshot(tg, &csses, &nr_css);
+	if (ret)
+		return ret;
+	for (k = 0; k < nr_css && !ret; k++) {
+		if (!csses[k])
+			continue;
+		css_task_iter_start(csses[k], 0, &it);
+		while (!ret && (t = css_task_iter_next(&it))) {
+			guard(raw_spinlock_irq)(&t->pi_lock);
+			if (!conc_dl_task(t))
+				continue;
+			trace_sched_conc_refuse(t, "cpu.concurrency.max",
+					      "a SCHED_DEADLINE task", -EBUSY);
+			ret = -EBUSY;
+		}
+		css_task_iter_end(&it);
+	}
+	conc_subtree_release(csses, nr_css);
+	return ret;
+}
+
+/*
  * @tg is about to stop counting. First stop each child from propagating
  * its slots into @tg, and release the entities the child holds there. A
  * claim by a child which finds @tg inactive then also finds its own
@@ -5209,6 +5265,59 @@ void conc_task_affinity_changed(struct task_struct *p, struct affinity_context *
 }
 
 /*
+ * cpuset_mutex orders the limit writes against the changes of the partition
+ * roots and against the deadline admission. CONFIG_SCHED_MAX_CONCURRENCY
+ * depends on CONFIG_CPUSETS for this.
+ */
+static inline void conc_cfg_lock_settled(void) { cpuset_lock_no_attach(); }
+
+static inline void conc_cfg_unlock(void) { cpuset_unlock(); }
+
+/**
+ * conc_dl_admit - may @p become a SCHED_DEADLINE task?
+ * @p: the task. The caller is __sched_setscheduler(), for a user request of
+ *     SCHED_DEADLINE which the deadline admission sees (admission on, not
+ *     SCHED_FLAG_SUGOV). It holds task_rq_lock() and cpuset_mutex.
+ *
+ * A deadline task is not allowed in a group which counts, see conc_dl_task().
+ *
+ * A limit which starts is serialized by cpuset_mutex. It finds the task with
+ * or without the deadline policy (conc_subtree_dl_start()). A migration
+ * checked after this call reads the new policy (__conc_attach_check()).
+ *
+ * Return: 0 if @p may become a deadline task. -EPERM if its group counts, as
+ * for an affinity narrower than the root domain. -EAGAIN if a migration of @p
+ * has not finished (p->conc_move_seq is odd, see __conc_attach_check()). It
+ * was checked with the old policy, and the destination may count. The caller
+ * must then drop its locks, call conc_dl_wait() and check again.
+ */
+int conc_dl_admit(struct task_struct *p)
+{
+	lockdep_assert_held(&p->pi_lock);
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return 0;
+	if (READ_ONCE(task_group(p)->conc.active)) {
+		trace_sched_conc_refuse(p, "sched_setattr", "SCHED_DEADLINE under a limit", -EPERM);
+		return -EPERM;
+	}
+	if (p->conc_move_seq & 1)
+		return -EAGAIN;
+	return 0;
+}
+
+/*
+ * Wait for the migration of @p which made conc_dl_admit() return -EAGAIN.
+ * Call with no lock held.
+ */
+void conc_dl_wait(struct task_struct *p)
+{
+	unsigned int seq = READ_ONCE(p->conc_move_seq);
+
+	if (seq & 1)
+		wait_event(conc_attach_wq, READ_ONCE(p->conc_move_seq) != seq);
+}
+
+/*
  * Handle the exit of task @p. Called from the release callback of the cpu
  * controller.
  */
@@ -5271,10 +5380,30 @@ void conc_attach_finish(struct cgroup_taskset *tset, bool retry)
 	struct cgroup_subsys_state *css, *last = NULL;
 	struct conc_attach_src *src, *tmp;
 	struct task_struct *task;
+	bool checked = false;
+
+	/*
+	 * The tasks are in place. Make conc_move_seq even again. A change of
+	 * policy which waits for it then checks the task where it is
+	 * (conc_dl_admit()).
+	 */
+	cgroup_taskset_for_each(task, css, tset) {
+		/*
+		 * Only the check of this migration made the count odd. That
+		 * check and this code both run under cgroup_mutex. So read
+		 * the count without p->pi_lock. A migration then costs
+		 * nothing more while no group has a limit.
+		 */
+		if (!(READ_ONCE(task->conc_move_seq) & 1))
+			continue;
+		scoped_guard(raw_spinlock_irq, &task->pi_lock)
+			WRITE_ONCE(task->conc_move_seq, task->conc_move_seq + 1);
+		checked = true;
+	}
 
 	/* The retries below may set-move again. */
 	current->conc_attaching = 0;
-	if (atomic_dec_and_test(&conc_attach_pending))
+	if (atomic_dec_and_test(&conc_attach_pending) || checked)
 		wake_up(&conc_attach_wq);
 
 	if (retry && static_branch_unlikely(&sched_conc_enabled)) {
@@ -5311,6 +5440,9 @@ void conc_attach_finish(struct cgroup_taskset *tset, bool retry)
  * Handle a write to cpu.concurrency.max. @limit is the value written, 0 for
  * "max". Return 0 or a negative error code.
  *
+ * The write does not fail because of the masks of the tasks. It can fail
+ * because of the deadline tasks of the subtree, see conc_subtree_dl_start().
+ *
  * A group with a ceiling has it since its creation (conc_tg_take_ceiling())
  * and counts already. A write to such a group starts nothing.
  *
@@ -5342,17 +5474,32 @@ static int conc_set_request(struct task_group *tg, unsigned int limit)
 
 	start = limit && !conc_active(&tg->conc);
 again:
+	/*
+	 * Take cpuset_mutex before conc_mutex, as a cpuset write does. The
+	 * deadline checks below need it. A change of a partition root, a
+	 * change of policy and the start of a limit then exclude each other.
+	 *
+	 * Use cpuset_lock_no_attach(): conc_wait_attach() below waits for
+	 * migrations with these locks held, as a set-move does.
+	 */
+	conc_cfg_lock_settled();
 	mutex_lock(&conc_mutex);
 	if (start && conc_scx_active) {
 		ret = -EBUSY;
 		goto out;
 	}
+	/*
+	 * Wait for the migrations which were checked before. The deadline
+	 * checks below then see their tasks in place.
+	 */
+	conc_wait_attach();
 	if (limit && !tg->conc.active && !start) {
 		/*
 		 * The limits of its ancestors went away meanwhile. This write
 		 * starts a limit after all.
 		 */
 		mutex_unlock(&conc_mutex);
+		conc_cfg_unlock();
 		start = true;
 		goto again;
 	}
@@ -5362,6 +5509,15 @@ again:
 	if (limit && ceil_eff && limit > ceil_eff) {
 		ret = -EINVAL;
 		goto out;
+	}
+	/*
+	 * The subtree starts to count. Check its deadline tasks, see
+	 * conc_subtree_dl_start().
+	 */
+	if (limit && !tg->conc.active) {
+		ret = conc_subtree_dl_start(tg);
+		if (ret)
+			goto out;
 	}
 	if (limit || ceiling || tg->parent->conc.active) {
 		ret = conc_subtree_state_alloc(tg);
@@ -5384,6 +5540,7 @@ again:
 	conc_hold_kick();
 out:
 	mutex_unlock(&conc_mutex);
+	conc_cfg_unlock();
 
 	/*
 	 * Keep one reference per group with a limit or a ceiling. If the
@@ -5691,13 +5848,62 @@ int cpu_concurrency_effective_show(struct seq_file *sf, void *v)
 }
 
 /*
+ * Check a migration in the can_attach() of the cpu controller. Return 0 or
+ * -EBUSY.
+ *
+ * Refuse a deadline task bound for a counting group. Only a change of group
+ * can bring a deadline task under a limit.
+ *
+ * The policy is read under p->pi_lock. conc_move_seq of each checked task is
+ * odd until the migration ends (conc_attach_finish()). A change of policy
+ * waits for an even count (conc_dl_admit()).
+ *
  * Count an accepted migration as pending, see conc_wait_attach().
  */
 static int __conc_attach_check(struct cgroup_taskset *tset)
 {
+	struct cgroup_subsys_state *css;
+	struct task_struct *task, *refused = NULL;
+
 	guard(mutex)(&conc_mutex);
-	conc_attach_begin();
-	return 0;
+	/*
+	 * The static key went off since conc_attach_check() read it. No group
+	 * counts any more. Only count the migration as pending. Do it under
+	 * conc_mutex, where a limit which starts reads the count.
+	 */
+	if (!static_branch_unlikely(&sched_conc_enabled)) {
+		conc_attach_begin();
+		return 0;
+	}
+	cgroup_taskset_for_each(task, css, tset) {
+		struct task_group *tg = css_tg(css);
+
+		guard(raw_spinlock_irq)(&task->pi_lock);
+		if (READ_ONCE(tg->conc.active) && conc_dl_task(task)) {
+			trace_sched_conc_refuse(task, "cgroup migration", "a SCHED_DEADLINE task",
+					      -EBUSY);
+			refused = task;
+			break;
+		}
+		WRITE_ONCE(task->conc_move_seq, task->conc_move_seq + 1);
+	}
+	if (!refused) {
+		conc_attach_begin();
+		return 0;
+	}
+	/*
+	 * The migration is refused. cgroup core calls neither attach() nor
+	 * cancel_attach() for it. Make conc_move_seq of the tasks checked
+	 * before the refused one even again here.
+	 */
+	cgroup_taskset_for_each(task, css, tset) {
+		if (task == refused)
+			break;
+		scoped_guard(raw_spinlock_irq, &task->pi_lock)
+			WRITE_ONCE(task->conc_move_seq, task->conc_move_seq + 1);
+	}
+	wake_up(&conc_attach_wq);
+	return -EBUSY;
 }
 
 /*

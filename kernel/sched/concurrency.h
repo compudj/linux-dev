@@ -275,6 +275,8 @@ extern int conc_pick_dest(struct task_struct *p, const struct cpumask *valid,
 			const struct cpumask *allowed, struct affinity_context *ctx);
 extern void conc_task_affinity_changed(struct task_struct *p, struct affinity_context *ctx);
 extern void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx);
+extern int conc_dl_admit(struct task_struct *p);
+extern void conc_dl_wait(struct task_struct *p);
 
 /* The rotation period, see conc_rotate_for(). Set from debugfs. */
 extern unsigned int conc_rotation_ms;
@@ -406,6 +408,10 @@ static inline void conc_task_affinity_changed(struct task_struct *p,
 					      struct affinity_context *ctx) { }
 
 static inline void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx) { }
+
+static inline int conc_dl_admit(struct task_struct *p) { return 0; }
+
+static inline void conc_dl_wait(struct task_struct *p) { }
 
 static inline int conc_tg_prepare(struct task_group *tg, struct task_group *parent) { return 0; }
 
