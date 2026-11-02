@@ -304,6 +304,134 @@ static void dl_task_release_bw(struct task_struct *p)
 	dl_se->dl_bw_gen = dl_bw_gen;
 }
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+static u64 dl_server_read_bw(int cpu);
+
+/*
+ * The bandwidth of @dl_b's deadline tasks: its total less the servers it
+ * counts, those of its active CPUs (dl_server_add_bw()). The largest of
+ * these, or @srv_max if larger, goes in @srv_max.
+ */
+static u64 __dl_tasks_bw(struct dl_bw *dl_b, u64 *srv_max)
+{
+	struct root_domain *rd = container_of(dl_b, struct root_domain, dl_bw);
+	u64 servers = 0;
+	int i;
+
+	for_each_cpu_and(i, rd->span, cpu_active_mask) {
+		u64 bw = dl_server_read_bw(i);
+
+		servers += bw;
+		*srv_max = max(*srv_max, bw);
+	}
+	return dl_b->total_bw > servers ? dl_b->total_bw - servers : 0;
+}
+
+/*
+ * A partition root under a concurrency limit keeps its deadline tasks on
+ * at most rd->conc_dl_cpus CPUs at once, wherever they are in its root
+ * domain (conc_dl_update_cap()): admit them against that many, each CPU
+ * keeping the share of the largest server, since only the servers of the
+ * CPUs they use compete with them. __dl_overflow() counts every CPU's
+ * server against every CPU, which would leave a wide partition with a
+ * small limit nearly nothing. Checked beside it: @cap is the capacity the
+ * caller checks against, @bw the per-CPU limit, @tsk_old and @tsk_new the
+ * task bandwidth it trades, @srv_new a server bandwidth it sets.
+ */
+static bool __dl_conc_overflow_bw(struct dl_bw *dl_b, unsigned long cap, u64 bw,
+				  u64 tsk_old, u64 tsk_new, u64 srv_new)
+{
+	struct root_domain *rd = container_of(dl_b, struct root_domain, dl_bw);
+	unsigned long n = rd->conc_dl_cpus;
+	u64 srv_max = srv_new;
+	s64 tasks;
+
+	if (!n || bw == (u64)-1)
+		return false;
+	n = min(n, cap >> SCHED_CAPACITY_SHIFT);
+	tasks = (s64)__dl_tasks_bw(dl_b, &srv_max) - (s64)tsk_old + (s64)tsk_new;
+	if (tasks <= 0)
+		return false;
+	return bw <= srv_max || tasks > n * (bw - srv_max);
+}
+
+static inline bool __dl_conc_overflow(struct dl_bw *dl_b, unsigned long cap,
+				      u64 tsk_old, u64 tsk_new, u64 srv_new)
+{
+	return __dl_conc_overflow_bw(dl_b, cap, dl_b->bw, tsk_old, tsk_new, srv_new);
+}
+
+/**
+ * dl_conc_set_cpus - cap the CPUs the deadline tasks of a root domain use
+ * @cpu: a CPU of the root domain
+ * @n: the CPUs its deadline tasks may use at once, 0 for all
+ * @check: refuse a cap that the bandwidth admitted would overflow
+ *
+ * Return: 0, or -EBUSY with @check when the deadline tasks admitted in
+ * the root domain do not fit @n CPUs, see __dl_conc_overflow(); the cap
+ * is then left as it was.
+ */
+int dl_conc_set_cpus(int cpu, unsigned int n, bool check)
+{
+	struct root_domain *rd;
+	unsigned long flags;
+	unsigned int old;
+	int ret = 0;
+
+	rcu_read_lock_sched();
+	rd = cpu_rq(cpu)->rd;
+	raw_spin_lock_irqsave(&rd->dl_bw.lock, flags);
+	old = rd->conc_dl_cpus;
+	rd->conc_dl_cpus = n;
+	if (check && n && __dl_conc_overflow(&rd->dl_bw, dl_bw_capacity(cpu), 0, 0, 0)) {
+		rd->conc_dl_cpus = old;
+		ret = -EBUSY;
+	}
+	raw_spin_unlock_irqrestore(&rd->dl_bw.lock, flags);
+	rcu_read_unlock_sched();
+	return ret;
+}
+
+/* The cap of @cpu's root domain, see dl_conc_set_cpus(). */
+unsigned int dl_conc_cpus(int cpu)
+{
+	unsigned int n;
+
+	rcu_read_lock_sched();
+	n = READ_ONCE(cpu_rq(cpu)->rd->conc_dl_cpus);
+	rcu_read_unlock_sched();
+	return n;
+}
+
+/* Does @cpu's root domain hold deadline task bandwidth, its servers' aside? */
+bool dl_conc_rd_busy(int cpu)
+{
+	u64 srv_max = 0, tasks;
+	struct dl_bw *dl_b;
+	unsigned long flags;
+
+	rcu_read_lock_sched();
+	dl_b = dl_bw_of(cpu);
+	raw_spin_lock_irqsave(&dl_b->lock, flags);
+	tasks = __dl_tasks_bw(dl_b, &srv_max);
+	raw_spin_unlock_irqrestore(&dl_b->lock, flags);
+	rcu_read_unlock_sched();
+	return tasks;
+}
+#else /* !CONFIG_SCHED_MAX_CONCURRENCY */
+static inline bool __dl_conc_overflow_bw(struct dl_bw *dl_b, unsigned long cap, u64 bw,
+					 u64 tsk_old, u64 tsk_new, u64 srv_new)
+{
+	return false;
+}
+
+static inline bool __dl_conc_overflow(struct dl_bw *dl_b, unsigned long cap,
+				      u64 tsk_old, u64 tsk_new, u64 srv_new)
+{
+	return false;
+}
+#endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
+
 static inline
 void __add_running_bw(u64 dl_bw, struct dl_rq *dl_rq)
 {
@@ -2083,7 +2211,8 @@ int dl_server_apply_params(struct sched_dl_entity *dl_se, u64 runtime, u64 perio
 	cpus = dl_bw_cpus(cpu);
 	cap = dl_bw_capacity(cpu);
 
-	if (__dl_overflow(dl_b, cap, old_bw, new_bw))
+	if (__dl_overflow(dl_b, cap, old_bw, new_bw) ||
+	    __dl_conc_overflow(dl_b, cap, 0, 0, new_bw))
 		return -EBUSY;
 
 	if (init) {
@@ -4129,7 +4258,8 @@ int sched_dl_global_validate(void)
 		cpus = dl_bw_cpus(cpu);
 
 		raw_spin_lock_irqsave(&dl_b->lock, flags);
-		if (new_bw * cpus < dl_b->total_bw)
+		if (new_bw * cpus < dl_b->total_bw ||
+		    __dl_conc_overflow_bw(dl_b, dl_bw_capacity(cpu), new_bw, 0, 0, 0))
 			ret = -EBUSY;
 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
 
@@ -4206,6 +4336,7 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 	struct dl_bw *dl_b;
 	unsigned long cap;
 	bool counted;
+	u64 old_bw;
 
 	if (attr->sched_flags & SCHED_FLAG_SUGOV)
 		return 0;
@@ -4224,6 +4355,7 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 	 */
 	counted = task_has_dl_policy(p) && p->dl.dl_bw_cpu >= 0 &&
 		  p->dl.dl_bw_gen == dl_bw_gen;
+	old_bw = counted ? p->dl.dl_bw : 0;
 	cpu = counted ? p->dl.dl_bw_cpu : task_cpu(p);
 	dl_b = dl_bw_of(cpu);
 
@@ -4237,12 +4369,13 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 	cap = dl_bw_capacity(cpu);
 
 	if (dl_policy(policy) && !task_has_dl_policy(p) &&
-	    !__dl_overflow(dl_b, cap, 0, new_bw)) {
+	    !__dl_overflow(dl_b, cap, 0, new_bw) &&
+	    !__dl_conc_overflow(dl_b, cap, 0, new_bw, 0)) {
 		__dl_add(dl_b, new_bw, cpus);
 		err = 0;
 	} else if (dl_policy(policy) && task_has_dl_policy(p) &&
-		   !__dl_overflow(dl_b, cap, counted ? p->dl.dl_bw : 0,
-				  new_bw)) {
+		   !__dl_overflow(dl_b, cap, old_bw, new_bw) &&
+		   !__dl_conc_overflow(dl_b, cap, old_bw, new_bw, 0)) {
 		/*
 		 * XXX this is slightly incorrect: when the task
 		 * utilization decreases, we should delay the total
@@ -4480,7 +4613,7 @@ int dl_cpuset_cpumask_can_shrink(const struct cpumask *cur,
 	cur_dl_b = dl_bw_of(cpumask_any(cur));
 	cap = __dl_bw_capacity(trial);
 	raw_spin_lock_irqsave(&cur_dl_b->lock, flags);
-	if (__dl_overflow(cur_dl_b, cap, 0, 0))
+	if (__dl_overflow(cur_dl_b, cap, 0, 0) || __dl_conc_overflow(cur_dl_b, cap, 0, 0, 0))
 		ret = 0;
 	raw_spin_unlock_irqrestore(&cur_dl_b->lock, flags);
 	rcu_read_unlock_sched();
@@ -4511,7 +4644,8 @@ static int dl_bw_manage(enum dl_bw_request req, int cpu, u64 dl_bw)
 		__dl_sub(dl_b, dl_bw, dl_bw_cpus(cpu));
 		break;
 	case dl_bw_req_alloc:
-		overflow = __dl_overflow(dl_b, cap, 0, dl_bw);
+		overflow = __dl_overflow(dl_b, cap, 0, dl_bw) ||
+			   __dl_conc_overflow(dl_b, cap, 0, dl_bw, 0);
 
 		if (!overflow) {
 			/*
@@ -4551,7 +4685,8 @@ static int dl_bw_manage(enum dl_bw_request req, int cpu, u64 dl_bw)
 			 * yet, so account for that.
 			 */
 			if (dl_bw_cpus(cpu) - 1)
-				overflow = __dl_overflow(dl_b, cap, dl_server_bw, 0);
+				overflow = __dl_overflow(dl_b, cap, dl_server_bw, 0) ||
+					   __dl_conc_overflow(dl_b, cap, 0, 0, 0);
 			else
 				overflow = 1;
 		}

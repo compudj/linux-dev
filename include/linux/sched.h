@@ -2606,6 +2606,8 @@ extern int conc_cpuset_check(struct cgroup_subsys_state *css,
 extern int conc_cpuset_busy(struct cgroup_subsys_state *css,
 			  bool (*in)(struct cgroup_subsys_state *css));
 extern bool conc_cpuset_active(void);
+extern void conc_dl_rebuild_caps(void);
+extern bool conc_dl_domain_busy(struct cgroup *cgrp);
 extern void conc_fatal_signal(struct task_struct *t);
 extern void conc_hold_resume(void);
 extern void sched_cid_resume(void);
@@ -2639,6 +2641,11 @@ static inline int conc_cpuset_busy(struct cgroup_subsys_state *css,
 	return 0;
 }
 static inline bool conc_cpuset_active(void)
+{
+	return false;
+}
+static inline void conc_dl_rebuild_caps(void) { }
+static inline bool conc_dl_domain_busy(struct cgroup *cgrp)
 {
 	return false;
 }

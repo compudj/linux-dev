@@ -88,6 +88,8 @@ extern void cpuset_css_cpus_configured_rcu(struct cgroup_subsys_state *css,
 extern bool cpuset_css_cpus_fixed_rcu(struct cgroup_subsys_state *css);
 extern int cpuset_conc_check_subtree(struct cgroup *cgrp);
 extern void cpuset_conc_sync(void);
+extern int cpuset_conc_root_partition(struct cgroup *cgrp, const struct cpumask *mask,
+				      bool *covers);
 extern bool cpuset_cpus_allowed_fallback(struct task_struct *p);
 extern int cpuset_num_cpus(struct cgroup *cgroup);
 extern nodemask_t cpuset_mems_allowed(struct task_struct *p);
