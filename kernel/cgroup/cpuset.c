@@ -993,21 +993,14 @@ void dl_rebuild_rd_accounting(void)
 {
 	struct cpuset *cs = NULL;
 	struct cgroup_subsys_state *pos_css;
-	int cpu;
-	u64 cookie = ++dl_cookie;
 
 	lockdep_assert_cpuset_lock_held();
 	lockdep_assert_cpus_held();
 	lockdep_assert_held(&sched_domains_mutex);
 
+	dl_clear_root_domains();
+
 	rcu_read_lock();
-
-	for_each_possible_cpu(cpu) {
-		if (dl_bw_visited(cpu, cookie))
-			continue;
-
-		dl_clear_root_domain_cpu(cpu);
-	}
 
 	cpuset_for_each_descendant_pre(cs, pos_css, &top_cpuset) {
 
