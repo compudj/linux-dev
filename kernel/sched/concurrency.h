@@ -245,6 +245,10 @@ extern bool conc_affinity_lock(struct task_struct *p, struct affinity_context *c
 extern void conc_affinity_unlock(struct task_struct *p, bool locked);
 extern int conc_dl_admit(struct task_struct *p);
 extern void conc_dl_wait(struct task_struct *p);
+/* deadline.c's, for the deadline domains of concurrency.c. */
+extern int dl_conc_set_cpus(int cpu, unsigned int n, bool check);
+extern unsigned int dl_conc_cpus(int cpu);
+extern bool dl_conc_rd_busy(int cpu);
 
 /*
  * A migration of @p judged its mask after @ctx's change was judged, see

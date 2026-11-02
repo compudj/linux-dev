@@ -1070,6 +1070,9 @@ void dl_rebuild_rd_accounting(void)
 		css_put(&cs->css);
 	}
 	rcu_read_unlock();
+
+	/* The root domains are new: their deadline caps, see dl_conc_set_cpus(). */
+	conc_dl_rebuild_caps();
 }
 
 /*
@@ -3697,6 +3700,15 @@ static ssize_t cpuset_partition_write(struct kernfs_open_file *of, char *buf,
 
 			retval = cpuset_conc_judge(cs, cs->cpus_allowed, cs->exclusive_cpus, val);
 			/*
+			 * A partition root a concurrency limit admits deadline
+			 * tasks in keeps its root domain while it holds them:
+			 * they were admitted against its limit, and would be
+			 * left under it in another, see conc_dl_domain_busy().
+			 */
+			if (!retval && cs->partition_root_state == PRS_ROOT &&
+			    conc_dl_domain_busy(cs->css.cgroup))
+				retval = -EBUSY;
+			/*
 			 * A new partition root a concurrency limit refuses is
 			 * created invalid, with the reason, see cpuset_conc_judge():
 			 * from a member, or a root refused before, which claims
@@ -4770,6 +4782,40 @@ static int cpuset_conc_check_literal(const struct cpuset_conc_view *v)
 	}
 	return 0;
 }
+
+/**
+ * cpuset_conc_root_partition - is @cgrp a root domain of its own?
+ * @cgrp: a cgroup
+ * @mask: a mask to test, or NULL
+ * @covers: whether @mask contains every effective CPU of the partition
+ *
+ * For a cgroup whose own cpuset is a valid partition root of the
+ * load-balanced kind ("root", not "isolated"), which the scheduler gives
+ * a root domain of its own; never the top cpuset. Under RCU, and stable
+ * under cpuset_mutex.
+ *
+ * Return: an active CPU of the partition, or -1 when it is none or has
+ * no active CPU.
+ */
+int cpuset_conc_root_partition(struct cgroup *cgrp, const struct cpumask *mask, bool *covers)
+{
+	struct cgroup_subsys_state *css = cgroup_css(cgrp, &cpuset_cgrp_subsys);
+	struct cpuset *cs;
+	int cpu;
+
+	if (!css)
+		return -1;
+	cs = css_cs(css);
+	if (cs == &top_cpuset || cs->partition_root_state != PRS_ROOT)
+		return -1;
+	cpu = cpumask_first_and(cs->effective_cpus, cpu_active_mask);
+	if (cpu >= nr_cpu_ids)
+		return -1;
+	if (mask)
+		*covers = cpumask_subset(cs->effective_cpus, mask);
+	return cpu;
+}
+
 /**
  * cpuset_conc_check_subtree - may the cgroup subtree of @cgrp start counting?
  * @cgrp: the cgroup a concurrency limit is being set on
