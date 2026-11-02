@@ -1928,19 +1928,240 @@ static inline bool conc_dl_task(struct task_struct *p)
 }
 
 /*
- * Check the deadline tasks of the subtree of @tg, on which a limit starts.
- * Return 0 if the limit may start, or a negative error code. The caller
- * holds cpuset_mutex and conc_mutex.
+ * Deadline domains. See "SCHED_DEADLINE" in
+ * Documentation/scheduler/sched-max-concurrency.rst.
  *
- * A deadline task (conc_dl_task()) is refused.
+ * A deadline domain is a partition root with a limit and no counting group
+ * above it. Its tasks are on at most N CPUs at once, where N is its effective
+ * limit. All these CPUs are in its own root domain. So its deadline tasks are
+ * admitted against N CPUs. The root domain is capped at N
+ * (dl_conc_set_cpus()). The checks of the deadline class then hold.
+ *
+ * A deadline task of any other counting group stays refused (conc_dl_task()).
+ *
+ * The functions below read state which is stable under cpuset_mutex. Every
+ * deadline admission, every limit write and every check of a migration into
+ * a counting group holds it.
  */
-static int conc_subtree_dl_start(struct task_group *tg)
+
+/*
+ * Return the topmost counting group at or above @tg, or NULL if @tg does not
+ * count.
+ */
+static struct task_group *conc_top_group(struct task_group *tg)
+{
+	struct task_group *top = NULL;
+
+	for (; tg && conc_active(&tg->conc); tg = tg->parent)
+		top = tg;
+	return top;
+}
+
+/*
+ * Check whether @top, a topmost counting group, can be a deadline domain. It
+ * must be a partition root with a root domain of its own, on CPUs of equal
+ * capacity. Call under RCU.
+ *
+ * Return: an active CPU of its root domain, or -1 if @top cannot be a
+ * deadline domain.
+ */
+static int conc_dl_domain_rcu(struct task_group *top)
+{
+	if (top == &root_task_group || sched_asym_cpucap_active())
+		return -1;
+	return cpuset_conc_root_partition(top->css.cgroup);
+}
+
+/*
+ * Return true if a SCHED_DEADLINE task may be in @tg on CPU @cpu.
+ *
+ * If @tg does not count, it may. If @tg counts, all of these must hold:
+ *
+ *  - the topmost counting group above @tg can be a deadline domain;
+ *  - the root domain of @cpu is the root domain of that group, and is capped
+ *    at the effective limit of that group (conc_dl_update_cap());
+ *  - no group between @tg and that group bounds its tasks to fewer CPUs.
+ *
+ * The masks of the other tasks of the domain are not checked. A task with a
+ * narrower mask is served by the rotation, see conc_rotate_for(). It takes
+ * the slot of a lower class at once, and the slot of its own class after a
+ * rotation period.
+ *
+ * This does not check the bandwidth. The deadline class admits it against the
+ * cap. The caller holds cpuset_mutex.
+ */
+static bool conc_dl_allowed(struct task_group *tg, int cpu)
+{
+	struct task_group *top = conc_top_group(tg), *g;
+	int dcpu;
+
+	lockdep_assert_cpuset_lock_held();
+	if (!top)
+		return true;
+	scoped_guard(rcu)
+		dcpu = conc_dl_domain_rcu(top);
+	if (dcpu < 0 || cpu < 0 || cpu >= nr_cpu_ids ||
+	    cpu_rq(cpu)->rd != cpu_rq(dcpu)->rd || dl_conc_cpus(dcpu) != top->conc.effective)
+		return false;
+	for (g = tg; g != top; g = g->parent) {
+		if (g->conc.effective != top->conc.effective)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Set the deadline cap of the root domain of @top to @n CPUs, 0 for no cap.
+ * Do nothing unless @top is a partition root. With @check, return -EBUSY and
+ * leave the cap as it was if the bandwidth admitted there would not fit. The
+ * caller holds cpuset_mutex.
+ */
+static int conc_dl_set_cap(struct task_group *top, unsigned int n, bool check)
+{
+	int cpu = -1;
+
+	lockdep_assert_cpuset_lock_held();
+	if (top == &root_task_group)
+		return 0;
+	scoped_guard(rcu)
+		cpu = cpuset_conc_root_partition(top->css.cgroup);
+	if (cpu < 0)
+		return 0;
+	if (sched_asym_cpucap_active())
+		n = 0;
+	return dl_conc_set_cpus(cpu, n, check);
+}
+
+/*
+ * Set the cap which the root domain of @tg should have now. It is the
+ * effective limit of @tg when @tg is the topmost counting group, and no cap
+ * otherwise. See conc_dl_set_cap().
+ */
+static void conc_dl_update_cap(struct task_group *tg)
+{
+	bool top = tg->parent && conc_active(&tg->conc) && !conc_active(&tg->parent->conc);
+
+	conc_dl_set_cap(tg, top ? tg->conc.effective : 0, false);
+}
+
+/**
+ * conc_dl_rebuild_caps - set the deadline caps of every root domain
+ *
+ * Called from dl_rebuild_rd_accounting(), after the root domains were
+ * rebuilt. Clear the cap of every root domain. Then set the cap of each
+ * deadline domain.
+ *
+ * The caller holds cpuset_mutex, as every deadline admission and every limit
+ * write does. It also holds the hotplug lock, so no CPU goes offline
+ * meanwhile (dl_bw_deactivate()).
+ */
+void conc_dl_rebuild_caps(void)
+{
+	struct cgroup_subsys_state *css;
+	int cpu;
+
+	lockdep_assert_cpuset_lock_held();
+	/*
+	 * No group has a limit or a ceiling, so no root domain has a cap. The
+	 * last limit write cleared its own.
+	 */
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return;
+	for_each_possible_cpu(cpu)
+		dl_conc_set_cpus(cpu, 0, false);
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &root_task_group.css) {
+		struct task_group *tg = css_tg(css);
+
+		if (tg == &root_task_group || !conc_active(&tg->conc))
+			continue;
+		/*
+		 * @tg is a topmost counting group. No group below it can be a
+		 * domain.
+		 */
+		conc_dl_update_cap(tg);
+		css = css_rightmost_descendant(css);
+	}
+	rcu_read_unlock();
+}
+
+/*
+ * Return true if the cpu group of @cgrp is a deadline domain which holds
+ * deadline tasks. Its partition root must then stay one, see
+ * cpuset_partition_write(). The caller holds cpuset_mutex.
+ */
+bool conc_dl_domain_busy(struct cgroup *cgrp)
+{
+	struct cgroup_subsys_state *css;
+	struct task_group *tg;
+	int cpu = -1;
+
+	if (!static_branch_unlikely(&sched_conc_enabled))
+		return false;
+	lockdep_assert_cpuset_lock_held();
+	scoped_guard(rcu) {
+		css = cgroup_css(cgrp, &cpu_cgrp_subsys);
+		tg = css ? css_tg(css) : NULL;
+		if (tg && conc_top_group(tg) == tg)
+			cpu = conc_dl_domain_rcu(tg);
+	}
+	return cpu >= 0 && dl_conc_cpus(cpu) && dl_conc_rd_busy(cpu);
+}
+
+/*
+ * Set @found to whether the subtree of @tg holds a deadline task
+ * (conc_dl_task()). Return 0 or a negative error code.
+ */
+static int conc_subtree_dl(struct task_group *tg, bool *found)
 {
 	struct cgroup_subsys_state **csses;
 	struct css_task_iter it;
 	struct task_struct *t;
 	int ret, nr_css, k;
 
+	*found = false;
+	ret = conc_subtree_snapshot(tg, &csses, &nr_css);
+	if (ret)
+		return ret;
+	for (k = 0; k < nr_css && !*found; k++) {
+		if (!csses[k])
+			continue;
+		css_task_iter_start(csses[k], 0, &it);
+		while (!*found && (t = css_task_iter_next(&it))) {
+			guard(raw_spinlock_irq)(&t->pi_lock);
+			*found = conc_dl_task(t);
+		}
+		css_task_iter_end(&it);
+	}
+	conc_subtree_release(csses, nr_css);
+	return 0;
+}
+
+/*
+ * Check the deadline tasks of the subtree of @tg, on which a limit starts.
+ * Return 0 if the limit may start, or a negative error code. The caller
+ * holds cpuset_mutex and conc_mutex.
+ *
+ * A deadline task (conc_dl_task()) is refused unless @tg can be a deadline
+ * domain (conc_dl_allowed()). This needs:
+ *
+ *  - @tg is a partition root;
+ *  - the task is in the root domain of @tg;
+ *  - no group between the task and @tg counts.
+ *
+ * Set @dl to true if a deadline task was found. The caller then checks the
+ * bandwidth against the limit (conc_dl_set_cap()).
+ */
+static int conc_subtree_dl_start(struct task_group *tg, bool *dl)
+{
+	struct cgroup_subsys_state **csses;
+	struct css_task_iter it;
+	struct task_struct *t;
+	int ret, nr_css, k, dcpu;
+
+	*dl = false;
+	scoped_guard(rcu)
+		dcpu = conc_dl_domain_rcu(tg);
 	ret = conc_subtree_snapshot(tg, &csses, &nr_css);
 	if (ret)
 		return ret;
@@ -1949,12 +2170,21 @@ static int conc_subtree_dl_start(struct task_group *tg)
 			continue;
 		css_task_iter_start(csses[k], 0, &it);
 		while (!ret && (t = css_task_iter_next(&it))) {
+			struct task_group *g;
+			bool below = false;
+
 			guard(raw_spinlock_irq)(&t->pi_lock);
 			if (!conc_dl_task(t))
 				continue;
-			trace_sched_conc_refuse(t, "cpu.concurrency.max",
-					      "a SCHED_DEADLINE task", -EBUSY);
-			ret = -EBUSY;
+			/* A group below with a ceiling counts already. */
+			for (g = task_group(t); g && g != tg; g = g->parent)
+				below |= conc_active(&g->conc);
+			if (dcpu < 0 || below || cpu_rq(task_cpu(t))->rd != cpu_rq(dcpu)->rd) {
+				trace_sched_conc_refuse(t, "cpu.concurrency.max",
+						      "a SCHED_DEADLINE task", -EBUSY);
+				ret = -EBUSY;
+			}
+			*dl = true;
 		}
 		css_task_iter_end(&it);
 	}
@@ -5269,6 +5499,8 @@ void conc_task_affinity_changed(struct task_struct *p, struct affinity_context *
  * roots and against the deadline admission. CONFIG_SCHED_MAX_CONCURRENCY
  * depends on CONFIG_CPUSETS for this.
  */
+static inline void conc_cfg_lock(void) { cpuset_lock(); }
+
 static inline void conc_cfg_lock_settled(void) { cpuset_lock_no_attach(); }
 
 static inline void conc_cfg_unlock(void) { cpuset_unlock(); }
@@ -5279,29 +5511,32 @@ static inline void conc_cfg_unlock(void) { cpuset_unlock(); }
  *     SCHED_DEADLINE which the deadline admission sees (admission on, not
  *     SCHED_FLAG_SUGOV). It holds task_rq_lock() and cpuset_mutex.
  *
- * A deadline task is not allowed in a group which counts, see conc_dl_task().
+ * In a group which counts, a deadline task is only allowed in a deadline
+ * domain (conc_dl_allowed()). The deadline class then admits its bandwidth
+ * against the cap of the root domain.
  *
  * A limit which starts is serialized by cpuset_mutex. It finds the task with
  * or without the deadline policy (conc_subtree_dl_start()). A migration
  * checked after this call reads the new policy (__conc_attach_check()).
  *
- * Return: 0 if @p may become a deadline task. -EPERM if its group counts, as
- * for an affinity narrower than the root domain. -EAGAIN if a migration of @p
- * has not finished (p->conc_move_seq is odd, see __conc_attach_check()). It
- * was checked with the old policy, and the destination may count. The caller
- * must then drop its locks, call conc_dl_wait() and check again.
+ * Return: 0 if @p may become a deadline task. -EPERM if its group counts and
+ * the task is not allowed there, as for an affinity narrower than the root
+ * domain. -EAGAIN if a migration of @p has not finished (p->conc_move_seq is
+ * odd, see __conc_attach_check()). It was checked with the old policy, and the
+ * destination may count. The caller must then drop its locks, call
+ * conc_dl_wait() and check again.
  */
 int conc_dl_admit(struct task_struct *p)
 {
 	lockdep_assert_held(&p->pi_lock);
 	if (!static_branch_unlikely(&sched_conc_enabled))
 		return 0;
-	if (READ_ONCE(task_group(p)->conc.active)) {
+	if (p->conc_move_seq & 1)
+		return -EAGAIN;
+	if (READ_ONCE(task_group(p)->conc.active) && !conc_dl_allowed(task_group(p), task_cpu(p))) {
 		trace_sched_conc_refuse(p, "sched_setattr", "SCHED_DEADLINE under a limit", -EPERM);
 		return -EPERM;
 	}
-	if (p->conc_move_seq & 1)
-		return -EAGAIN;
 	return 0;
 }
 
@@ -5452,9 +5687,10 @@ void conc_attach_finish(struct cgroup_taskset *tset, bool retry)
  */
 static int conc_set_request(struct task_group *tg, unsigned int limit)
 {
-	unsigned int ceiling = tg->conc.ceiling, ceil_eff = ceiling;
+	unsigned int ceiling = tg->conc.ceiling, ceil_eff = ceiling, bound;
+	struct cgroup_subsys_state *css;
+	bool was, now, start, dl = false;
 	struct cpumask *scratch;
-	bool was, now, start;
 	int ret = 0;
 
 	scratch = conc_alloc_scratch();
@@ -5515,7 +5751,35 @@ again:
 	 * conc_subtree_dl_start().
 	 */
 	if (limit && !tg->conc.active) {
-		ret = conc_subtree_dl_start(tg);
+		ret = conc_subtree_dl_start(tg, &dl);
+		if (ret)
+			goto out;
+	}
+	/*
+	 * Deadline tasks are admitted against the effective limit of their
+	 * deadline domain (conc_dl_allowed()). So that limit must not drop
+	 * below their bandwidth. A limit which starts over deadline tasks
+	 * makes their root domain a deadline domain. Check the bandwidth and
+	 * set the cap first (conc_dl_set_cap()). A limit inside a domain must
+	 * not bound the deadline tasks to fewer CPUs.
+	 */
+	bound = limit ? (ceil_eff ? min(limit, ceil_eff) : limit) : ceil_eff;
+	if (!tg->parent->conc.active) {
+		if (bound && (dl || (tg->conc.active && bound < tg->conc.effective))) {
+			ret = conc_dl_set_cap(tg, bound, true);
+			if (ret) {
+				trace_sched_conc_refuse(current, "cpu.concurrency.max",
+						      "under the SCHED_DEADLINE bandwidth", ret);
+				goto out;
+			}
+		}
+	} else if (limit && bound < conc_top_group(tg)->conc.effective) {
+		ret = conc_subtree_dl(tg, &dl);
+		if (!ret && dl) {
+			trace_sched_conc_refuse(current, "cpu.concurrency.max",
+					      "a SCHED_DEADLINE task below", -EBUSY);
+			ret = -EBUSY;
+		}
 		if (ret)
 			goto out;
 	}
@@ -5539,6 +5803,16 @@ again:
 	conc_notify_tree(tg);
 	conc_hold_kick();
 out:
+	/*
+	 * Set the deadline caps of the partition roots of the subtree from
+	 * the effective limits. After a success these are the new values.
+	 * After a failure this restores a cap which was set above for the
+	 * check.
+	 */
+	scoped_guard(rcu) {
+		css_for_each_descendant_pre(css, &tg->css)
+			conc_dl_update_cap(css_tg(css));
+	}
 	mutex_unlock(&conc_mutex);
 	conc_cfg_unlock();
 
@@ -5633,6 +5907,8 @@ void conc_tg_online(struct task_group *tg)
 
 	if (!static_branch_unlikely(&sched_conc_enabled) || !tg->parent)
 		return;
+	/* The deadline cap below needs cpuset_mutex, taken before conc_mutex. */
+	conc_cfg_lock();
 	mutex_lock(&conc_mutex);
 	if (tg->conc.ceiling || conc_active(&tg->parent->conc)) {
 		/*
@@ -5642,6 +5918,7 @@ void conc_tg_online(struct task_group *tg)
 		if (WARN_ONCE(conc_tg_state_alloc(tg),
 			      "conc: no memory for css %d, which does not count\n", tg->css.id)) {
 			mutex_unlock(&conc_mutex);
+			conc_cfg_unlock();
 			return;
 		}
 		conc_update_tree(tg, &scratch);
@@ -5650,8 +5927,15 @@ void conc_tg_online(struct task_group *tg)
 		 * The file shows the values at once.
 		 */
 		conc_bounds_apply(tg);
+		/*
+		 * The cpu controller can be enabled for a cgroup which is a
+		 * partition root already. With a ceiling it is a deadline
+		 * domain from now on, and its root domain needs its cap.
+		 */
+		conc_dl_update_cap(tg);
 	}
 	mutex_unlock(&conc_mutex);
+	conc_cfg_unlock();
 }
 
 /*
@@ -5849,10 +6133,13 @@ int cpu_concurrency_effective_show(struct seq_file *sf, void *v)
 
 /*
  * Check a migration in the can_attach() of the cpu controller. Return 0 or
- * -EBUSY.
+ * -EBUSY. The caller holds cpuset_mutex.
  *
- * Refuse a deadline task bound for a counting group. Only a change of group
- * can bring a deadline task under a limit.
+ * Refuse a deadline task bound for a counting group, except into a deadline
+ * domain (conc_dl_allowed()). Only a change of group can bring a deadline
+ * task under a limit. The same migration may change the cpuset of the task.
+ * So the check uses a CPU of the destination cpuset
+ * (cgroup_taskset_cur_dst_css()).
  *
  * The policy is read under p->pi_lock. conc_move_seq of each checked task is
  * odd until the migration ends (conc_attach_finish()). A change of policy
@@ -5877,9 +6164,16 @@ static int __conc_attach_check(struct cgroup_taskset *tset)
 	}
 	cgroup_taskset_for_each(task, css, tset) {
 		struct task_group *tg = css_tg(css);
+		int cpu;
 
+		scoped_guard(rcu) {
+			struct cgroup_subsys_state *dst;
+
+			dst = cgroup_taskset_cur_dst_css(tset, cpuset_cgrp_id);
+			cpu = cpuset_css_active_cpu_rcu(dst);
+		}
 		guard(raw_spinlock_irq)(&task->pi_lock);
-		if (READ_ONCE(tg->conc.active) && conc_dl_task(task)) {
+		if (READ_ONCE(tg->conc.active) && conc_dl_task(task) && !conc_dl_allowed(tg, cpu)) {
 			trace_sched_conc_refuse(task, "cgroup migration", "a SCHED_DEADLINE task",
 					      -EBUSY);
 			refused = task;
@@ -5909,6 +6203,10 @@ static int __conc_attach_check(struct cgroup_taskset *tset)
 /*
  * Check a migration in the can_attach() of the cpu controller. Return 0 if it
  * is accepted, or a negative error code.
+ *
+ * Run the check under cpuset_mutex. The deadline check reads state which is
+ * stable under it (conc_dl_allowed()). cpuset_can_attach() ran before this
+ * and released the mutex.
  */
 int conc_attach_check(struct cgroup_taskset *tset)
 {
@@ -5935,7 +6233,9 @@ int conc_attach_check(struct cgroup_taskset *tset)
 	 */
 	if (atomic_dec_and_test(&conc_attach_pending))
 		wake_up(&conc_attach_wq);
+	conc_cfg_lock();
 	ret = __conc_attach_check(tset);
+	conc_cfg_unlock();
 	return ret;
 }
 

@@ -3785,8 +3785,19 @@ static ssize_t cpuset_partition_write(struct kernfs_open_file *of, char *buf,
 	cpus_read_lock();
 	wait_attach_done_lock();
 
-	if (is_cpuset_online(cs))
-		retval = update_prstate(cs, val);
+	/*
+	 * A partition root which is a deadline domain must keep its root
+	 * domain while it holds deadline tasks. They were admitted against
+	 * its concurrency limit. In another root domain they would still be
+	 * under that limit. See conc_dl_domain_busy().
+	 */
+	if (is_cpuset_online(cs)) {
+		if (cs->partition_root_state == PRS_ROOT && val != PRS_ROOT &&
+		    conc_dl_domain_busy(cs->css.cgroup))
+			retval = -EBUSY;
+		else
+			retval = update_prstate(cs, val);
+	}
 	cpuset_update_sd_hk_unlock();
 	return retval ?: nbytes;
 }
@@ -4531,6 +4542,60 @@ void cpuset_task_cpus_rcu(struct task_struct *tsk, struct cpumask *pmask)
 	if (cpumask_empty(pmask))
 		cpumask_and(pmask, possible_mask, parent_cs(cs)->effective_cpus);
 }
+
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+/**
+ * cpuset_conc_root_partition - is @cgrp a root domain of its own?
+ * @cgrp: a cgroup
+ *
+ * This is so when the own cpuset of @cgrp is a valid partition root of the
+ * load-balanced kind ("root", not "isolated"). The scheduler gives such a
+ * partition a root domain of its own. The top cpuset does not qualify. Call
+ * under RCU. The result is stable under cpuset_mutex.
+ *
+ * Return: an active CPU of the partition. -1 if @cgrp is not such a
+ * partition, or if the partition has no active CPU.
+ */
+int cpuset_conc_root_partition(struct cgroup *cgrp)
+{
+	struct cgroup_subsys_state *css = cgroup_css(cgrp, &cpuset_cgrp_subsys);
+	struct cpuset *cs;
+	int cpu;
+
+	if (!css)
+		return -1;
+	cs = css_cs(css);
+	if (cs == &top_cpuset || cs->partition_root_state != PRS_ROOT)
+		return -1;
+	cpu = cpumask_first_and(cs->effective_cpus, cpu_active_mask);
+	return cpu < nr_cpu_ids ? cpu : -1;
+}
+
+/**
+ * cpuset_css_active_cpu_rcu - an active CPU which a cpuset grants its tasks
+ * @css: the css of a cpuset
+ *
+ * The CPU tells which root domain a task which joins the cpuset lands in. Use
+ * the CPUs which cpuset_task_cpus_rcu() gives such a task. Call under RCU.
+ * The result is stable under cpuset_mutex.
+ *
+ * Return: the CPU, or -1 if the cpuset grants no active CPU.
+ */
+int cpuset_css_active_cpu_rcu(struct cgroup_subsys_state *css)
+{
+	struct cpuset *cs = css_cs(css);
+	int cpu;
+
+	if (cs == &top_cpuset) {
+		cpu = cpumask_first_andnot(cpu_active_mask, subpartitions_cpus);
+	} else {
+		cpu = cpumask_first_and(cs->effective_cpus, cpu_active_mask);
+		if (cpu >= nr_cpu_ids)
+			cpu = cpumask_first_and(parent_cs(cs)->effective_cpus, cpu_active_mask);
+	}
+	return cpu < nr_cpu_ids ? cpu : -1;
+}
+#endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
 /**
  * cpuset_cpus_allowed_fallback - final fallback before complete catastrophe.

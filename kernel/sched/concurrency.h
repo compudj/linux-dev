@@ -277,6 +277,10 @@ extern void conc_task_affinity_changed(struct task_struct *p, struct affinity_co
 extern void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx);
 extern int conc_dl_admit(struct task_struct *p);
 extern void conc_dl_wait(struct task_struct *p);
+/* Defined in deadline.c, for the deadline domains of concurrency.c. */
+extern int dl_conc_set_cpus(int cpu, unsigned int n, bool check);
+extern unsigned int dl_conc_cpus(int cpu);
+extern bool dl_conc_rd_busy(int cpu);
 
 /* The rotation period, see conc_rotate_for(). Set from debugfs. */
 extern unsigned int conc_rotation_ms;

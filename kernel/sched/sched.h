@@ -1164,6 +1164,17 @@ struct root_domain {
 	 */
 	u64 visit_cookie;
 
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	/*
+	 * The number of CPUs which the deadline tasks of this root domain may
+	 * use at once, or 0 for no cap. It is set for a partition root under
+	 * a concurrency limit. Its deadline tasks are admitted against this
+	 * number, see __dl_conc_overflow(). Protected by dl_bw.lock. Writers
+	 * also hold cpuset_mutex.
+	 */
+	unsigned int		conc_dl_cpus;
+#endif
+
 #ifdef HAVE_RT_PUSH_IPI
 	/*
 	 * For IPI pull requests, loop across the rto_mask.

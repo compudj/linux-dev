@@ -2685,6 +2685,28 @@ struct task_struct *cgroup_taskset_next(struct cgroup_taskset *tset,
 	return NULL;
 }
 
+/**
+ * cgroup_taskset_cur_dst_css - destination css of another subsystem
+ * @tset: taskset of interest
+ * @ssid: the subsystem
+ *
+ * A controller uses this when its check depends on the destination of another
+ * controller. The cpu controller checks a deadline task against the CPUs of
+ * the destination cpuset.
+ *
+ * Return: the css of subsystem @ssid which the current task of @tset moves
+ * to. The current task is the one last returned by cgroup_taskset_first() or
+ * cgroup_taskset_next(). If the migration does not change this css, return
+ * the css the task has now.
+ */
+struct cgroup_subsys_state *cgroup_taskset_cur_dst_css(struct cgroup_taskset *tset,
+						       int ssid)
+{
+	struct css_set *cset = tset->cur_cset;
+
+	return cset->mg_dst_cset ? cset->mg_dst_cset->subsys[ssid] : cset->subsys[ssid];
+}
+
 static void cgroup_migrate_notify_canceled(struct css_set *src_cset,
 					   struct task_struct *task)
 {

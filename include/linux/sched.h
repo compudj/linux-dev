@@ -2626,9 +2626,12 @@ extern void migrate_enable(void);
 
 DEFINE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
 
+struct cgroup;
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 extern void conc_pass_begin(void);
 extern void conc_pass_end(void);
+extern void conc_dl_rebuild_caps(void);
+extern bool conc_dl_domain_busy(struct cgroup *cgrp);
 extern void conc_fatal_signal(struct task_struct *t);
 extern void conc_hold_resume(void);
 extern void sched_cid_resume(void);
@@ -2650,5 +2653,10 @@ static inline void sched_conc_resume_user_mode(void) { }
 static inline void conc_fatal_signal(struct task_struct *t) { }
 static inline void conc_pass_begin(void) { }
 static inline void conc_pass_end(void) { }
+static inline void conc_dl_rebuild_caps(void) { }
+static inline bool conc_dl_domain_busy(struct cgroup *cgrp)
+{
+	return false;
+}
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY */
 #endif
