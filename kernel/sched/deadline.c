@@ -3335,13 +3335,19 @@ static void task_woken_dl(struct rq *rq, struct task_struct *p)
  * current cpus_mask (not yet updated to the new mask) to find the
  * actual root domain. Use cpus_mask rather than cpus_ptr, which
  * may be temporarily narrowed by migrate_disable().
+ *
+ * The mask has no active CPU left when the CPUs it allows went offline,
+ * which the affinity of a deadline task allows with admission control
+ * off, and that of a task boosted into the deadline class by priority
+ * inheritance always: fall back to the CPU the task last ran on.
  */
 static unsigned int dl_task_root_domain_cpu(struct task_struct *p)
 {
 	unsigned int cpu;
 
 	cpu = cpumask_first_and(&p->cpus_mask, cpu_active_mask);
-	BUG_ON(cpu >= nr_cpu_ids);
+	if (cpu >= nr_cpu_ids)
+		cpu = task_cpu(p);
 	return cpu;
 }
 
