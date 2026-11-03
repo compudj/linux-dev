@@ -10,6 +10,6 @@ LDLIBS += -lpthread
 
 TEST_GEN_FILES := cs_prctl_test
 TEST_PROGS := cs_prctl_test
-TEST_GEN_PROGS := deadline_switch_test deadline_rebuild_test
+TEST_GEN_PROGS := deadline_switch_test deadline_rebuild_test deadline_bw_test
 
 include ../lib.mk
