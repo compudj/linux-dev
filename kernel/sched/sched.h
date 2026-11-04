@@ -2953,6 +2953,8 @@ extern struct task_struct *pick_task_idle(struct rq *rq, struct rq_flags *rf);
 #define SCA_MIGRATE_DISABLE	0x02
 #define SCA_MIGRATE_ENABLE	0x04
 #define SCA_USER		0x08
+/* The caller made room for @p's deadline bandwidth where the mask points. */
+#define SCA_DL_BW_RESERVED	0x10
 
 extern void update_group_capacity(struct sched_domain *sd, int cpu);
 
