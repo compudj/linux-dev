@@ -752,10 +752,16 @@ struct sched_dl_entity {
 	 *
 	 * @dl_bw_gen is the value of dl_bw_gen when the bandwidth was last
 	 * counted. If a rebuild dropped it since, there is nothing to remove.
+	 *
+	 * @dl_bw_resv_cpu is a CPU of the root domain where a cpuset attach
+	 * in progress reserved room for the bandwidth, or -1.
+	 * cpuset_can_attach() sets it, and cpuset_attach() moves the
+	 * bandwidth there.
 	 */
 	struct list_head		dl_departed_node;
 	int				dl_bw_cpu;
 	unsigned int			dl_bw_gen;
+	int				dl_bw_resv_cpu;
 
 	/*
 	 * Bits for DL-server functionality. Also see the comment near
@@ -1967,7 +1973,8 @@ extern void set_cpus_allowed_force(struct task_struct *p, const struct cpumask *
  */
 extern int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask);
 extern int set_cpus_allowed_bw_reserved(struct task_struct *p,
-					const struct cpumask *new_mask);
+					const struct cpumask *new_mask,
+					u64 *moved);
 extern int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src, int node);
 extern void release_user_cpus_ptr(struct task_struct *p);
 extern int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask);

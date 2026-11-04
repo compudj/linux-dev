@@ -2662,6 +2662,8 @@ extern const u32		sched_prio_to_wmult[40];
 struct affinity_context {
 	const struct cpumask	*new_mask;
 	struct cpumask		*user_mask;
+	/* Out: the deadline bandwidth moved to the new root domain. */
+	u64			dl_bw_moved;
 	unsigned int		flags;
 };
 

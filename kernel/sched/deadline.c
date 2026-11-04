@@ -3580,6 +3580,8 @@ static unsigned int dl_task_root_domain_cpu(struct task_struct *p)
 static void set_cpus_allowed_dl(struct task_struct *p,
 				struct affinity_context *ctx)
 {
+	bool reserved;
+
 	WARN_ON_ONCE(!dl_task(p));
 
 	/*
@@ -3590,9 +3592,20 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 	 * Otherwise, the bandwidth stays where it is counted, until the next
 	 * rebuild of the accounting. Moving it without room would leave no
 	 * root domain counting it.
+	 *
+	 * cpuset_can_attach() recorded with @p that it made room for it. A
+	 * task that became a deadline task since has no such record, and its
+	 * bandwidth stays where it is counted.
+	 *
+	 * Report in @ctx the bandwidth moved. The caller read the record
+	 * without the runqueue lock, so it must count only what this reports.
 	 */
-	if ((ctx->flags & SCA_DL_BW_RESERVED) &&
-	    dl_task_needs_bw_move(p, ctx->new_mask)) {
+	reserved = (ctx->flags & SCA_DL_BW_RESERVED) &&
+		   p->dl.dl_bw_resv_cpu >= 0;
+	if (reserved)
+		p->dl.dl_bw_resv_cpu = -1;
+
+	if (reserved && dl_task_needs_bw_move(p, ctx->new_mask)) {
 		unsigned int src_cpu = dl_task_root_domain_cpu(p);
 		struct dl_bw *src_dl_b = &cpu_rq(src_cpu)->rd->dl_bw;
 		unsigned int cpu;
@@ -3618,9 +3631,43 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 		cpu = cpumask_any_and(ctx->new_mask, cpu_active_mask);
 		p->dl.dl_bw_cpu = cpu < nr_cpu_ids ? (int)cpu : -1;
 		p->dl.dl_bw_gen = dl_bw_gen;
+		ctx->dl_bw_moved = p->dl.dl_bw;
 	}
 
 	set_cpus_allowed_common(p, ctx);
+}
+
+/*
+ * Record with @p that a cpuset attach in progress reserved room for its
+ * bandwidth in the root domain of @cpu.
+ */
+void dl_task_bw_reserve(struct task_struct *p, int cpu)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+
+	rq = task_rq_lock(p, &rf);
+	p->dl.dl_bw_resv_cpu = cpu;
+	task_rq_unlock(rq, p, &rf);
+}
+
+/* Return the CPU that a cpuset attach recorded with @p, or -1. */
+int dl_task_bw_reserved_cpu(struct task_struct *p)
+{
+	return READ_ONCE(p->dl.dl_bw_resv_cpu);
+}
+
+/* Forget the CPU that a cpuset attach recorded with @p. */
+void dl_task_bw_unreserve(struct task_struct *p)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+
+	if (READ_ONCE(p->dl.dl_bw_resv_cpu) < 0)
+		return;
+	rq = task_rq_lock(p, &rf);
+	p->dl.dl_bw_resv_cpu = -1;
+	task_rq_unlock(rq, p, &rf);
 }
 
 bool dl_task_needs_bw_move(struct task_struct *p,
@@ -4492,6 +4539,7 @@ void init_dl_entity(struct sched_dl_entity *dl_se)
 	dl_se->dl_bw = 0;
 	__dl_clear_params(dl_se);
 	dl_se->dl_bw_cpu = -1;
+	dl_se->dl_bw_resv_cpu = -1;
 	INIT_LIST_HEAD(&dl_se->dl_departed_node);
 }
 

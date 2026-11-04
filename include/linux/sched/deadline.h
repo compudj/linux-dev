@@ -58,6 +58,9 @@ extern void lockdep_assert_dl_accounting_held(void);
  */
 extern bool dl_task_needs_bw_move(struct task_struct *p,
 				  const struct cpumask *new_mask);
+extern void dl_task_bw_reserve(struct task_struct *p, int cpu);
+extern int dl_task_bw_reserved_cpu(struct task_struct *p);
+extern void dl_task_bw_unreserve(struct task_struct *p);
 
 static inline bool dl_server(struct sched_dl_entity *dl_se)
 {
