@@ -355,18 +355,31 @@ void __sub_rq_bw(u64 dl_bw, struct dl_rq *dl_rq)
 	WARN_ON_ONCE(dl_rq->running_bw > dl_rq->this_bw);
 }
 
+/*
+ * @dl_bw_oncpu tells whether this_bw of a runqueue counts @dl_se's
+ * bandwidth, so that these two put it there and take it away once each:
+ * a wakeup takes it off the runqueue the task slept on and the enqueue on
+ * the one it wakes on puts it back, and what happens to the task in
+ * between must not count it twice, nor take it from a runqueue that does
+ * not have it. The servers keep their own tally, dl_bw_attached, and go
+ * through __add_rq_bw() and __sub_rq_bw() directly.
+ */
 static inline
 void add_rq_bw(struct sched_dl_entity *dl_se, struct dl_rq *dl_rq)
 {
-	if (!dl_entity_is_special(dl_se))
-		__add_rq_bw(dl_se->dl_bw, dl_rq);
+	if (dl_entity_is_special(dl_se) || dl_se->dl_bw_oncpu)
+		return;
+	__add_rq_bw(dl_se->dl_bw, dl_rq);
+	dl_se->dl_bw_oncpu = 1;
 }
 
 static inline
 void sub_rq_bw(struct sched_dl_entity *dl_se, struct dl_rq *dl_rq)
 {
-	if (!dl_entity_is_special(dl_se))
-		__sub_rq_bw(dl_se->dl_bw, dl_rq);
+	if (dl_entity_is_special(dl_se) || !dl_se->dl_bw_oncpu)
+		return;
+	__sub_rq_bw(dl_se->dl_bw, dl_rq);
+	dl_se->dl_bw_oncpu = 0;
 }
 
 static inline
@@ -433,6 +446,14 @@ static void dl_change_utilization(struct task_struct *p, u64 new_bw)
 	WARN_ON_ONCE(p->dl.flags & SCHED_FLAG_SUGOV);
 
 	if (task_on_rq_queued(p))
+		return;
+
+	/*
+	 * Waking up on another CPU, the task has its bandwidth on no
+	 * runqueue: the enqueue to come charges the new one, with the new
+	 * parameters, which __setparam_dl() sets right after this.
+	 */
+	if (!p->dl.dl_bw_oncpu)
 		return;
 
 	dl_rq_change_utilization(task_rq(p), &p->dl, new_bw);
@@ -2790,6 +2811,11 @@ static void migrate_task_rq_dl(struct task_struct *p, int new_cpu __maybe_unused
 		 */
 		cancel_inactive_timer(&p->dl);
 	}
+	/*
+	 * Until the enqueue on the CPU it wakes on charges it there, this
+	 * bandwidth is on no runqueue: the rq of task_cpu() is not the one
+	 * it was taken from, which dl_bw_oncpu now says.
+	 */
 	sub_rq_bw(&p->dl, &rq->dl);
 	rq_unlock(rq, &rf);
 }
@@ -4214,6 +4240,7 @@ static void __dl_clear_params(struct sched_dl_entity *dl_se)
 	dl_se->dl_defer			= 0;
 	dl_se->dl_defer_running		= 0;
 	dl_se->dl_defer_armed		= 0;
+	dl_se->dl_bw_oncpu		= 0;
 
 #ifdef CONFIG_RT_MUTEXES
 	dl_se->pi_se			= dl_se;
