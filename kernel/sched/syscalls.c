@@ -674,19 +674,24 @@ change:
 	prev_class = p->sched_class;
 	next_class = __setscheduler_class(policy, newprio);
 
-	if (prev_class != next_class) {
-		/*
-		 * SCHED_FLAG_KEEP_PARAMS prevents the class change from
-		 * actually happening (it skips __setscheduler_params and
-		 * the sched_class assignment). Reject contradictory
-		 * requests that ask for a class change with KEEP_PARAMS.
-		 */
-		if (attr->sched_flags & SCHED_FLAG_KEEP_PARAMS) {
-			retval = -EINVAL;
-			goto unlock;
-		}
-		queue_flags |= DEQUEUE_CLASS;
+	/*
+	 * SCHED_FLAG_KEEP_PARAMS prevents the policy and the class change
+	 * from actually happening: it skips __setscheduler_params() and the
+	 * sched_class assignment. Reject the contradictory requests that
+	 * ask for either, rather than carry out half of what they ask.
+	 *
+	 * A class change with the policy kept is one of them: the class of a
+	 * policy depends on the priority that priority inheritance leaves,
+	 * and on whether a BPF scheduler is in charge.
+	 */
+	if ((attr->sched_flags & SCHED_FLAG_KEEP_PARAMS) &&
+	    (policy != p->policy || prev_class != next_class)) {
+		retval = -EINVAL;
+		goto unlock;
 	}
+
+	if (prev_class != next_class)
+		queue_flags |= DEQUEUE_CLASS;
 
 	/*
 	 * If setscheduling to SCHED_DEADLINE (or changing the parameters
