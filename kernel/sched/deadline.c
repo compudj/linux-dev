@@ -442,22 +442,32 @@ void cancel_inactive_timer(struct sched_dl_entity *dl_se)
 	cancel_dl_timer(dl_se, &dl_se->inactive_timer);
 }
 
+/*
+ * The runqueue a sleeping task is on counts the bandwidth the task has:
+ * give it @new_bw in place of what it counts of the task's.
+ */
 static void dl_change_utilization(struct task_struct *p, u64 new_bw)
 {
-	WARN_ON_ONCE(p->dl.flags & SCHED_FLAG_SUGOV);
+	struct sched_dl_entity *dl_se = &p->dl;
+	struct rq *rq = task_rq(p);
 
-	if (task_on_rq_queued(p))
+	if (task_on_rq_queued(p) || dl_entity_is_special(dl_se))
 		return;
 
 	/*
-	 * Waking up on another CPU, the task has its bandwidth on no
-	 * runqueue: the enqueue to come charges the new one, with the new
-	 * parameters, which __setparam_dl() sets right after this.
+	 * No runqueue counts bandwidth of the task's: this one takes the
+	 * new one, and the enqueue to come leaves it there (add_rq_bw() of
+	 * a task a runqueue counts). A task waking up on another CPU has
+	 * none of its bandwidth on a runqueue, and task_cpu() points at the
+	 * one it wakes on.
 	 */
-	if (!p->dl.dl_bw_oncpu)
+	if (!dl_se->dl_bw_oncpu) {
+		__add_rq_bw(new_bw, &rq->dl);
+		dl_se->dl_bw_oncpu = 1;
 		return;
+	}
 
-	dl_rq_change_utilization(task_rq(p), &p->dl, new_bw);
+	dl_rq_change_utilization(rq, dl_se, new_bw);
 }
 
 static void __dl_clear_params(struct sched_dl_entity *dl_se);
@@ -4217,7 +4227,6 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 		if (counted)
 			__dl_sub(dl_b, p->dl.dl_bw, cpus);
 		__dl_add(dl_b, new_bw, cpus);
-		dl_change_utilization(p, new_bw);
 		err = 0;
 	} else if (!dl_policy(policy) && task_has_dl_policy(p)) {
 		/*
@@ -4266,6 +4275,18 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 void __setparam_dl(struct task_struct *p, const struct sched_attr *attr)
 {
 	struct sched_dl_entity *dl_se = &p->dl;
+	u64 period = attr->sched_period ?: attr->sched_deadline;
+
+	/*
+	 * The bandwidth of a special entity is counted on no runqueue.
+	 * The rest have theirs changed here, where their parameters are:
+	 * switched_to_dl() hands it to the runqueue of a task that enters
+	 * the class, and a task that priority inheritance boosted into the
+	 * class is in it already, so nothing dequeues it and enqueues it
+	 * back for that.
+	 */
+	if (!(attr->sched_flags & SCHED_FLAG_SUGOV))
+		dl_change_utilization(p, to_ratio(period, attr->sched_runtime));
 
 	dl_se->dl_runtime = attr->sched_runtime;
 	dl_se->dl_deadline = attr->sched_deadline;
