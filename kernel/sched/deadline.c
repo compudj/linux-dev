@@ -562,6 +562,7 @@ static void task_non_contending(struct sched_dl_entity *dl_se, bool dl_task)
 				if (READ_ONCE(p->__state) == TASK_DEAD)
 					sub_rq_bw(dl_se, &rq->dl);
 				dl_task_release_bw(p);
+				cancel_replenish_timer(dl_se);
 				__dl_clear_params(dl_se);
 			}
 		}
@@ -2325,6 +2326,7 @@ static enum hrtimer_restart inactive_task_timer(struct hrtimer *timer)
 		}
 
 		dl_task_release_bw(p);
+		cancel_replenish_timer(dl_se);
 		__dl_clear_params(dl_se);
 
 		goto unlock;
@@ -3920,8 +3922,10 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
 		 * boosted owner would never leave its loop over a dl_period
 		 * and a dl_runtime of 0.
 		 */
-		if (released)
+		if (released) {
+			cancel_replenish_timer(&p->dl);
 			__dl_clear_state(&p->dl);
+		}
 	}
 
 	/*
