@@ -3270,6 +3270,20 @@ int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
 EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
 
 /*
+ * The same, for a caller that has made room in the root domain of @new_mask
+ * for the deadline bandwidth of @p: that bandwidth moves there with it.
+ */
+int set_cpus_allowed_bw_reserved(struct task_struct *p, const struct cpumask *new_mask)
+{
+	struct affinity_context ac = {
+		.new_mask  = new_mask,
+		.flags     = SCA_DL_BW_RESERVED,
+	};
+
+	return __set_cpus_allowed_ptr(p, &ac);
+}
+
+/*
  * Change a given task's CPU affinity to the intersection of its current
  * affinity mask and @subset_mask, writing the resulting mask to @new_mask.
  * If user_cpus_ptr is defined, use it as the basis for restricting CPU
