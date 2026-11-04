@@ -3512,7 +3512,9 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 	 * The bandwidth of a task whose move no one made room for stays
 	 * where it is counted, for the next rebuild of the accounting to
 	 * attribute, rather than leaving the root domain it moves to short
-	 * of what its tasks hold.
+	 * of what its tasks hold. @ctx tells the caller what moved: the
+	 * record of a task is read here, under its runqueue lock, and the
+	 * caller cannot keep a reservation for a move this decides against.
 	 */
 	if ((ctx->flags & SCA_DL_BW_RESERVED) &&
 	    dl_task_needs_bw_move(p, ctx->new_mask)) {
@@ -3540,6 +3542,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 		cpu = cpumask_any_and(ctx->new_mask, cpu_active_mask);
 		p->dl.dl_bw_cpu = cpu < nr_cpu_ids ? (int)cpu : -1;
 		p->dl.dl_bw_gen = dl_bw_gen;
+		ctx->dl_bw_moved = p->dl.dl_bw;
 	}
 
 	set_cpus_allowed_common(p, ctx);
