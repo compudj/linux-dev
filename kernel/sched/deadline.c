@@ -252,15 +252,14 @@ static unsigned int dl_bw_gen;
  * @p leaves SCHED_DEADLINE, or dies, its bandwidth kept for now in the root
  * domain of @cpu. Under its rq lock.
  */
-static void dl_task_depart(struct task_struct *p, int cpu)
+static void dl_task_depart(struct task_struct *p)
 {
 	struct sched_dl_entity *dl_se = &p->dl;
 
 	lockdep_assert_irqs_disabled();
-	if (dl_se->dl_departed_cpu >= 0)
-		return;
 	guard(raw_spinlock)(&dl_departed_lock);
-	dl_se->dl_departed_cpu = cpu;
+	if (!list_empty(&dl_se->dl_departed_node) || dl_se->dl_bw_cpu < 0)
+		return;
 	list_add(&dl_se->dl_departed_node, &dl_departed_list);
 }
 
@@ -273,9 +272,10 @@ static void dl_task_undepart(struct task_struct *p)
 	struct sched_dl_entity *dl_se = &p->dl;
 
 	lockdep_assert_irqs_disabled();
+	if (list_empty(&dl_se->dl_departed_node))
+		return;
 	guard(raw_spinlock)(&dl_departed_lock);
-	dl_se->dl_departed_cpu = -1;
-	list_del(&dl_se->dl_departed_node);
+	list_del_init(&dl_se->dl_departed_node);
 }
 
 /*
@@ -284,24 +284,25 @@ static void dl_task_undepart(struct task_struct *p)
  * when a rebuild of the accounting has dropped it; and no rebuild running
  * counts it again. Under @p's rq lock.
  */
-static void dl_task_release_bw(struct task_struct *p, int cpu)
+static void dl_task_release_bw(struct task_struct *p)
 {
 	struct sched_dl_entity *dl_se = &p->dl;
 	struct dl_bw *dl_b;
+	int cpu;
 
 	lockdep_assert_irqs_disabled();
 	guard(raw_spinlock)(&dl_departed_lock);
-	if (dl_se->dl_departed_cpu >= 0) {
-		cpu = dl_se->dl_departed_cpu;
-		dl_se->dl_departed_cpu = -1;
-		list_del(&dl_se->dl_departed_node);
-	}
-	if (dl_se->dl_bw_gen == dl_bw_gen) {
+	if (!list_empty(&dl_se->dl_departed_node))
+		list_del_init(&dl_se->dl_departed_node);
+	cpu = dl_se->dl_bw_cpu;
+	WARN_ON_ONCE(dl_se->dl_bw && cpu < 0);
+	if (cpu >= 0 && dl_se->dl_bw_gen == dl_bw_gen) {
 		dl_b = dl_bw_of(cpu);
 		raw_spin_lock(&dl_b->lock);
 		__dl_sub(dl_b, dl_se->dl_bw, dl_bw_cpus(cpu));
 		raw_spin_unlock(&dl_b->lock);
 	}
+	dl_se->dl_bw_cpu = -1;
 	dl_se->dl_bw_gen = dl_bw_gen;
 }
 
@@ -560,7 +561,7 @@ static void task_non_contending(struct sched_dl_entity *dl_se, bool dl_task)
 			if (!dl_task || READ_ONCE(p->__state) == TASK_DEAD) {
 				if (READ_ONCE(p->__state) == TASK_DEAD)
 					sub_rq_bw(dl_se, &rq->dl);
-				dl_task_release_bw(p, task_cpu(p));
+				dl_task_release_bw(p);
 				__dl_clear_params(dl_se);
 			}
 		}
@@ -579,7 +580,7 @@ static void task_non_contending(struct sched_dl_entity *dl_se, bool dl_task)
 		 * SCHED_DEADLINE.
 		 */
 		if (READ_ONCE(p->__state) == TASK_DEAD)
-			dl_task_depart(p, task_cpu(p));
+			dl_task_depart(p);
 	}
 
 	hrtimer_start(timer, ns_to_ktime(zerolag_time), HRTIMER_MODE_REL_HARD);
@@ -830,6 +831,7 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 	raw_spin_lock(&dl_b->lock);
 	__dl_add(dl_b, p->dl.dl_bw, cpumask_weight(later_rq->rd->span));
 	raw_spin_unlock(&dl_b->lock);
+	p->dl.dl_bw_cpu = later_rq->cpu;
 
 	set_task_cpu(p, later_rq->cpu);
 	double_unlock_balance(later_rq, rq);
@@ -2312,7 +2314,7 @@ static enum hrtimer_restart inactive_task_timer(struct hrtimer *timer)
 			dl_se->dl_non_contending = 0;
 		}
 
-		dl_task_release_bw(p, task_cpu(p));
+		dl_task_release_bw(p);
 		__dl_clear_params(dl_se);
 
 		goto unlock;
@@ -3475,11 +3477,14 @@ static void task_woken_dl(struct rq *rq, struct task_struct *p)
  */
 static unsigned int dl_task_root_domain_cpu(struct task_struct *p)
 {
-	unsigned int cpu;
+	int cpu = p->dl.dl_bw_cpu;
 
-	cpu = cpumask_first_and(&p->cpus_mask, cpu_active_mask);
-	if (cpu >= nr_cpu_ids)
-		cpu = task_cpu(p);
+	/*
+	 * No bandwidth of @p's counted anywhere: nothing to take back or to
+	 * move, and the CPU it is on answers for its root domain.
+	 */
+	if (cpu < 0)
+		return task_cpu(p);
 	return cpu;
 }
 
@@ -3497,6 +3502,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 	if (dl_task_needs_bw_move(p, ctx->new_mask)) {
 		unsigned int src_cpu = dl_task_root_domain_cpu(p);
 		struct dl_bw *src_dl_b = &cpu_rq(src_cpu)->rd->dl_bw;
+		unsigned int cpu;
 
 		/*
 		 * We now free resources of the root_domain we are migrating
@@ -3506,6 +3512,14 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 		raw_spin_lock(&src_dl_b->lock);
 		__dl_sub(src_dl_b, p->dl.dl_bw, dl_bw_cpus(src_cpu));
 		raw_spin_unlock(&src_dl_b->lock);
+
+		/*
+		 * The room in the root domain of the mask to come was made
+		 * by cpuset_can_attach(): that one counts the bandwidth from
+		 * here on.
+		 */
+		cpu = cpumask_any_and(ctx->new_mask, cpu_active_mask);
+		p->dl.dl_bw_cpu = cpu < nr_cpu_ids ? (int)cpu : -1;
 	}
 
 	set_cpus_allowed_common(p, ctx);
@@ -3614,10 +3628,12 @@ void dl_add_task_root_domain(struct task_struct *p)
 	 */
 	if (p->dl.dl_bw_gen == dl_bw_gen)
 		goto unlock;
-	if (p->dl.dl_departed_cpu >= 0) {
-		cpu = p->dl.dl_departed_cpu;
-		if (!cpu_active(cpu))
+	if (!list_empty(&p->dl.dl_departed_node)) {
+		int recorded = p->dl.dl_bw_cpu;
+
+		if (recorded < 0 || !cpu_active(recorded))
 			goto unlock;
+		cpu = recorded;
 	}
 	rq = cpu_rq(cpu);
 	dl_b = &rq->rd->dl_bw;
@@ -3625,6 +3641,7 @@ void dl_add_task_root_domain(struct task_struct *p)
 	raw_spin_lock(&dl_b->lock);
 	__dl_add(dl_b, p->dl.dl_bw, cpumask_weight(rq->rd->span));
 	raw_spin_unlock(&dl_b->lock);
+	p->dl.dl_bw_cpu = cpu;
 	p->dl.dl_bw_gen = dl_bw_gen;
 unlock:
 	raw_spin_unlock(&dl_departed_lock);
@@ -3754,7 +3771,7 @@ void dl_clear_root_domains(void)
 			dl_clear_root_domain(cpu_rq(cpu)->rd);
 	}
 	list_for_each_entry(dl_se, &dl_departed_list, dl_departed_node) {
-		cpu = dl_se->dl_departed_cpu;
+		cpu = dl_se->dl_bw_cpu;
 		/*
 		 * Counted in the generation that ends here, and nowhere
 		 * since: one a rebuild dropped, for want of an active CPU to
@@ -3763,7 +3780,7 @@ void dl_clear_root_domains(void)
 		 */
 		if (dl_se->dl_bw_gen != dl_bw_gen - 1)
 			continue;
-		if (!cpu_active(cpu))
+		if (cpu < 0 || !cpu_active(cpu))
 			continue;
 		dl_b = dl_bw_of(cpu);
 		raw_spin_lock(&dl_b->lock);
@@ -3820,7 +3837,7 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
 			 * nor for a special one: neither has bandwidth in
 			 * total_bw.
 			 */
-			dl_task_release_bw(p, dl_task_root_domain_cpu(p));
+			dl_task_release_bw(p);
 			released = true;
 		}
 		sub_rq_bw(&p->dl, &rq->dl);
@@ -3861,7 +3878,7 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
 	 */
 	if (p->dl.dl_non_contending) {
 		p->dl.dl_non_contending = 0;
-		dl_task_depart(p, dl_task_root_domain_cpu(p));
+		dl_task_depart(p);
 	}
 
 	/*
@@ -3890,8 +3907,7 @@ static void switched_to_dl(struct rq *rq, struct task_struct *p)
 	 * the task then removes the bandwidth from that one, as it did
 	 * before departures were recorded.
 	 */
-	if (p->dl.dl_departed_cpu >= 0)
-		dl_task_undepart(p);
+	dl_task_undepart(p);
 
 	/*
 	 * In case a task is setscheduled to SCHED_DEADLINE we need to keep
@@ -4157,11 +4173,20 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 	 * domain that keeps it (dl_task_release_bw()). A rebuild cannot
 	 * run meanwhile: the caller holds cpuset_mutex.
 	 */
-	if (!err && dl_policy(policy) && !task_has_dl_policy(p)) {
-		lockdep_assert_cpuset_lock_held();
-		lockdep_assert_dl_accounting_held();
-		if (p->dl.dl_departed_cpu >= 0)
-			dl_task_release_bw(p, -1);
+	if (!err && dl_policy(policy)) {
+		if (!task_has_dl_policy(p)) {
+			lockdep_assert_cpuset_lock_held();
+			lockdep_assert_dl_accounting_held();
+			/*
+			 * Whatever bandwidth the task still has counted
+			 * somewhere, the new one replaces: on the departed
+			 * list, or taken off it by a boost into the class
+			 * (switched_to_dl()), the record says where.
+			 */
+			if (p->dl.dl_bw_cpu >= 0)
+				dl_task_release_bw(p);
+		}
+		p->dl.dl_bw_cpu = cpu;
 		p->dl.dl_bw_gen = dl_bw_gen;
 	}
 
@@ -4301,7 +4326,8 @@ void init_dl_entity(struct sched_dl_entity *dl_se)
 	init_dl_task_timer(dl_se);
 	init_dl_inactive_task_timer(dl_se);
 	__dl_clear_params(dl_se);
-	dl_se->dl_departed_cpu = -1;
+	dl_se->dl_bw_cpu = -1;
+	INIT_LIST_HEAD(&dl_se->dl_departed_node);
 }
 
 bool dl_param_changed(struct task_struct *p, const struct sched_attr *attr)
