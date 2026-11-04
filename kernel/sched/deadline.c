@@ -398,18 +398,35 @@ void __sub_rq_bw(u64 dl_bw, struct dl_rq *dl_rq)
 	WARN_ON_ONCE(dl_rq->running_bw > dl_rq->this_bw);
 }
 
+/*
+ * @dl_se->dl_bw_oncpu tells whether the this_bw of a runqueue counts the
+ * bandwidth of @dl_se. add_rq_bw() adds the bandwidth only if no runqueue
+ * counts it. sub_rq_bw() subtracts it only if one does.
+ *
+ * A wakeup on another CPU takes the bandwidth off the old runqueue. The
+ * enqueue on the new CPU adds it back later. A change of the task in
+ * between must not count the bandwidth twice, nor take it off a runqueue
+ * that does not count it.
+ *
+ * The servers track their bandwidth with dl_bw_attached. They call
+ * __add_rq_bw() and __sub_rq_bw() directly.
+ */
 static inline
 void add_rq_bw(struct sched_dl_entity *dl_se, struct dl_rq *dl_rq)
 {
-	if (!dl_entity_is_special(dl_se))
-		__add_rq_bw(dl_se->dl_bw, dl_rq);
+	if (dl_entity_is_special(dl_se) || dl_se->dl_bw_oncpu)
+		return;
+	__add_rq_bw(dl_se->dl_bw, dl_rq);
+	dl_se->dl_bw_oncpu = 1;
 }
 
 static inline
 void sub_rq_bw(struct sched_dl_entity *dl_se, struct dl_rq *dl_rq)
 {
-	if (!dl_entity_is_special(dl_se))
-		__sub_rq_bw(dl_se->dl_bw, dl_rq);
+	if (dl_entity_is_special(dl_se) || !dl_se->dl_bw_oncpu)
+		return;
+	__sub_rq_bw(dl_se->dl_bw, dl_rq);
+	dl_se->dl_bw_oncpu = 0;
 }
 
 static inline
@@ -476,6 +493,14 @@ static void dl_change_utilization(struct task_struct *p, u64 new_bw)
 	WARN_ON_ONCE(p->dl.flags & SCHED_FLAG_SUGOV);
 
 	if (task_on_rq_queued(p))
+		return;
+
+	/*
+	 * The task is waking up on another CPU, and no runqueue counts its
+	 * bandwidth. The enqueue adds it, with the new parameters that
+	 * __setparam_dl() sets right after this.
+	 */
+	if (!p->dl.dl_bw_oncpu)
 		return;
 
 	dl_rq_change_utilization(task_rq(p), &p->dl, new_bw);
@@ -2846,6 +2871,11 @@ static void migrate_task_rq_dl(struct task_struct *p, int new_cpu __maybe_unused
 		 */
 		cancel_inactive_timer(&p->dl);
 	}
+	/*
+	 * set_task_cpu() points task_cpu() at the new CPU next. The runqueue
+	 * of that CPU counts this bandwidth only once the enqueue there adds
+	 * it. Until then, no runqueue counts it, as dl_bw_oncpu now says.
+	 */
 	sub_rq_bw(&p->dl, &rq->dl);
 	rq_unlock(rq, &rf);
 }
@@ -4236,6 +4266,7 @@ static void __dl_clear_params(struct sched_dl_entity *dl_se)
 	dl_se->dl_defer			= 0;
 	dl_se->dl_defer_running		= 0;
 	dl_se->dl_defer_armed		= 0;
+	dl_se->dl_bw_oncpu		= 0;
 
 #ifdef CONFIG_RT_MUTEXES
 	dl_se->pi_se			= dl_se;
