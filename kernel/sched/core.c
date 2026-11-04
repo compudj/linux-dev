@@ -3271,16 +3271,21 @@ EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
 
 /*
  * The same, for a caller that has made room in the root domain of @new_mask
- * for the deadline bandwidth of @p: that bandwidth moves there with it.
+ * for the deadline bandwidth of @p: that bandwidth moves there with it, and
+ * @moved takes what the move counts there, 0 where it moved none.
  */
-int set_cpus_allowed_bw_reserved(struct task_struct *p, const struct cpumask *new_mask)
+int set_cpus_allowed_bw_reserved(struct task_struct *p,
+				 const struct cpumask *new_mask, u64 *moved)
 {
 	struct affinity_context ac = {
 		.new_mask  = new_mask,
 		.flags     = SCA_DL_BW_RESERVED,
 	};
+	int ret;
 
-	return __set_cpus_allowed_ptr(p, &ac);
+	ret = __set_cpus_allowed_ptr(p, &ac);
+	*moved = ac.dl_bw_moved;
+	return ret;
 }
 
 /*
