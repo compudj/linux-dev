@@ -654,6 +654,7 @@ change:
 		if (cpuset_locked) {
 			dl_accounting_unlock();
 			cpuset_unlock();
+			cpuset_locked = false;
 		}
 		goto recheck;
 	}
