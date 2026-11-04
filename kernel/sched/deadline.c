@@ -3574,6 +3574,9 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 	 * Otherwise, the bandwidth stays where it is counted, until the next
 	 * rebuild of the accounting. Moving it without room would leave no
 	 * root domain counting it.
+	 *
+	 * Report in @ctx the bandwidth moved. The caller read the record
+	 * without the runqueue lock, so it must count only what this reports.
 	 */
 	if ((ctx->flags & SCA_DL_BW_RESERVED) &&
 	    dl_task_needs_bw_move(p, ctx->new_mask)) {
@@ -3600,6 +3603,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 		cpu = cpumask_any_and(ctx->new_mask, cpu_active_mask);
 		p->dl.dl_bw_cpu = cpu < nr_cpu_ids ? (int)cpu : -1;
 		p->dl.dl_bw_gen = dl_bw_gen;
+		ctx->dl_bw_moved = p->dl.dl_bw;
 	}
 
 	set_cpus_allowed_common(p, ctx);
