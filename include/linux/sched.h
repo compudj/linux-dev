@@ -717,6 +717,7 @@ struct sched_dl_entity {
 	unsigned int			dl_defer_running  : 1;
 	unsigned int			dl_defer_idle     : 1;
 	unsigned int			dl_bw_attached    : 1;
+	unsigned int			dl_bw_offrq       : 1;
 
 	/*
 	 * Bandwidth enforcement timer. Each -deadline task has its

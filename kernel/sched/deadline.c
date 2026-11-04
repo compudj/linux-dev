@@ -358,6 +358,7 @@ void __sub_rq_bw(u64 dl_bw, struct dl_rq *dl_rq)
 static inline
 void add_rq_bw(struct sched_dl_entity *dl_se, struct dl_rq *dl_rq)
 {
+	dl_se->dl_bw_offrq = 0;
 	if (!dl_entity_is_special(dl_se))
 		__add_rq_bw(dl_se->dl_bw, dl_rq);
 }
@@ -433,6 +434,14 @@ static void dl_change_utilization(struct task_struct *p, u64 new_bw)
 	WARN_ON_ONCE(p->dl.flags & SCHED_FLAG_SUGOV);
 
 	if (task_on_rq_queued(p))
+		return;
+
+	/*
+	 * Waking up on another CPU, the task has its bandwidth on no
+	 * runqueue: the enqueue to come charges the new one, with the new
+	 * parameters, which __setparam_dl() sets right after this.
+	 */
+	if (p->dl.dl_bw_offrq)
 		return;
 
 	dl_rq_change_utilization(task_rq(p), &p->dl, new_bw);
@@ -2785,6 +2794,12 @@ static void migrate_task_rq_dl(struct task_struct *p, int new_cpu __maybe_unused
 		cancel_inactive_timer(&p->dl);
 	}
 	sub_rq_bw(&p->dl, &rq->dl);
+	/*
+	 * Until the enqueue on the CPU it wakes on charges it there, which
+	 * add_rq_bw() tells of, this bandwidth is on no runqueue: the rq of
+	 * task_cpu() is not the one it was taken from.
+	 */
+	p->dl.dl_bw_offrq = 1;
 	rq_unlock(rq, &rf);
 }
 
@@ -3733,7 +3748,9 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
 			dl_task_release_bw(p, dl_task_root_domain_cpu(p));
 			released = true;
 		}
-		sub_rq_bw(&p->dl, &rq->dl);
+		if (!p->dl.dl_bw_offrq)
+			sub_rq_bw(&p->dl, &rq->dl);
+		p->dl.dl_bw_offrq = 0;
 		/*
 		 * Released: reset the parameters, as inactive_task_timer()
 		 * does. Kept, they would make the task one with bandwidth to
@@ -4188,6 +4205,7 @@ static void __dl_clear_params(struct sched_dl_entity *dl_se)
 	dl_se->dl_defer			= 0;
 	dl_se->dl_defer_running		= 0;
 	dl_se->dl_defer_armed		= 0;
+	dl_se->dl_bw_offrq		= 0;
 
 #ifdef CONFIG_RT_MUTEXES
 	dl_se->pi_se			= dl_se;
