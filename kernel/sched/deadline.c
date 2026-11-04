@@ -3614,6 +3614,16 @@ static void dl_get_task_effective_cpus(struct task_struct *p, struct cpumask *cp
 	 * hierarchy up to the partition root.
 	 */
 	cpuset_cpus_allowed_locked(p, cpus);
+	/*
+	 * Which the CPUs isolated by isolcpu="domain" are not part of: a
+	 * cpuset can name them beside housekeeping CPUs, and without
+	 * cpusets the mask is every CPU the task can run on. The first
+	 * active CPU of it would then be an isolated one, of the default
+	 * root domain, rather than one of the root domain the task's
+	 * bandwidth belongs to.
+	 */
+	if (housekeeping_enabled(HK_TYPE_DOMAIN))
+		cpumask_and(cpus, cpus, hk_msk);
 }
 
 /* The caller should hold cpuset_mutex */
@@ -3634,7 +3644,18 @@ void dl_add_task_root_domain(struct task_struct *p)
 	msk = this_cpu_cpumask_var_ptr(local_cpu_mask_dl);
 	dl_get_task_effective_cpus(p, msk);
 	cpu = cpumask_first_and(cpu_active_mask, msk);
-	BUG_ON(cpu >= nr_cpu_ids);
+	if (cpu >= nr_cpu_ids) {
+		/*
+		 * No active CPU to count this task's bandwidth: the ones it
+		 * may run on all went offline, which the CPUs isolated by
+		 * isolcpu="domain" allow, no deadline task of theirs keeping
+		 * the last of them online. Leave it out of this rebuild,
+		 * where dl_bw_gen keeps its release out as well, until one
+		 * has a CPU for it.
+		 */
+		raw_spin_unlock_irqrestore(&p->pi_lock, rf.flags);
+		return;
+	}
 
 	raw_spin_lock(&dl_departed_lock);
 	/*
