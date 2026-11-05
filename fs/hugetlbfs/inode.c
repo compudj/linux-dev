@@ -25,6 +25,7 @@
 #include <linux/ctype.h>
 #include <linux/backing-dev.h>
 #include <linux/hugetlb.h>
+#include <linux/cid_namespace.h>
 #include <linux/folio_batch.h>
 #include <linux/fs_parser.h>
 #include <linux/mman.h>
@@ -113,6 +114,13 @@ static int hugetlbfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 	 */
 	vma_set_flags(vma, VMA_HUGETLB_BIT, VMA_DONTEXPAND_BIT);
 	vma->vm_ops = &hugetlb_vm_ops;
+
+	/* Bound to a concurrency ID namespace (MFD_CID_NS): its processes alone, each mapping for itself. */
+	if (cid_ns_file_bound(file)) {
+		if (!cid_ns_may_map(file))
+			return -EPERM;
+		vma_set_flags(vma, VMA_DONTCOPY_BIT);
+	}
 
 	/*
 	 * page based offset in vm_pgoff could be sufficiently large to
@@ -595,6 +603,9 @@ static void hugetlbfs_evict_inode(struct inode *inode)
 
 	trace_hugetlbfs_evict_inode(inode);
 	remove_inode_hugepages(inode, 0, LLONG_MAX);
+#ifdef CONFIG_CID_NS
+	cid_ns_unbind(&HUGETLBFS_I(inode)->cid_ns);
+#endif
 
 	resv_map = HUGETLBFS_I(inode)->resv_map;
 	/* Only regular and link inodes have associated reserve maps */
@@ -919,6 +930,9 @@ static struct inode *hugetlbfs_get_inode(struct super_block *sb,
 		inode->i_mapping->a_ops = &hugetlbfs_aops;
 		simple_inode_init_ts(inode);
 		info->resv_map = resv_map;
+#ifdef CONFIG_CID_NS
+		info->cid_ns = NULL;
+#endif
 		info->seals = F_SEAL_SEAL;
 		hugetlbfs_pmd_sharing_init(inode);
 		switch (mode & S_IFMT) {

@@ -1808,8 +1808,27 @@ cleanup:
 struct ns_cid_memfd_shared {
 	void *parent_map;	/* the parent's mapping of its bound memfd */
 	size_t len;
+	size_t huge_len;	/* a huge page, 0 without huge pages */
 	int child_fd;		/* the child's bound memfd, for /proc/<child>/fd/N */
+	int huge_fd;		/* the parent's bound hugetlb memfd, -1 without */
 };
+
+/* The size of a huge page, 0 when there are none. */
+static size_t ns_cid_huge_page_size(void)
+{
+	FILE *f = fopen("/proc/meminfo", "r");
+	unsigned long kb = 0;
+	char line[128];
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "Hugepagesize: %lu kB", &kb) == 1)
+			break;
+	}
+	fclose(f);
+	return kb * 1024;
+}
 
 /*
  * In the namespace unshared for it: the parent's mapping of its bound
@@ -1834,6 +1853,12 @@ static int ns_cid_memfd_child(struct ns_cid_memfd_shared *sh, int parent_fd, int
 	map = mmap(NULL, sh->len, PROT_READ, MAP_PRIVATE, parent_fd, 0);
 	if (map != MAP_FAILED || errno != EPERM)
 		return 22;
+	/* The parent's hugetlb memfd: refused before any huge page is asked for. */
+	if (sh->huge_fd >= 0) {
+		map = mmap(NULL, sh->huge_len, PROT_READ | PROT_WRITE, MAP_SHARED, sh->huge_fd, 0);
+		if (map != MAP_FAILED || errno != EPERM)
+			return 33;
+	}
 	fd = memfd_create("ns_cid_child", MFD_CID_NS);
 	if (fd < 0)
 		return 23;
@@ -1911,6 +1936,8 @@ static int ns_cid_memfd_run(void)
 	sh->parent_map = map;
 	if (madvise(map, sh->len, MADV_DOFORK) == 0 || errno != EINVAL)
 		return 15;
+	sh->huge_len = ns_cid_huge_page_size();
+	sh->huge_fd = sh->huge_len ? memfd_create("ns_cid_huge", MFD_HUGETLB | MFD_CID_NS) : -1;
 	child = fork();
 	if (child < 0)
 		return 16;

@@ -17,6 +17,7 @@
 #include <linux/sched/task.h>
 #include <linux/proc_ns.h>
 #include <linux/shmem_fs.h>
+#include <linux/hugetlb.h>
 #include <linux/mm.h>
 #include <linux/nstree.h>
 #include <linux/slab.h>
@@ -119,7 +120,8 @@ void free_cid_ns(struct cid_namespace *ns)
 }
 
 /*
- * Memory bound to a namespace: a memfd created with MFD_CID_NS belongs to
+ * Memory bound to a namespace: a memfd created with MFD_CID_NS, huge
+ * pages or not, belongs to
  * its creator's namespace, and only the namespace's processes map it, so
  * that a table sized by the maximum is never indexed from another space.
  * The binding is the inode's, set before any descriptor exists and cleared
@@ -136,6 +138,10 @@ static struct cid_namespace **cid_ns_file_slot(struct file *file)
 	/* The underlying file of a System V segment too: same mapping, same inode. */
 	if (shmem_file(file))
 		return &SHMEM_I(file_inode(file))->cid_ns;
+#ifdef CONFIG_HUGETLBFS
+	if (is_file_hugepages(file))
+		return &HUGETLBFS_I(file_inode(file))->cid_ns;
+#endif
 	return NULL;
 }
 
