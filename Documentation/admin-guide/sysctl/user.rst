@@ -41,6 +41,12 @@ max_cgroup_namespaces
   The maximum number of cgroup namespaces that any user in the current
   user namespace may create.
 
+max_cid_namespaces
+==================
+
+  The maximum number of concurrency ID namespaces that any user in the
+  current user namespace may create.
+
 max_ipc_namespaces
 ==================
 
