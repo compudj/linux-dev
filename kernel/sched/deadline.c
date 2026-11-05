@@ -3607,6 +3607,36 @@ static void dl_get_task_effective_cpus(struct task_struct *p, struct cpumask *cp
 	cpuset_cpus_allowed_locked(p, cpus);
 }
 
+/*
+ * A CPU of the root domain that a rebuild of the accounting counts @p's
+ * bandwidth in. The one recorded with it, where it is active and the
+ * cpuset of @p allows it: that of the root domain that admitted the
+ * bandwidth, or that the last move put it in, which the cpuset alone does
+ * not tell where it holds CPUs of two root domains, housekeeping ones
+ * beside the ones isolcpus="domain" leaves to the default root domain. The
+ * record answers as well for a task whose own CPUs went offline, moved to
+ * an active one by dl_task_offline_migration(). Else the first active CPU
+ * the cpuset allows, a housekeeping one where it has any; and nr_cpu_ids
+ * where it allows none, which the isolated CPUs allow, no deadline task
+ * of theirs keeping the last of them online.
+ */
+static unsigned int dl_task_rebuild_cpu(struct task_struct *p)
+{
+	struct cpumask *msk = this_cpu_cpumask_var_ptr(local_cpu_mask_dl);
+	int recorded = p->dl.dl_bw_cpu;
+	unsigned int cpu;
+
+	dl_get_task_effective_cpus(p, msk);
+	cpumask_and(msk, msk, cpu_active_mask);
+	if (recorded >= 0 && cpu_active(recorded) &&
+	    (cpumask_test_cpu(recorded, msk) || cpumask_empty(msk)))
+		return recorded;
+	cpu = cpumask_first_and(msk, housekeeping_cpumask(HK_TYPE_DOMAIN_BOOT));
+	if (cpu < nr_cpu_ids)
+		return cpu;
+	return cpumask_first(msk);
+}
+
 /* The caller should hold cpuset_mutex */
 void dl_add_task_root_domain(struct task_struct *p)
 {
@@ -3614,7 +3644,6 @@ void dl_add_task_root_domain(struct task_struct *p)
 	struct rq *rq;
 	struct dl_bw *dl_b;
 	unsigned int cpu;
-	struct cpumask *msk;
 
 	raw_spin_lock_irqsave(&p->pi_lock, rf.flags);
 	/*
@@ -3626,10 +3655,16 @@ void dl_add_task_root_domain(struct task_struct *p)
 		return;
 	}
 
-	msk = this_cpu_cpumask_var_ptr(local_cpu_mask_dl);
-	dl_get_task_effective_cpus(p, msk);
-	cpu = cpumask_first_and(cpu_active_mask, msk);
-	BUG_ON(cpu >= nr_cpu_ids);
+	cpu = dl_task_rebuild_cpu(p);
+	if (cpu >= nr_cpu_ids) {
+		/*
+		 * No active CPU to count this task's bandwidth: leave it out
+		 * of this rebuild, where dl_bw_gen keeps its release out as
+		 * well, until one has a CPU for it.
+		 */
+		raw_spin_unlock_irqrestore(&p->pi_lock, rf.flags);
+		return;
+	}
 
 	raw_spin_lock(&dl_departed_lock);
 	/*
