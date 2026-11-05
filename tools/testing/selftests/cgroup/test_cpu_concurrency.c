@@ -2103,6 +2103,192 @@ cleanup:
 	return ret;
 }
 
+#ifndef MFD_CID_NS
+#define MFD_CID_NS	0x0020U
+#endif
+
+/* The parent's side of the memfd test, read by the child. */
+struct ns_cid_memfd_shared {
+	void *parent_map;	/* the parent's mapping of its bound memfd */
+	size_t len;
+	int child_fd;		/* the child's bound memfd, for /proc/<child>/fd/N */
+};
+
+/*
+ * Run the child in the new namespace. Return 0, or a code which names the
+ * check that failed.
+ *  1. The child does not have the parent's mapping: mincore() fails with
+ *     ENOMEM.
+ *  2. mmap() of the parent's memfd fails with EPERM, shared or private.
+ *  3. The child creates a bound memfd of its own and maps it.
+ *  4. The child waits while the parent tries to map that memfd.
+ *  5. setns(2) to the parent's namespace fails with EBUSY.
+ *  6. The child unmaps its memfd. setns(2) now succeeds.
+ *  7. mmap() of the parent's memfd succeeds. mmap() of the child's own
+ *     memfd fails with EPERM.
+ */
+static int ns_cid_memfd_child(struct ns_cid_memfd_shared *sh, int parent_fd, int cmdfd, int ackfd,
+			      pid_t parent)
+{
+	unsigned char vec[16];
+	char path[64], c;
+	void *map;
+	int fd, nsfd;
+
+	if (mincore(sh->parent_map, sh->len, vec) == 0 || errno != ENOMEM)
+		return 20;
+	map = mmap(NULL, sh->len, PROT_READ | PROT_WRITE, MAP_SHARED, parent_fd, 0);
+	if (map != MAP_FAILED || errno != EPERM)
+		return 21;
+	map = mmap(NULL, sh->len, PROT_READ, MAP_PRIVATE, parent_fd, 0);
+	if (map != MAP_FAILED || errno != EPERM)
+		return 22;
+	fd = memfd_create("ns_cid_child", MFD_CID_NS);
+	if (fd < 0)
+		return 23;
+	if (ftruncate(fd, sh->len))
+		return 24;
+	map = mmap(NULL, sh->len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (map == MAP_FAILED)
+		return 25;
+	sh->child_fd = fd;
+	/* The parent tries the child's memfd meanwhile. */
+	if (write(ackfd, "m", 1) != 1 || read(cmdfd, &c, 1) != 1)
+		return 26;
+	snprintf(path, sizeof(path), "/proc/%d/ns/cid", (int)parent);
+	nsfd = open(path, O_RDONLY);
+	if (nsfd < 0)
+		return 27;
+	if (setns(nsfd, CLONE_NEWCID) == 0 || errno != EBUSY)
+		return 28;
+	if (munmap(map, sh->len))
+		return 29;
+	if (setns(nsfd, CLONE_NEWCID))
+		return 30;
+	map = mmap(NULL, sh->len, PROT_READ | PROT_WRITE, MAP_SHARED, parent_fd, 0);
+	if (map == MAP_FAILED)
+		return 31;
+	map = mmap(NULL, sh->len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (map != MAP_FAILED || errno != EPERM)
+		return 32;
+	return 0;
+}
+
+/*
+ * Run a child in the namespace of the parent. Return 0 if it did not
+ * inherit the mapping of the parent.
+ */
+static int ns_cid_memfd_same_ns_child(struct ns_cid_memfd_shared *sh)
+{
+	unsigned char vec[16];
+
+	return mincore(sh->parent_map, sh->len, vec) == 0 || errno != ENOMEM ? 40 : 0;
+}
+
+/*
+ * Test a memfd created with MFD_CID_NS. Run in a process of its own,
+ * because it calls unshare(2).
+ *  1. The parent creates a bound memfd and maps it. madvise(MADV_DOFORK)
+ *     on the mapping fails with EINVAL.
+ *  2. The parent forks a child in its own namespace. The child does not
+ *     have the mapping: mincore() fails with ENOMEM.
+ *  3. The parent calls unshare(CLONE_NEWCID) and forks a second child,
+ *     which is in the new namespace. The parent still has its mapping.
+ *  4. The second child runs ns_cid_memfd_child().
+ *  5. While the second child waits, the parent opens the bound memfd of
+ *     that child through /proc/<child>/fd. Its mmap() fails with EPERM.
+ */
+static int ns_cid_memfd_run(void)
+{
+	struct ns_cid_memfd_shared *sh;
+	int fd, cfd, cmd[2], ack[2], status;
+	unsigned char vec[16];
+	char path[64], c;
+	pid_t child;
+	void *map;
+
+	sh = mmap(NULL, sizeof(*sh), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (sh == MAP_FAILED)
+		return 1;
+	sh->len = 2 * sysconf(_SC_PAGESIZE);
+	fd = memfd_create("ns_cid", MFD_CID_NS);
+	if (fd < 0) {
+		if (errno == EINVAL) {
+			ksft_print_msg("no MFD_CID_NS\n");
+			return NS_CID_SKIP;
+		}
+		return 2;
+	}
+	if (ftruncate(fd, sh->len))
+		return 3;
+	map = mmap(NULL, sh->len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (map == MAP_FAILED)
+		return 4;
+	sh->parent_map = map;
+	if (madvise(map, sh->len, MADV_DOFORK) == 0 || errno != EINVAL)
+		return 15;
+	child = fork();
+	if (child < 0)
+		return 16;
+	if (child == 0)
+		exit(ns_cid_memfd_same_ns_child(sh));
+	if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status))
+		return 17;
+	if (pipe(cmd) || pipe(ack))
+		return 5;
+	if (unshare(CLONE_NEWCID)) {
+		if (errno == EINVAL || errno == EPERM) {
+			ksft_print_msg("no concurrency ID namespace (CLONE_NEWCID)\n");
+			return NS_CID_SKIP;
+		}
+		return 6;
+	}
+	child = fork();
+	if (child < 0)
+		return 7;
+	if (child == 0)
+		exit(ns_cid_memfd_child(sh, fd, cmd[0], ack[1], getppid()));
+	/* The unshare and the fork leave the parent's own mapping alone. */
+	if (mincore(map, sh->len, vec))
+		return 8;
+	if (read(ack[0], &c, 1) != 1)
+		return 9;
+	snprintf(path, sizeof(path), "/proc/%d/fd/%d", (int)child, sh->child_fd);
+	cfd = open(path, O_RDWR);
+	if (cfd < 0)
+		return 10;
+	if (mmap(NULL, sh->len, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0) != MAP_FAILED ||
+	    errno != EPERM)
+		return 11;
+	if (write(cmd[1], "g", 1) != 1)
+		return 12;
+	if (waitpid(child, &status, 0) != child)
+		return 13;
+	return WIFEXITED(status) ? WEXITSTATUS(status) : 14;
+}
+
+static int test_concurrency_ns_cid_memfd(const char *root)
+{
+	int status, r;
+	pid_t pid;
+
+	pid = fork();
+	if (pid < 0)
+		return KSFT_FAIL;
+	if (pid == 0)
+		exit(ns_cid_memfd_run());
+	if (waitpid(pid, &status, 0) != pid)
+		return KSFT_FAIL;
+	r = WIFEXITED(status) ? WEXITSTATUS(status) : 99;
+	if (r == NS_CID_SKIP)
+		return KSFT_SKIP;
+	if (r) {
+		fprintf(stderr, "memfd bound to a namespace: step %d failed\n", r);
+		return KSFT_FAIL;
+	}
+	return KSFT_PASS;
+}
+
 /*
  * Move the members of a namespace while they run. The ID space is as
  * small as the limit.
@@ -11064,6 +11250,7 @@ struct cc_test {
 	T(test_concurrency_sleepers),
 	T(test_concurrency_cpuset_class),
 	T(test_concurrency_ns_cid),
+	T(test_concurrency_ns_cid_memfd),
 	T(test_concurrency_ns_cid_moves),
 	T(test_concurrency_mm_cid_moves),
 	T(test_concurrency_ns_home_unshare),

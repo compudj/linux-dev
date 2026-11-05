@@ -12,6 +12,8 @@
 #define MFD_NOEXEC_SEAL		0x0008U
 /* executable */
 #define MFD_EXEC		0x0010U
+/* only the creator's concurrency ID namespace can map it */
+#define MFD_CID_NS		0x0020U
 
 /*
  * Huge page size encoding when MFD_HUGETLB is specified, and a huge page

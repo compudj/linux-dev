@@ -21,6 +21,8 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 #include <linux/proc_ns.h>
+#include <linux/shmem_fs.h>
+#include <linux/mm.h>
 #include <linux/nstree.h>
 #include <linux/slab.h>
 #include <linux/cred.h>
@@ -140,10 +142,124 @@ void free_cid_ns(struct cid_namespace *ns)
 }
 
 /*
+ * Memory bound to a namespace.
+ *
+ * A memfd created with MFD_CID_NS belongs to the namespace of its creator.
+ * Only the processes of that namespace can map the memory. So a table
+ * sized by the maximum is never indexed with an ID of another namespace.
+ *
+ * The binding is in the inode. It is set when the file is created, before
+ * any process can map it. It is cleared when the inode is evicted.
+ *
+ * A mapping never outlives the membership of its process:
+ *  - a fork(2) child does not inherit it (VMA_DONTCOPY_BIT, which
+ *    madvise(MADV_DOFORK) cannot clear), so it maps the memory itself;
+ *  - setns(2) to another namespace is refused while it exists;
+ *  - execve(2) starts from a new mm.
+ *
+ * ptrace(2) and process_vm_writev(2) are not mappings and are not checked.
+ * The hazard is a user instruction which indexes with an ID of another
+ * namespace.
+ */
+static struct cid_namespace **cid_ns_file_slot(struct file *file)
+{
+	if (shmem_file(file))
+		return &SHMEM_I(file_inode(file))->cid_ns;
+	return NULL;
+}
+
+/*
+ * Bind @file to the namespace of current. Call it when @file is created:
+ * nothing else refers to the file yet, so no lock is needed. Return
+ * -EINVAL for a file which cannot be bound.
+ */
+int cid_ns_bind_file(struct file *file)
+{
+	struct cid_namespace **slot = cid_ns_file_slot(file);
+
+	if (!slot)
+		return -EINVAL;
+	*slot = get_cid_ns(current->nsproxy->cid_ns);
+	return 0;
+}
+
+/* Drop the binding in @slot. Call it when the inode is evicted. */
+void cid_ns_unbind(struct cid_namespace **slot)
+{
+	if (*slot) {
+		put_cid_ns(*slot);
+		*slot = NULL;
+	}
+}
+
+/* Return the namespace which @file is bound to, or NULL. */
+static struct cid_namespace *cid_ns_of_file(struct file *file)
+{
+	struct cid_namespace **slot = cid_ns_file_slot(file);
+
+	return slot ? *slot : NULL;
+}
+
+bool cid_ns_file_bound(struct file *file)
+{
+	return cid_ns_of_file(file) != NULL;
+}
+
+/*
+ * Return true if current may map @file: the file is not bound, or it is
+ * bound to the namespace of current. Called from the mmap hooks.
+ */
+bool cid_ns_may_map(struct file *file)
+{
+	struct cid_namespace *ns = cid_ns_of_file(file);
+
+	return !ns || ns == current->nsproxy->cid_ns;
+}
+
+/*
+ * Return the first VMA of @mm at or after @start whose file is bound to a
+ * namespace other than @ns, or NULL.
+ */
+static struct vm_area_struct *cid_ns_find_other(struct mm_struct *mm, unsigned long start,
+						struct cid_namespace *ns)
+{
+	VMA_ITERATOR(vmi, mm, start);
+	struct vm_area_struct *vma;
+
+	for_each_vma(vmi, vma) {
+		struct cid_namespace *bound;
+
+		if (!vma->vm_file)
+			continue;
+		bound = cid_ns_of_file(vma->vm_file);
+		if (bound && bound != ns)
+			return vma;
+	}
+	return NULL;
+}
+
+/* Does @mm map memory bound to a namespace other than @ns? */
+static bool cid_ns_mm_maps_other(struct mm_struct *mm, struct cid_namespace *ns)
+{
+	bool maps;
+
+	if (!mm)
+		return false;
+	mmap_read_lock(mm);
+	maps = cid_ns_find_other(mm, 0, ns) != NULL;
+	mmap_read_unlock(mm);
+	return maps;
+}
+
+/*
  * Commit the namespace of the children to @tsk. Called at a fork(2)
  * without CLONE_VM and at execve(2). The task takes the namespace which
  * its creator set for its children. sched_post_fork() and
  * switch_task_namespaces() then update the membership of the domain.
+ *
+ * The task takes no mapping of memory bound to a namespace with it. A
+ * fork(2) child inherits none (VMA_DONTCOPY_BIT) and execve(2) has a new
+ * mm already.
  */
 void cidns_on_fork(struct nsproxy *nsproxy, struct task_struct *tsk)
 {
@@ -214,6 +330,12 @@ static int cidns_install(struct nsset *nsset, struct ns_common *new)
 		return -EPERM;
 	/* Refuse a caller whose cgroup is outside the subtree of the home. */
 	if (!conc_ns_may_join(ns))
+		return -EBUSY;
+	/*
+	 * Refuse while the caller maps memory bound to another namespace. It
+	 * must unmap it first.
+	 */
+	if (cid_ns_mm_maps_other(current->mm, ns))
 		return -EBUSY;
 
 	get_cid_ns(ns);

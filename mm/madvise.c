@@ -35,6 +35,7 @@
 #include <linux/swap_ops.h>
 
 #include <asm/tlb.h>
+#include <linux/cid_namespace.h>
 
 #include "internal.h"
 #include "swap.h"
@@ -1410,6 +1411,12 @@ static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
 		break;
 	case MADV_DOFORK:
 		if (!vma_is_mm_backed(vma) || vma_is_hugetlb(vma))
+			return -EINVAL;
+		/*
+		 * A fork(2) child never inherits memory bound to a
+		 * concurrency ID namespace, see MFD_CID_NS.
+		 */
+		if (vma->vm_file && cid_ns_file_bound(vma->vm_file))
 			return -EINVAL;
 		new_flags &= ~VM_DONTCOPY;
 		break;
