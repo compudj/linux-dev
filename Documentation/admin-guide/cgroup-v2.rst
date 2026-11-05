@@ -1344,7 +1344,54 @@ will be referred to. All time durations are in microseconds.
 	the process moves to another cgroup.  So size data indexed by
 	``mm_cid`` by the number of possible CPUs.  A decrease of the
 	limit moves the IDs below the new bound and asks nothing of
-	the process.
+	the process.  A concurrency ID namespace (CLONE_NEWCID, see
+	unshare(2) and setns(2)) takes the ceiling as the maximum of
+	the ``ns_cid`` field.  The namespace lives in a cgroup: the
+	nearest cgroup with a limit or a ceiling, at or above the cgroup it is
+	created in.  That is the cgroup of the caller for unshare(2),
+	and the cgroup of the new process for clone3(2), which
+	CLONE_INTO_CGROUP can choose.  The maximum is the effective
+	ceiling of the nearest cgroup with a ceiling, at or above that
+	cgroup.
+	It is the number of possible CPUs where no ceiling applies.
+	prctl(``PR_GET_NS_CID_MAX``) returns it to the processes of the
+	namespace.  It never changes, so data indexed by ``ns_cid`` is
+	sized once.  Below the maximum, the namespace follows the limit
+	of the cgroup it lives in.  No ``ns_cid`` is handed out at or
+	above the effective limit of that cgroup.  So a decrease
+	compacts the IDs once it is in force, as it does for
+	``mm_cid``.  A thread which runs when the limit is lowered
+	keeps its ID until it is next scheduled in.  It can read an ID
+	at or above the new limit for that short time, never one at or
+	above the maximum.  A process may read the effective limit as
+	the current size of the ID space, with this exception.  A
+	process of the namespace keeps its membership and its
+	IDs wherever it is moved within the subtree of that cgroup.  It
+	cannot leave the subtree.  Three operations fail with EBUSY:
+	moving a process of the namespace out of the subtree, creating
+	a process of the namespace outside it, and joining the namespace
+	with setns(2) from outside it.  So the limit which bounds the
+	IDs also bounds how many processes of the namespace run at
+	once.  A namespace created where no limit applies lives in no
+	cgroup, for good.  Its IDs are then bounded by the maximum
+	alone, also for the processes which join later where a limit
+	applies.
+	The cgroup cannot be removed while the namespace exists:
+	rmdir(2) fails with EBUSY, and so does a write to
+	"cgroup.subtree_control" of the parent which disables the cpu
+	controller.  "cpu.concurrency.namespaces" lists the namespaces
+	which keep the cgroup.  A namespace exists as long as a process
+	uses it or keeps it for its children, or a file descriptor or a
+	bind mount refers to it.
+	unshare(2) and setns(2) set the namespace of the children of
+	the caller.  It is committed at fork(2) and execve(2).  setns(2)
+	also moves the caller, which must be single-threaded.  So a
+	running program never sees its maximum change, and the threads
+	of a process are never in different namespaces.  The ``ns_cid``
+	field exists in rseq registrations of at least 36 bytes.  User
+	space detects it as an ``AT_RSEQ_FEATURE_SIZE`` of at least 36;
+	glibc 2.41 and later register that size.  A registration of 33
+	to 35 bytes, valid before the field existed, fails with EINVAL.
 
 	This file affects all processes in the cgroup, whatever their
 	scheduling policy.  Kernel threads attached to the cgroup follow
@@ -1374,6 +1421,16 @@ will be referred to. All time durations are in microseconds.
 	  CLONE_INTO_CGROUP: EBUSY, when the process is a
 	  SCHED_DEADLINE one bound for a limited subtree other than a
 	  partition root under its own limit.
+	- setns(2) to a concurrency ID namespace: EUSERS, from a
+	  multi-threaded process; EBUSY, from outside the cgroup the
+	  namespace lives in.  "cgroup.procs" and "cgroup.threads":
+	  EBUSY, when a process of a concurrency ID namespace would
+	  leave the subtree of the cgroup the namespace lives in;
+	  clone3(2) with CLONE_INTO_CGROUP, or fork(2) by a process
+	  moved since it created the namespace: EBUSY, for a child of
+	  the namespace born outside it.  unshare(2), clone3(2) and
+	  setns(2) with CLONE_NEWCID: EINVAL, on a kernel without the
+	  namespace.
 	- "cpuset.cpus.partition": EBUSY, when the write would make a
 	  partition root which holds SCHED_DEADLINE processes under its
 	  limit a member.
@@ -1404,7 +1461,10 @@ will be referred to. All time durations are in microseconds.
 	A container runtime gives a container's cgroup its ceiling by
 	writing "cpu.concurrency.child_ceiling" on the parent before
 	creating the cgroup, or by creating an intermediate cgroup of
-	its own.
+	its own.  It then creates the container's concurrency ID
+	namespace in that cgroup, with clone3(2) and CLONE_INTO_CGROUP
+	or with unshare(2) from inside it, so that the namespace takes
+	the ceiling as its maximum.
 	See :ref:`Documentation/scheduler/sched-max-concurrency.rst
 	<sched-max-concurrency>` for details.
 
@@ -1480,6 +1540,16 @@ will be referred to. All time durations are in microseconds.
 	"/sys/kernel/cgroup/delegate": the manager a cgroup is delegated
 	to may write it, as it distributes the cgroup's own ceiling
 	among its children.
+
+  cpu.concurrency.namespaces
+	A read-only file which exists on non-root cgroups.
+
+	It lists the concurrency ID namespaces which live in the
+	cgroup, one per line, by the inode number which
+	"/proc/<pid>/ns/cid" shows.  The cgroup cannot be removed, and
+	the cpu controller cannot be disabled for it, while the file is
+	not empty: both fail with EBUSY.  A namespace leaves the list
+	when it no longer exists.
 
   cpu.pressure
 	A read-write nested-keyed file.

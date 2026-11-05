@@ -65,7 +65,8 @@ Interface
     memory, must never see it grow, which would overflow the data, nor
     shrink, which would let a reader miss IDs that held data before. That
     is what lets a concurrency ID namespace take a ceiling as the maximum
-    of its ``ns_cid``, in a later patch. The bound of ``mm_cid`` follows
+    of its ``ns_cid``, below which the IDs follow the limit (see
+    `Cross-process concurrency IDs`_). The bound of ``mm_cid`` follows
     the cgroup a process is moved to, so data indexed by ``mm_cid`` is
     sized by the number of possible CPUs.
 
@@ -122,8 +123,10 @@ the tasks, and no operation is refused because of them:
 * ``sched_setaffinity(2)``, the writes to the cpuset files, cgroup
   migrations, ``fork(2)`` and ``clone3(2)`` with ``CLONE_INTO_CGROUP``
   succeed under a limit as they do without one.
-* One refusal remains. A SCHED_DEADLINE task is refused in a limited
-  subtree, except in a deadline domain (see `SCHED_DEADLINE`_).
+* Two refusals remain. A SCHED_DEADLINE task is refused in a limited
+  subtree, except in a deadline domain (see `SCHED_DEADLINE`_). A member
+  of a concurrency ID namespace cannot leave the home of the namespace
+  (see `Cross-process concurrency IDs`_).
 
 The masks of a cgroup can need more CPUs than its limit. Two tasks pinned
 to two different CPUs under a limit of 1 are an example. The kernel then
@@ -963,6 +966,217 @@ unchanged. Three things change in the slow path:
 A thread pool whose size hovers around the limit switches modes more
 often than before because the slack is capped; the existing hysteresis
 limits the cost.
+
+Cross-process concurrency IDs
+=============================
+
+``ns_cid`` is a second ID. It is exposed through a new 32-bit ``struct
+rseq`` field placed after ``slice_ctrl``. The field replaces the reserved
+byte, as the comment of that byte foresaw. The ID is unique among the
+tasks of a *concurrency ID namespace* that are running at the same
+instant. It is below a maximum which is fixed when the namespace is
+created. It lets processes of a container index shared memory by
+concurrency, with tables sized once.
+
+The namespace says *who shares an ID space*; the cgroup says *how many of
+them may run at once*. The namespace lives in a cgroup, its *home*. The
+home is the nearest limited cgroup at or above the cgroup where its first
+member joins. The namespace takes two numbers from the cgroups at that
+join: a hard maximum, copied once, and a soft limit, which the home keeps
+up to date. Otherwise the namespace does not depend on the cgroups. Its
+membership follows the namespace alone. A member keeps its ID wherever it
+is moved within the home's subtree, which it cannot leave.
+
+Decisions:
+
+* The home is a namespace type of its own, ``CLONE_NEWCID``, with the
+  nsfs type, ``/proc/<pid>/ns/cid``, ``setns(2)`` support and the
+  ``max_cid_namespaces`` ucount the other types have. A namespace's kind
+  is set by its type, not by a creation flag of another one, and a
+  namespace is the only kernel object that says who shares something:
+  no cgroup controller hands a task a number. The privilege is
+  ``CAP_SYS_ADMIN`` in the user namespace that owns the new namespace,
+  which a container runtime holds anyway. The flag bit lies in
+  ``CSIGNAL``, as ``CLONE_NEWTIME``'s does: the bits above it are all
+  spent, ``clone(2)`` reads the low byte as its exit signal and masks
+  it out of its flags, so the bit is usable with ``clone3(2)``,
+  ``unshare(2)`` and ``setns(2)``, which refused it before.
+* *The home.* The nearest cgroup with a limit or a ceiling at or above the
+  cgroup the namespace is created in, for the life of the namespace.
+  That cgroup is the caller's for ``unshare(2)``, and the new child's
+  for ``clone3(2)``. With ``clone3(CLONE_NEWCID | CLONE_INTO_CGROUP)`` a
+  container runtime creates the container's init in the container's
+  cgroup, whose ceiling and limit are the ones meant, not the runtime's
+  own. No member may be in a cgroup outside the home's subtree: a
+  migration out of it, a ``clone3(2)`` into a cgroup outside it and a
+  ``setns(2)`` from outside it are refused with ``EBUSY``. That is what
+  keeps the members
+  placed by the limit that bounds their IDs. The home is decided at the
+  creation, for good. A namespace created where no limit and no ceiling
+  applies has no home, no soft limit and no boundary, and a member which joins later
+  where a limit applies does not give it one. The home cannot be
+  removed while the namespace exists: ``rmdir(2)`` of its cgroup, and
+  a write to ``cgroup.subtree_control`` which disables the cpu
+  controller for it, fail with ``EBUSY``. The file
+  ``cpu.concurrency.namespaces`` of the home lists the namespaces
+  living in it, and the ``NS_GET_CID_CGROUP`` ioctl on a namespace file
+  descriptor returns the ID of the home. A namespace exists as long as
+  a process uses it or keeps it for its children, or a file descriptor
+  or a bind mount refers to it.
+* *The maximum.* At the creation, the effective ceiling of the nearest
+  cgroup with a ceiling at or above the cgroup of creation, or the
+  number of possible CPUs when there is none, or the ceiling is no
+  tighter. The nearest ceiling and not the outermost: limits nest, a
+  host capping all its containers at 60 CPUs and each container at 2,
+  and the ceiling the processes of a container size their tables by is
+  the container's. Copied into the namespace, it never changes
+  afterwards, as ceilings never do: the maximum is meant to behave like
+  the possible-CPU count, which is what user space sizes its tables by,
+  and it is read once, with ``prctl(PR_GET_NS_CID_MAX)``, which needs no
+  mounted filesystem.
+* *The soft limit.* The effective limit in force at the home, capped by
+  the maximum; the maximum when the namespace has no home. Unlike the
+  maximum it moves: the home feeds the namespace its effective value
+  whenever it changes (``conc_ns_feed()``), so a limit written to the
+  cgroup reaches the IDs the way it reaches ``mm_cid``, once the cgroup
+  is within it, and raising it back widens them again. No ID is ever
+  handed out at or above the soft limit: user space may read the home's
+  effective file as the live size of the ID space, below the table it
+  sized once by the maximum. There is one exception. A thread which
+  runs when the soft limit is lowered keeps its ID until it is next
+  scheduled in. For that short time it can read an ID at or above the
+  new soft limit. That ID is still below the maximum, so it indexes the
+  table within its size.
+* *The join.* Time-namespace semantics: ``unshare(CLONE_NEWCID)`` and
+  ``setns(2)`` set what the *children* get (``cid_ns_for_children`` in
+  ``nsproxy``), committed at ``fork(2)`` and ``execve(2)`` the way
+  ``timens_on_fork()`` does; ``setns(2)`` joins the caller as well and
+  requires a single-threaded process (``EUSERS`` otherwise), as the time
+  namespace does. Two consequences: a running program never sees its
+  maximum change under a table it has already sized, and the threads of
+  a process are never in different ID spaces. The namespace is flat: one
+  space per task, no nesting, no translation, as with IPC and UTS.
+* *Autonomy.* The members are the tasks with an mm whose ``nsproxy``
+  names the namespace. The membership changes at ``fork(2)``, at the
+  commit of a namespace switch and at exit, and nowhere else. A cgroup
+  migration within the home's subtree neither tests nor touches it, and a
+  member keeps its ID wherever it is moved. The concurrency of the members
+  is bounded by the placement of their cgroups, as for every task. The IDs
+  are bounded by the allocator, which hands out nothing at or above the
+  soft limit. The two bounds agree. Every member is under the home, and
+  the placement keeps the tasks of the home at or below its effective
+  limit, which is the soft limit. So a member finds an ID free, except in
+  two transition windows of the placement: a task is counted in a group
+  before it is held, or a task is moved while it runs. Either can leave a
+  member with no ID at its schedule in. That member takes one at its
+  return to user space, or waits there for one. A member's schedule out
+  hands the ID it frees to the waiters, in their order. An ID put in the
+  pool would go to whichever member schedules in first. A member's leave,
+  a raised limit or an ID put back in the pool wakes the waiters to try
+  again. The wait is killable and as short-lived as a hold. A thread of a
+  bounded mm takes the same path in the same window. Kernel
+  threads are not members. Nor are the user workers of a process
+  (io_uring's, vhost's), which never return to user space and take no
+  ID of either kind. A member holds a reference on its namespace, so
+  that ``task_struct::ns_dom`` stays valid whatever the order of the
+  exit and namespace paths. ``task_struct`` caches the domain pointer so
+  that the hot path never walks ``nsproxy``.
+* The initial namespace has no engine. Its ID is the CPU number and its
+  maximum is ``nr_cpu_ids``. The contract holds there too, because two
+  tasks running at once are on different CPUs. This gives three things.
+  The cost per context switch for a task that never asked is a static
+  key, then a pointer test. User space has one code path everywhere: size
+  by the maximum, index by the ID. A process can tell whether it is in
+  the initial namespace: it compares ``/proc/self/ns/cid`` with
+  ``/proc/1/ns/cid``, or reads the maximum.
+* The engine is ``struct mm_mm_cid`` generalised into a cid domain
+  (bitmap, per-CPU storage, task-owned and CPU-owned modes, the same
+  ``max_cids`` formula with ``users`` being the member count) that the
+  mm embeds and the namespace embeds. The bound of a namespace's domain
+  is its soft limit. The bounds walk of the cgroup writes each new value
+  and applies it as it visits the members. The domain's work applies it
+  for a domain whose members the walk does not visit. The bound of an
+  mm's domain follows the cgroups of its threads instead. A namespace's
+  domain keeps no common ancestor group and asks the cgroups nothing at
+  a fork, an exit or a migration. The
+  hot path is a second schedin/schedout call for the members. A joining
+  task widens the domain's allowed CPUs with its own mask, since the
+  members of a namespace come from anywhere. The IDs a namespace caches
+  on CPUs are given back on demand, by a member that found none free,
+  rather than at every slot change of a cgroup; while a member waits,
+  the members' schedule outs give their CPU's ID back instead of caching
+  it.
+* ``struct rseq`` and ``AT_RSEQ_FEATURE_SIZE`` are extended the way
+  ``node_id`` and ``mm_cid`` were; the field is written for every
+  registration large enough to hold it, which is what the feature size
+  advertises, on every architecture. The RSEQ ABI V2 mode, which the
+  architecture decides and not user space, gates the time slice
+  extension because that needs the generic entry code; it must not gate
+  an ID, or ``ns_cid`` would stay 0 on the architectures that have rseq
+  without it while the feature size claims the field.
+
+The contract. The kernel guarantees: the maximum never changes for the
+life of a program; the IDs are unique among the concurrently running
+members of a namespace, below the maximum, and below the soft limit in
+force when the member was last scheduled in; a member in user space
+always has one; a member is never outside
+the home's subtree; ``mm_cid`` is untouched by all of this. User space
+keeps: one table per namespace, sized once by the maximum; never index
+it from two namespaces; assert it with the namespace inode if it
+matters. The data sized by the maximum lives in shared memory, and the
+convention is that the memory and the namespace coincide. The kernel
+does not enforce the correspondence; a process that breaks it corrupts
+only its own data.
+
+How it is built:
+
+* ``kernel/sched/cid_namespace.c`` is the namespace type, modelled on
+  ``kernel/time/namespace.c``: ``copy_cid_ns()`` sets the domain up with
+  no bound, ``cidns_on_fork()`` commits the children's namespace,
+  ``cidns_install()`` is ``setns(2)``, refused from outside the home's
+  subtree; the membership is in ``kernel/sched/cid.c``.
+* Membership is driven by the namespace switch itself.
+  ``switch_task_namespaces()`` leaves the old domain and joins the new
+  one before the nsproxy changes hands. Exit leaves with the mm. A
+  ``fork(2)`` child is made a member in ``sched_post_fork()``. The first
+  join gives the namespace its home, its maximum and its soft limit
+  (``conc_ns_home()``), before any ID is taken. In per-task mode a
+  joining user takes its ID in the join. In per CPU mode it takes none:
+  it borrows the ID of the CPU it runs on at its next schedule in. A task
+  that joins while it is running reaches user space before that. So it
+  takes its ID in the join itself, the way a schedule in would. The
+  running joiners are ``setns(2)``, and ``execve(2)`` after
+  ``unshare(CLONE_NEWCID)``.
+* The refusals are made in the cpu controller: a migration in
+  ``conc_attach_check()``, from the cpu controller's ``can_attach``, and
+  a child born into a cgroup, or a plain one born to a parent moved
+  since, in ``conc_fork_check()``, from ``sched_cgroup_fork()``, both
+  against the task's namespace and the task group it would be in
+  (``conc_ns_may_live()``).
+* The soft limit is fed from the cgroup's bounds walk, the same pass
+  that refreshes the ``mm_cid`` bounds of the tasks in the subtree: the
+  home keeps the namespaces living in it on a list, under a lock of
+  its own, and the walk writes each its new value, then applies the
+  domain's bound (``cid_apply_bound()``) as it visits the members, the
+  way it applies an mm's, before the effective file shows the new
+  value; a domain the walk finds no member of applies it from its work.
+  The removal of the home takes the namespaces off the list.
+* A member that found no ID free at its schedule in takes the path a
+  thread of a bounded mm takes (``cid_wait()``, ``sched_cid_resume()``):
+  the same waiters, hand-offs and wake-ups, on the namespace's domain.
+* ``ns_cid`` is written to the rseq area of every registration larger
+  than the original 32 bytes, the only lengths ``rseq(2)`` admits being
+  that one and the ones that hold the whole field, validated like
+  ``mm_cid`` in debug mode, reset at unregistration, and carried in
+  ``struct rseq_ids`` so that a change raises the IDs update; a
+  namespace switch and a wait for an ID force one.
+* The namespace and the cpu controller say different things. The
+  namespace says who shares and the cgroup says how many may run. The
+  cpu controller gives the namespace its maximum and its soft limit, and
+  keeps its members in one cgroup subtree. The maximum is copied once.
+  The soft limit is fed through a list the cgroup owns. The boundary is
+  checked in the controller's ``can_attach``. No lock is
+  taken across the subsystems and no reference is held either way.
 
 Invariant checks
 ================
