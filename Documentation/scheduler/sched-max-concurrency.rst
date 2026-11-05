@@ -1502,8 +1502,9 @@ keeps: one table per namespace, sized once by the maximum; never index
 it from two namespaces. The data sized by the maximum lives in shared
 memory, and the kernel can enforce that the memory and the namespace
 coincide: a memfd created with ``MFD_CID_NS``, with or without
-``MFD_HUGETLB``, is bound to its creator's namespace, and only the
-namespace's processes map it. The binding is the
+``MFD_HUGETLB``, or a System V segment created with ``SHM_CID_NS``, is
+bound to its creator's namespace, and only the namespace's processes map
+it. The binding is the
 inode's, made before any descriptor exists, so no mapping from outside
 can race it. A map from outside fails with ``EPERM``, whoever holds the
 descriptor; a mapping of a bound object is never inherited by a
@@ -1559,8 +1560,8 @@ How it is built:
   the same waiters, hand-offs and wake-ups, on the namespace's domain.
 * The memory binding is a pointer in ``shmem_inode_info`` and in
   ``hugetlbfs_inode_info`` holding a namespace reference, set by
-  ``memfd_alloc_file()`` (``cid_ns_bind_file()``) and dropped at the
-  inode's eviction; ``shmem_mmap_prepare()`` and ``hugetlbfs_file_mmap()``
+  ``memfd_alloc_file()`` and ``newseg()`` (``cid_ns_bind_file()``) and
+  dropped at the inode's eviction; ``shmem_mmap_prepare()`` and ``hugetlbfs_file_mmap()``
   ask ``cid_ns_may_map()``, which System V segments reach through their
   underlying file, and give the mapping ``VMA_DONTCOPY``, which
   ``madvise(MADV_DOFORK)`` refuses to clear on a bound mapping;

@@ -121,7 +121,7 @@ void free_cid_ns(struct cid_namespace *ns)
 
 /*
  * Memory bound to a namespace: a memfd created with MFD_CID_NS, huge
- * pages or not, belongs to
+ * pages or not, or a System V segment created with SHM_CID_NS, belongs to
  * its creator's namespace, and only the namespace's processes map it, so
  * that a table sized by the maximum is never indexed from another space.
  * The binding is the inode's, set before any descriptor exists and cleared

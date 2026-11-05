@@ -6,6 +6,8 @@
  */
 
 #include "cpu_concurrency_util.h"
+#include <sys/ipc.h>
+#include <sys/shm.h>
 /* The files parse, round trip and report "max" when unlimited. */
 static int test_concurrency_interface(const char *root)
 {
@@ -1803,6 +1805,9 @@ cleanup:
 #ifndef MFD_CID_NS
 #define MFD_CID_NS	0x0020U
 #endif
+#ifndef SHM_CID_NS
+#define SHM_CID_NS	020000
+#endif
 
 /* The parent's side of the memfd test, read by the child. */
 struct ns_cid_memfd_shared {
@@ -1811,6 +1816,8 @@ struct ns_cid_memfd_shared {
 	size_t huge_len;	/* a huge page, 0 without huge pages */
 	int child_fd;		/* the child's bound memfd, for /proc/<child>/fd/N */
 	int huge_fd;		/* the parent's bound hugetlb memfd, -1 without */
+	int shmid;		/* the parent's bound System V segment, -1 without */
+	void *parent_shm;	/* the parent's attach of it */
 };
 
 /* The size of a huge page, 0 when there are none. */
@@ -1859,6 +1866,13 @@ static int ns_cid_memfd_child(struct ns_cid_memfd_shared *sh, int parent_fd, int
 		if (map != MAP_FAILED || errno != EPERM)
 			return 33;
 	}
+	/* The parent's System V segment: not inherited, not attachable. */
+	if (sh->shmid >= 0) {
+		if (mincore(sh->parent_shm, sh->len, vec) == 0 || errno != ENOMEM)
+			return 34;
+		if (shmat(sh->shmid, NULL, 0) != (void *)-1 || errno != EPERM)
+			return 35;
+	}
 	fd = memfd_create("ns_cid_child", MFD_CID_NS);
 	if (fd < 0)
 		return 23;
@@ -1887,15 +1901,21 @@ static int ns_cid_memfd_child(struct ns_cid_memfd_shared *sh, int parent_fd, int
 	map = mmap(NULL, sh->len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (map != MAP_FAILED || errno != EPERM)
 		return 32;
+	if (sh->shmid >= 0 && shmat(sh->shmid, NULL, 0) == (void *)-1)
+		return 36;
 	return 0;
 }
 
-/* A child in the same namespace: the mapping was not inherited either. */
+/* A child in the same namespace: the mappings were not inherited either. */
 static int ns_cid_memfd_same_ns_child(struct ns_cid_memfd_shared *sh)
 {
 	unsigned char vec[16];
 
-	return mincore(sh->parent_map, sh->len, vec) == 0 || errno != ENOMEM ? 40 : 0;
+	if (mincore(sh->parent_map, sh->len, vec) == 0 || errno != ENOMEM)
+		return 40;
+	if (sh->shmid >= 0 && (mincore(sh->parent_shm, sh->len, vec) == 0 || errno != ENOMEM))
+		return 41;
+	return 0;
 }
 
 /*
@@ -1904,8 +1924,10 @@ static int ns_cid_memfd_same_ns_child(struct ns_cid_memfd_shared *sh)
  * mapping, in the same namespace or in the one unshared for it, where the
  * child cannot map the memfd either; the child's own bound memfd cannot be
  * mapped by the parent, through /proc/<child>/fd; MADV_DOFORK is refused
- * on a bound mapping; and setns(2) is refused while one exists. Runs in a
- * process of its own, since it unshares.
+ * on a bound mapping; and setns(2) is refused while one exists. A hugetlb
+ * memfd and a System V segment (SHM_CID_NS) of the parent are refused the
+ * same way, the segment attached again once the child is back in the
+ * parent's namespace. Runs in a process of its own, since it unshares.
  */
 static int ns_cid_memfd_run(void)
 {
@@ -1938,6 +1960,20 @@ static int ns_cid_memfd_run(void)
 		return 15;
 	sh->huge_len = ns_cid_huge_page_size();
 	sh->huge_fd = sh->huge_len ? memfd_create("ns_cid_huge", MFD_HUGETLB | MFD_CID_NS) : -1;
+	if (sh->huge_fd < 0)
+		ksft_print_msg("no hugetlb memfd (%s): its part skipped\n",
+			       sh->huge_len ? strerror(errno) : "no huge pages");
+	/* A System V segment, bound the same way: attached by the creator. */
+	sh->shmid = shmget(IPC_PRIVATE, sh->len, IPC_CREAT | 0600 | SHM_CID_NS);
+	if (sh->shmid < 0)
+		ksft_print_msg("no System V segment (%s): its part skipped\n", strerror(errno));
+	if (sh->shmid >= 0) {
+		sh->parent_shm = shmat(sh->shmid, NULL, 0);
+		if (sh->parent_shm == (void *)-1)
+			return 18;
+		if (madvise(sh->parent_shm, sh->len, MADV_DOFORK) == 0 || errno != EINVAL)
+			return 19;
+	}
 	child = fork();
 	if (child < 0)
 		return 16;
@@ -1975,6 +2011,8 @@ static int ns_cid_memfd_run(void)
 		return 12;
 	if (waitpid(child, &status, 0) != child)
 		return 13;
+	if (sh->shmid >= 0)
+		shmctl(sh->shmid, IPC_RMID, NULL);
 	return WIFEXITED(status) ? WEXITSTATUS(status) : 14;
 }
 

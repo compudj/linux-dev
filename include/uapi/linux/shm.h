@@ -48,6 +48,7 @@ struct shmid_ds {
 /* Bits 9 & 10 are IPC_CREAT and IPC_EXCL */
 #define SHM_HUGETLB	04000	/* segment will use huge TLB pages */
 #define SHM_NORESERVE	010000	/* don't check for reservations */
+#define SHM_CID_NS	020000	/* bound to the creator's concurrency ID namespace: attached by its processes only */
 
 /*
  * Huge page size encoding when SHM_HUGETLB is specified, and a huge page
