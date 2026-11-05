@@ -120,6 +120,7 @@ TARGETS += rlimits
 TARGETS += rseq
 TARGETS += rtc
 TARGETS += rust
+TARGETS += sched/deadline
 TARGETS += sched_ext
 TARGETS += seccomp
 TARGETS += sgx
