@@ -560,6 +560,7 @@ recheck:
 	if (pi && (dl_policy(policy) || dl_policy(p->policy))) {
 		cpuset_locked = true;
 		cpuset_lock();
+		dl_accounting_lock();
 	}
 
 	/*
@@ -655,6 +656,7 @@ change:
 		policy = oldpolicy = -1;
 		task_rq_unlock(rq, p, &rf);
 		if (cpuset_locked) {
+			dl_accounting_unlock();
 			cpuset_unlock();
 			cpuset_locked = false;
 		}
@@ -746,8 +748,10 @@ change:
 	task_rq_unlock(rq, p, &rf);
 
 	if (pi) {
-		if (cpuset_locked)
+		if (cpuset_locked) {
+			dl_accounting_unlock();
 			cpuset_unlock();
+		}
 		rt_mutex_adjust_pi(p);
 	}
 
@@ -759,8 +763,10 @@ change:
 
 unlock:
 	task_rq_unlock(rq, p, &rf);
-	if (cpuset_locked)
+	if (cpuset_locked) {
+		dl_accounting_unlock();
 		cpuset_unlock();
+	}
 	return retval;
 }
 

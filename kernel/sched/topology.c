@@ -3516,7 +3516,16 @@ match3:
 void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
 			     struct sched_domain_attr *dattr_new)
 {
+	/*
+	 * The root domains attached here count no task's bandwidth until
+	 * dl_rebuild_rd_accounting() at the end: no admission of bandwidth
+	 * may run meanwhile. The callers of this hold cpuset_mutex, which
+	 * keeps admissions out, where cpusets are built in; the lock
+	 * dl_accounting_lock() takes stands in for it where they are not.
+	 */
+	dl_accounting_lock();
 	sched_domains_mutex_lock();
 	partition_sched_domains_locked(ndoms_new, doms_new, dattr_new);
 	sched_domains_mutex_unlock();
+	dl_accounting_unlock();
 }

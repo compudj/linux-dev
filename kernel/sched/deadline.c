@@ -3661,6 +3661,54 @@ void dl_clear_root_domain(struct root_domain *rd)
 		dl_server_add_bw(rd, i);
 }
 
+#ifndef CONFIG_CPUSETS
+/*
+ * Where cpusets are built in, cpuset_mutex keeps an admission of bandwidth
+ * from running against a rebuild of the accounting: __sched_setscheduler()
+ * takes it for every change of or into SCHED_DEADLINE, and the callers of
+ * partition_sched_domains() hold it from the attachment of the new root
+ * domains to the rebuild. Where they are not, cpuset_lock() is a stub and
+ * this takes its place, in both.
+ */
+static DEFINE_MUTEX(dl_accounting_mutex);
+
+void dl_accounting_lock(void)
+{
+	mutex_lock(&dl_accounting_mutex);
+}
+
+void dl_accounting_unlock(void)
+{
+	mutex_unlock(&dl_accounting_mutex);
+}
+
+void lockdep_assert_dl_accounting_held(void)
+{
+	lockdep_assert_held(&dl_accounting_mutex);
+}
+
+/*
+ * Rebuild the root domains' accounting, where no cpuset holds the
+ * deadline tasks of each: they are found by walking them all, which
+ * dl_rebuild_rd_accounting() of the cpusets does per cpuset instead.
+ */
+void dl_rebuild_rd_accounting(void)
+{
+	struct task_struct *g, *p;
+
+	lockdep_assert_cpus_held();
+	lockdep_assert_held(&sched_domains_mutex);
+	lockdep_assert_held(&dl_accounting_mutex);
+
+	dl_clear_root_domains();
+
+	read_lock(&tasklist_lock);
+	for_each_process_thread(g, p)
+		dl_add_task_root_domain(p);
+	read_unlock(&tasklist_lock);
+}
+#endif /* !CONFIG_CPUSETS */
+
 /*
  * Clear every root domain ahead of a rebuild of their accounting, which
  * dl_add_task_root_domain() then fills with the deadline tasks of the
@@ -4089,6 +4137,7 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 	 */
 	if (!err && dl_policy(policy) && !task_has_dl_policy(p)) {
 		lockdep_assert_cpuset_lock_held();
+		lockdep_assert_dl_accounting_held();
 		if (p->dl.dl_departed_cpu >= 0)
 			dl_task_release_bw(p, -1);
 		p->dl.dl_bw_gen = dl_bw_gen;
