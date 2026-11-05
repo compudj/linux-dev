@@ -350,6 +350,7 @@ static void dl_change_utilization(struct task_struct *p, u64 new_bw)
 	dl_rq_change_utilization(task_rq(p), &p->dl, new_bw);
 }
 
+static void __dl_clear_state(struct sched_dl_entity *dl_se);
 static void __dl_clear_params(struct sched_dl_entity *dl_se);
 
 /*
@@ -3550,15 +3551,62 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
 	dec_dl_tasks_cs(p);
 
 	if (!task_on_rq_queued(p)) {
-		/*
-		 * Inactive timer is armed. However, p is leaving DEADLINE and
-		 * might migrate away from this rq while continuing to run on
-		 * some other class. We need to remove its contribution from
-		 * this rq running_bw now, or sub_rq_bw (below) will complain.
-		 */
-		if (p->dl.dl_non_contending)
+		bool released = false;
+
+		if (p->dl.dl_non_contending) {
+			/*
+			 * Inactive timer is armed. However, p is leaving
+			 * DEADLINE and might migrate away from this rq while
+			 * continuing to run on some other class. We need to
+			 * remove its contribution from this rq running_bw now,
+			 * or sub_rq_bw (below) will complain.
+			 *
+			 * inactive_task_timer() will find !dl_task(p) and
+			 * release total_bw via __dl_sub().
+			 */
 			sub_running_bw(&p->dl, &rq->dl);
+		} else if (p->dl.dl_runtime && !dl_entity_is_special(&p->dl)) {
+			/*
+			 * No pending inactive timer: the task never ran as
+			 * DEADLINE or the timer already fired while still
+			 * DEADLINE (only dropping running_bw at that time).
+			 * Nobody else will release total_bw, do it now.
+			 *
+			 * Not for a task without parameters of its own, one
+			 * deboosted from priority inheritance, nor for a
+			 * special one: neither has bandwidth in total_bw.
+			 */
+			struct dl_bw *dl_b = dl_bw_of(task_cpu(p));
+
+			raw_spin_lock(&dl_b->lock);
+			__dl_sub(dl_b, p->dl.dl_bw, dl_bw_cpus(task_cpu(p)));
+			raw_spin_unlock(&dl_b->lock);
+			released = true;
+		}
 		sub_rq_bw(&p->dl, &rq->dl);
+		/*
+		 * Released: its 0-lag time is past, and the state of the
+		 * period it was in goes with the bandwidth, as where
+		 * inactive_task_timer() resets it. Its bandwidth is no one's
+		 * to release again, and a dl_bw of 0 is what every path that
+		 * would takes. Kept, it would make the task one with
+		 * bandwidth to task_contending() and task_non_contending()
+		 * once priority inheritance boosts it, and a deboost while
+		 * it sleeps would release it a second time. So would the
+		 * inactive timer's handler when it runs late,
+		 * dl_non_contending cleared under it by
+		 * migrate_task_rq_dl(): it finds !dl_task(p).
+		 *
+		 * The parameters themselves stay, where
+		 * inactive_task_timer() resets them with the bandwidth: the
+		 * task may still be the donor of a priority inheritance
+		 * boost until rt_mutex_adjust_pi() walks the chain, outside
+		 * this runqueue lock, and replenish_dl_entity() of the
+		 * boosted owner would never leave its loop over a dl_period
+		 * and a dl_runtime of 0.
+		 */
+		if (released)
+			__dl_clear_state(&p->dl);
 	}
 
 	/*
@@ -3960,22 +4008,34 @@ bool __checkparam_dl(const struct sched_attr *attr)
 /*
  * This function clears the sched_dl_entity static params.
  */
-static void __dl_clear_params(struct sched_dl_entity *dl_se)
+/*
+ * The bandwidth of @dl_se and the state of the period it is in: what a
+ * task that left the class past its 0-lag time has no use for. The
+ * parameters stay, where a boosted owner may still read them.
+ */
+static void __dl_clear_state(struct sched_dl_entity *dl_se)
 {
-	dl_se->dl_runtime		= 0;
-	dl_se->dl_deadline		= 0;
-	dl_se->dl_period		= 0;
 	dl_se->flags			= 0;
 	dl_se->dl_bw			= 0;
-	dl_se->dl_density		= 0;
 
 	dl_se->deadline			= 0;
 	dl_se->runtime			= 0;
 
 	dl_se->dl_throttled		= 0;
 	dl_se->dl_yielded		= 0;
-	dl_se->dl_non_contending	= 0;
 	dl_se->dl_overrun		= 0;
+}
+
+static void __dl_clear_params(struct sched_dl_entity *dl_se)
+{
+	__dl_clear_state(dl_se);
+
+	dl_se->dl_runtime		= 0;
+	dl_se->dl_deadline		= 0;
+	dl_se->dl_period		= 0;
+	dl_se->dl_density		= 0;
+
+	dl_se->dl_non_contending	= 0;
 	dl_se->dl_server		= 0;
 	dl_se->dl_defer			= 0;
 	dl_se->dl_defer_running		= 0;
