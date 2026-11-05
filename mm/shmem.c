@@ -82,6 +82,7 @@ static struct vfsmount *shm_mnt __ro_after_init;
 #include <linux/uuid.h>
 #include <linux/quotaops.h>
 #include <linux/rcupdate_wait.h>
+#include <linux/cid_namespace.h>
 
 #include <linux/uaccess.h>
 
@@ -1639,6 +1640,9 @@ static void shmem_evict_inode(struct inode *inode)
 	}
 
 	simple_xattrs_free(&sbinfo->xa_cache, &info->xattrs, sbinfo->max_inodes ? &freed : NULL);
+#ifdef CONFIG_CID_NS
+	cid_ns_unbind(&info->cid_ns);
+#endif
 
 	shmem_free_inode(inode->i_sb, freed);
 	if (inode->i_blocks)
@@ -3119,6 +3123,12 @@ static int shmem_mmap_prepare(struct vm_area_desc *desc)
 	struct file *file = desc->file;
 	struct inode *inode = file_inode(file);
 
+	/* Bound to a concurrency ID namespace (MFD_CID_NS): its processes alone, each mapping for itself. */
+	if (cid_ns_file_bound(file)) {
+		if (!cid_ns_may_map(file))
+			return -EPERM;
+		vma_desc_set_flags(desc, VMA_DONTCOPY_BIT);
+	}
 	file_accessed(file);
 	/* This is anonymous shared memory if it is unlinked at the time of mmap */
 	if (inode->i_nlink)

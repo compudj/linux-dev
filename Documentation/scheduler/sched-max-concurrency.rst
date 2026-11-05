@@ -1499,11 +1499,27 @@ members of a namespace, below the maximum and below the soft limit in
 force; a member in user space always has one; a member is never outside
 the home's subtree; ``mm_cid`` is untouched by all of this. User space
 keeps: one table per namespace, sized once by the maximum; never index
-it from two namespaces; assert it with the namespace inode if it
-matters. The data sized by the maximum lives in shared memory, and the
-convention is that the memory and the namespace coincide. The kernel
-does not enforce the correspondence; a process that breaks it corrupts
-only its own data.
+it from two namespaces. The data sized by the maximum lives in shared
+memory, and the kernel can enforce that the memory and the namespace
+coincide: a memfd created with ``MFD_CID_NS`` is bound to its creator's
+namespace, and only the namespace's processes map it. The binding is the
+inode's, made before any descriptor exists, so no mapping from outside
+can race it. A map from outside fails with ``EPERM``, whoever holds the
+descriptor; a mapping of a bound object is never inherited by a
+``fork(2)`` child, which inherits the descriptor and maps the object for
+itself (the mapping has the ``MADV_DONTFORK`` property from its creation,
+and ``MADV_DOFORK`` is refused on it), so a child born into another
+namespace after ``unshare(CLONE_NEWCID)`` has nothing to lose;
+``setns(2)`` fails with ``EBUSY`` while the caller maps a bound object,
+which it unmaps first; ``execve(2)`` starts from a fresh mm. So a mapping
+of a bound object belongs to a member at every instant user code runs,
+and a table sized by the maximum is never indexed from another space.
+Kernel-side access to a member's memory, ``ptrace(2)`` or
+``process_vm_writev(2)`` from a debugger outside, is not a mapping and
+keeps working: the hazard is a user instruction indexing with an ID of
+another space. Binding to the initial namespace is allowed, and means
+initial-namespace processes only. No fault path is involved: the checks
+are at ``mmap`` and ``madvise``, the one walk of an mm is at ``setns(2)``.
 
 How it is built:
 
@@ -1540,6 +1556,14 @@ How it is built:
 * A member that found no ID free at its schedule in takes the path a
   thread of a bounded mm takes (``cid_wait()``, ``sched_cid_resume()``):
   the same waiters, hand-offs and wake-ups, on the namespace's domain.
+* The memory binding is a pointer in ``shmem_inode_info`` holding a
+  namespace reference, set by ``memfd_alloc_file()`` (``cid_ns_bind_file()``)
+  and dropped at the inode's eviction; ``shmem_mmap_prepare()`` asks
+  ``cid_ns_may_map()``, which System V segments reach through their
+  underlying file, and gives the mapping ``VMA_DONTCOPY``, which
+  ``madvise(MADV_DOFORK)`` refuses to clear on a bound mapping;
+  ``cidns_install()`` walks the caller's mm and refuses while it maps a
+  bound object.
 * ``ns_cid`` is written to the rseq area of every registration larger
   than the original 32 bytes, the only lengths ``rseq(2)`` admits being
   that one and the ones that hold the whole field, validated like

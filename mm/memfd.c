@@ -18,6 +18,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/memfd.h>
 #include <linux/pid_namespace.h>
+#include <linux/cid_namespace.h>
 #include <uapi/linux/memfd.h>
 #include "internal.h"
 #include "swap.h"
@@ -341,7 +342,8 @@ long memfd_fcntl(struct file *file, unsigned int cmd, unsigned int arg)
 #define MFD_NAME_PREFIX_LEN (sizeof(MFD_NAME_PREFIX) - 1)
 #define MFD_NAME_MAX_LEN (NAME_MAX - MFD_NAME_PREFIX_LEN)
 
-#define MFD_ALL_FLAGS (MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL | MFD_EXEC)
+#define MFD_ALL_FLAGS (MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL | MFD_EXEC | \
+		       MFD_CID_NS)
 
 static int check_sysctl_memfd_noexec(unsigned int *flags)
 {
@@ -496,6 +498,15 @@ struct file *memfd_alloc_file(const char *name, unsigned int flags)
 		file_seals = memfd_file_seals_ptr(file);
 		if (file_seals)
 			*file_seals &= ~F_SEAL_SEAL;
+	}
+
+	/* Before any descriptor exists: no mapping from outside the namespace, ever. */
+	if (flags & MFD_CID_NS) {
+		err = cid_ns_bind_file(file);
+		if (err) {
+			fput(file);
+			return ERR_PTR(err);
+		}
 	}
 
 	return file;

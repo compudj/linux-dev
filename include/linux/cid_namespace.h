@@ -14,6 +14,7 @@
 #include <linux/cpumask.h>
 #include <linux/err.h>
 
+struct file;
 struct task_group;
 struct user_namespace;
 extern struct user_namespace init_user_ns;
@@ -82,6 +83,16 @@ static inline int cid_ns_get_max_prctl(void)
 	return cid_ns_max(current->nsproxy->cid_ns);
 }
 
+/*
+ * Memory bound to a namespace at its creation (memfd_create(MFD_CID_NS)):
+ * mapped by the namespace's processes only, so that a table sized by the
+ * maximum is never indexed from another space. The binding is the inode's.
+ */
+int cid_ns_bind_file(struct file *file);
+void cid_ns_unbind(struct cid_namespace **slot);
+bool cid_ns_file_bound(struct file *file);
+bool cid_ns_may_map(struct file *file);
+
 /* The engine's side, kernel/sched/cid.c. */
 int cid_ns_domain_init(struct cid_namespace *ns);
 void cid_ns_domain_exit(struct cid_namespace *ns);
@@ -113,6 +124,21 @@ static inline int cid_ns_get_max_prctl(void)
 }
 
 static inline void sched_cid_switch_ns(struct task_struct *t, struct nsproxy *new) { }
+
+static inline int cid_ns_bind_file(struct file *file)
+{
+	return -EINVAL;
+}
+
+static inline bool cid_ns_file_bound(struct file *file)
+{
+	return false;
+}
+
+static inline bool cid_ns_may_map(struct file *file)
+{
+	return true;
+}
 #endif /* !CONFIG_CID_NS */
 
 DEFINE_FREE(cid_ns, struct cid_namespace *, if (_T) put_cid_ns(_T))

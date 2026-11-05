@@ -51,6 +51,9 @@ struct shmem_inode_info {
 	pgoff_t			fallocend;	/* highest fallocate endindex */
 	unsigned int		fsflags;	/* for FS_IOC_[SG]ETFLAGS */
 	atomic_t		stop_eviction;	/* hold when working on inode */
+#ifdef CONFIG_CID_NS
+	struct cid_namespace	*cid_ns;	/* bound to it: its processes alone map the file, see MFD_CID_NS */
+#endif
 #ifdef CONFIG_TMPFS_QUOTA
 	struct dquot __rcu	*i_dquot[MAXQUOTAS];
 #endif

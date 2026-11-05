@@ -16,6 +16,8 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 #include <linux/proc_ns.h>
+#include <linux/shmem_fs.h>
+#include <linux/mm.h>
 #include <linux/nstree.h>
 #include <linux/slab.h>
 #include <linux/cred.h>
@@ -117,9 +119,105 @@ void free_cid_ns(struct cid_namespace *ns)
 }
 
 /*
+ * Memory bound to a namespace: a memfd created with MFD_CID_NS belongs to
+ * its creator's namespace, and only the namespace's processes map it, so
+ * that a table sized by the maximum is never indexed from another space.
+ * The binding is the inode's, set before any descriptor exists and cleared
+ * at its eviction, and a mapping never outlives the membership: a mapping
+ * is never inherited by a fork(2) child, which maps the object for itself
+ * (VMA_DONTCOPY, which madvise(MADV_DOFORK) cannot clear), setns(2) is
+ * refused while one exists, and execve(2) starts from a fresh mm. Kernel-side
+ * access to a process's memory (ptrace(2), process_vm_writev(2)) is not a
+ * mapping and is left alone: the hazard is a user instruction indexing
+ * with an ID of another space.
+ */
+static struct cid_namespace **cid_ns_file_slot(struct file *file)
+{
+	/* The underlying file of a System V segment too: same mapping, same inode. */
+	if (shmem_file(file))
+		return &SHMEM_I(file_inode(file))->cid_ns;
+	return NULL;
+}
+
+/* At the creation of @file: nothing else refers to it, nothing to lock. */
+int cid_ns_bind_file(struct file *file)
+{
+	struct cid_namespace **slot = cid_ns_file_slot(file);
+
+	if (!slot)
+		return -EINVAL;
+	*slot = get_cid_ns(current->nsproxy->cid_ns);
+	return 0;
+}
+
+/* At the eviction of the inode. */
+void cid_ns_unbind(struct cid_namespace **slot)
+{
+	if (*slot) {
+		put_cid_ns(*slot);
+		*slot = NULL;
+	}
+}
+
+/* The namespace the memory of @file is bound to, NULL when none. */
+static struct cid_namespace *cid_ns_of_file(struct file *file)
+{
+	struct cid_namespace **slot = cid_ns_file_slot(file);
+
+	return slot ? *slot : NULL;
+}
+
+bool cid_ns_file_bound(struct file *file)
+{
+	return cid_ns_of_file(file) != NULL;
+}
+
+/* From the mmap hooks: unbound, or bound to the caller's namespace. */
+bool cid_ns_may_map(struct file *file)
+{
+	struct cid_namespace *ns = cid_ns_of_file(file);
+
+	return !ns || ns == current->nsproxy->cid_ns;
+}
+
+/* The first mapping of @mm from @start of memory bound to a namespace other than @ns. */
+static struct vm_area_struct *cid_ns_find_other(struct mm_struct *mm, unsigned long start,
+						struct cid_namespace *ns)
+{
+	VMA_ITERATOR(vmi, mm, start);
+	struct vm_area_struct *vma;
+
+	for_each_vma(vmi, vma) {
+		struct cid_namespace *bound;
+
+		if (!vma->vm_file)
+			continue;
+		bound = cid_ns_of_file(vma->vm_file);
+		if (bound && bound != ns)
+			return vma;
+	}
+	return NULL;
+}
+
+/* Does @mm map memory bound to a namespace other than @ns? */
+static bool cid_ns_mm_maps_other(struct mm_struct *mm, struct cid_namespace *ns)
+{
+	bool maps;
+
+	if (!mm)
+		return false;
+	mmap_read_lock(mm);
+	maps = cid_ns_find_other(mm, 0, ns) != NULL;
+	mmap_read_unlock(mm);
+	return maps;
+}
+
+/*
  * A fork(2) without CLONE_VM, and execve(2): the task takes the namespace
  * its creator set for its children. The membership of the domain follows
- * in sched_post_fork() and switch_task_namespaces().
+ * in sched_post_fork() and switch_task_namespaces(). No mapping of memory
+ * bound to a namespace follows: a fork(2) child inherits none (VMA_DONTCOPY),
+ * an execve(2) has a fresh mm already.
  */
 void cidns_on_fork(struct nsproxy *nsproxy, struct task_struct *tsk)
 {
@@ -189,6 +287,9 @@ static int cidns_install(struct nsset *nsset, struct ns_common *new)
 		return -EPERM;
 	/* From outside the cgroup subtree the namespace lives in: refused, as a migration out of it is. */
 	if (!conc_ns_may_join(ns))
+		return -EBUSY;
+	/* Its mappings of memory bound to the namespace it leaves: unmapped first, by the caller. */
+	if (cid_ns_mm_maps_other(current->mm, ns))
 		return -EBUSY;
 
 	get_cid_ns(ns);
