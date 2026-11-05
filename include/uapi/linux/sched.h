@@ -46,6 +46,7 @@
  * syscalls only:
  */
 #define CLONE_NEWTIME	0x00000080	/* New time namespace */
+#define CLONE_NEWCID	0x00000040	/* New concurrency ID namespace */
 
 /*
  * unshare flags share the bit space with clone flags but only apply to the

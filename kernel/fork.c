@@ -1014,6 +1014,12 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	tsk->mm_cid.cid = MM_CID_UNSET;
 	tsk->mm_cid.active = 0;
 	INIT_HLIST_NODE(&tsk->mm_cid.node);
+#ifdef CONFIG_CID_NS
+	tsk->ns_cid.cid = MM_CID_UNSET;
+	tsk->ns_cid.active = 0;
+	INIT_HLIST_NODE(&tsk->ns_cid.node);
+	tsk->ns_dom = NULL;
+#endif
 #endif
 
 #ifdef CONFIG_BPF_SYSCALL
@@ -3041,7 +3047,7 @@ static bool clone3_args_valid(struct kernel_clone_args *kargs)
 	 * - make the CLONE_DETACHED bit reusable for clone3
 	 * - make the CSIGNAL bits reusable for clone3
 	 */
-	if (kargs->flags & (CLONE_DETACHED | (CSIGNAL & (~CLONE_NEWTIME))))
+	if (kargs->flags & (CLONE_DETACHED | (CSIGNAL & ~(CLONE_NEWTIME | CLONE_NEWCID))))
 		return false;
 
 	if ((kargs->flags & (CLONE_SIGHAND | CLONE_CLEAR_SIGHAND)) ==

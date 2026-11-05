@@ -1513,6 +1513,11 @@ struct task_struct {
 	struct rseq_data		rseq;
 	/* Concurrency IDs: the mm's domain, and the concurrency ID namespace's */
 	struct cid_user			mm_cid;
+#ifdef CONFIG_CID_NS
+	struct cid_user			ns_cid;
+	/* The namespace's domain while a member of one, with a reference on the namespace */
+	struct cid_domain		*ns_dom;
+#endif
 
 	struct tlbflush_unmap_batch	tlb_ubc;
 
@@ -2435,6 +2440,30 @@ static __always_inline int task_mm_cid(struct task_struct *t)
 {
 	return t->mm_cid.cid & ~(MM_CID_ONCPU | MM_CID_TRANSIT);
 }
+
+/* The domain of the concurrency ID namespace @t is a member of, NULL when none. */
+static __always_inline struct cid_domain *task_ns_dom(struct task_struct *t)
+{
+#ifdef CONFIG_CID_NS
+	return READ_ONCE(t->ns_dom);
+#else
+	return NULL;
+#endif
+}
+
+/*
+ * The cross-process concurrency ID: in a concurrency ID namespace, the
+ * namespace's ID; in the initial namespace, the CPU number, a
+ * concurrency ID too.
+ */
+static __always_inline int task_ns_cid(struct task_struct *t)
+{
+#ifdef CONFIG_CID_NS
+	if (t->ns_dom)
+		return t->ns_cid.cid & ~(MM_CID_ONCPU | MM_CID_TRANSIT);
+#endif
+	return task_cpu(t);
+}
 #else
 static inline void sched_mm_cid_before_execve(struct task_struct *t) { }
 static inline void sched_mm_cid_after_execve(struct task_struct *t) { }
@@ -2446,6 +2475,11 @@ static __always_inline int task_mm_cid(struct task_struct *t)
 	 * disabled. This provides functional per-cpu data structure accesses
 	 * in user-space, althrough it won't provide the memory usage benefits.
 	 */
+	return task_cpu(t);
+}
+
+static __always_inline int task_ns_cid(struct task_struct *t)
+{
 	return task_cpu(t);
 }
 #endif
@@ -2602,6 +2636,7 @@ struct cgroup;
 struct cgroup_subsys_state;
 struct cgroup_taskset;
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
+extern void sched_cid_resume(void);
 extern bool conc_cgroup_limited(struct cgroup *cgrp);
 extern int conc_cpuset_attach_check(struct cgroup_taskset *tset);
 extern void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus);
@@ -2618,7 +2653,6 @@ extern void conc_dl_rebuild_caps(void);
 extern bool conc_dl_domain_busy(struct cgroup *cgrp);
 extern void conc_fatal_signal(struct task_struct *t);
 extern void conc_hold_resume(void);
-extern void sched_cid_resume(void);
 
 /*
  * From resume_user_mode_work(): a hold of the concurrency limit is
@@ -2640,7 +2674,6 @@ static inline int conc_cpuset_attach_check(struct cgroup_taskset *tset)
 }
 static inline void conc_fatal_signal(struct task_struct *t) { }
 static inline void conc_cpuset_update(struct cgroup_subsys_state *css, const struct cpumask *cpus) { }
-static inline void sched_conc_resume_user_mode(void) { }
 static inline void conc_pass_begin(void) { }
 static inline void conc_pass_end(void) { }
 static inline int conc_cpuset_busy(struct cgroup_subsys_state *css,

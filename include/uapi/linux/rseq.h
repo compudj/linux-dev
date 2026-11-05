@@ -180,7 +180,11 @@ struct rseq {
 	 * user-space with single-copy atomicity semantics. This field should
 	 * only be read by the thread which registered this data structure.
 	 * Aligned on 32-bit. Contains the current thread's concurrency ID
-	 * (allocated uniquely within a memory map).
+	 * (allocated uniquely within a memory map), below the number of
+	 * possible CPUs. Under a cpu.concurrency.max limit, it is also kept
+	 * below the limit in force for the cgroups of the process's threads:
+	 * a decrease compacts the IDs the kernel hands out, and data indexed
+	 * by mm_cid stays sized by the number of possible CPUs.
 	 */
 	__u32 mm_cid;
 
@@ -191,15 +195,24 @@ struct rseq {
 	struct rseq_slice_ctrl slice_ctrl;
 
 	/*
-	 * Before rseq became extensible, its original size was 32 bytes even
-	 * though the active rseq area was only 20 bytes.
-	 * Exposing a 32 bytes feature size would make life needlessly painful
-	 * for userspace. Therefore, add a reserved byte after byte 32
-	 * to bump the rseq feature size from 32 to 33.
-	 * The next field to be added to the rseq area will be larger
-	 * than one byte, and will replace this reserved byte.
+	 * Restartable sequences ns_cid field. Updated by the kernel. Read by
+	 * user-space with single-copy atomicity semantics. This field should
+	 * only be read by the thread which registered this data structure.
+	 * Aligned on 32-bit. Contains the current thread's cross-process
+	 * concurrency ID: in a concurrency ID namespace (CLONE_NEWCID), an ID
+	 * allocated uniquely among the tasks of the namespace running at the
+	 * same time, below the value prctl(PR_GET_NS_CID_MAX) returns, which
+	 * does not change for the life of the namespace, and below the limit
+	 * in force for the cgroup the namespace lives in; in the initial
+	 * namespace, the CPU number, below that value there too.
+	 * The kernel sets it before the registration returns
+	 * to user space. Only valid for registrations larger than the original
+	 * 32 bytes: AT_RSEQ_FEATURE_SIZE of at least 36 says the kernel writes
+	 * it. This field took the place of the reserved byte that bumped the
+	 * feature size from 32 to 33; registrations of 33 to 35 bytes are
+	 * refused.
 	 */
-	__u8 __reserved;
+	__u32 ns_cid;
 
 	/*
 	 * Flexible array member at end of structure, after last feature field.

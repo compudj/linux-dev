@@ -498,6 +498,12 @@ bool rseq_set_ids_get_csaddr(struct task_struct *t, struct rseq_ids *ids, u64 *c
 			unsafe_get_user(uval, &rseq->mm_cid, efault);
 			if (uval != t->rseq.ids.mm_cid)
 				goto die;
+			/* ns_cid exists in registrations past the original size only */
+			if (rseq_has_ns_cid(t)) {
+				unsafe_get_user(uval, &rseq->ns_cid, efault);
+				if (uval != t->rseq.ids.ns_cid)
+					goto die;
+			}
 		}
 
 		unsafe_put_user(ids->cpu_id, &rseq->cpu_id_start, efault);
@@ -507,9 +513,16 @@ bool rseq_set_ids_get_csaddr(struct task_struct *t, struct rseq_ids *ids, u64 *c
 		if (csaddr)
 			unsafe_get_user(*csaddr, &rseq->rseq_cs, efault);
 
-		/* RSEQ ABI V2 only operations */
-		if (rseq_v2(t))
-			rseq_slice_clear_user(rseq, efault);
+		/*
+		 * The fields past mm_cid are part of a registration past the
+		 * original size only. ns_cid is written for every such one,
+		 * the time slice extension for the RSEQ ABI V2 mode.
+		 */
+		if (rseq_has_ns_cid(t)) {
+			unsafe_put_user(ids->ns_cid, &rseq->ns_cid, efault);
+			if (rseq_v2(t))
+				rseq_slice_clear_user(rseq, efault);
+		}
 	}
 
 	rseq_slice_clear_grant(t);
@@ -641,6 +654,7 @@ static __always_inline bool rseq_exit_user_update(struct pt_regs *regs, struct t
 		.cpu_id	 = cpu,
 		.mm_cid	 = task_mm_cid(t),
 		.node_id = cpu_to_node(cpu),
+		.ns_cid	 = task_ns_cid(t),
 	};
 
 	return rseq_update_usr(t, regs, &ids);

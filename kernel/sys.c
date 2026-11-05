@@ -62,6 +62,7 @@
 #include <linux/sched/coredump.h>
 #include <linux/sched/task.h>
 #include <linux/sched/cputime.h>
+#include <linux/cid_namespace.h>
 #include <linux/rcupdate.h>
 #include <linux/uidgid.h>
 #include <linux/cred.h>
@@ -2891,6 +2892,11 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		if (arg4 || arg5)
 			return -EINVAL;
 		error = rseq_slice_extension_prctl(arg2, arg3);
+		break;
+	case PR_GET_NS_CID_MAX:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = cid_ns_get_max_prctl();
 		break;
 	case PR_GET_CFI:
 		if (arg2 != PR_CFI_BRANCH_LANDING_PADS)

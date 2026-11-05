@@ -20,6 +20,7 @@
 #include <net/net_namespace.h>
 #include <linux/ipc_namespace.h>
 #include <linux/time_namespace.h>
+#include <linux/cid_namespace.h>
 #include <linux/fs_struct.h>
 #include <linux/proc_fs.h>
 #include <linux/proc_ns.h>
@@ -49,6 +50,10 @@ struct nsproxy init_nsproxy = {
 	.time_ns		= &init_time_ns,
 	.time_ns_for_children	= &init_time_ns,
 #endif
+#ifdef CONFIG_CID_NS
+	.cid_ns			= &init_cid_ns,
+	.cid_ns_for_children	= &init_cid_ns,
+#endif
 };
 
 static inline struct nsproxy *create_nsproxy(void)
@@ -69,6 +74,8 @@ void nsproxy_free(struct nsproxy *ns)
 	put_pid_ns(ns->pid_ns_for_children);
 	put_time_ns(ns->time_ns);
 	put_time_ns(ns->time_ns_for_children);
+	put_cid_ns(ns->cid_ns);
+	put_cid_ns(ns->cid_ns_for_children);
 	put_cgroup_ns(ns->cgroup_ns);
 	put_net(ns->net_ns);
 	kmem_cache_free(nsproxy_cachep, ns);
@@ -143,8 +150,19 @@ static struct nsproxy *create_new_namespaces(u64 flags,
 	}
 	new_nsp->time_ns = get_time_ns(tsk->nsproxy->time_ns);
 
+	new_nsp->cid_ns_for_children = copy_cid_ns(flags, user_ns,
+					tsk->nsproxy->cid_ns_for_children);
+	if (IS_ERR(new_nsp->cid_ns_for_children)) {
+		err = PTR_ERR(new_nsp->cid_ns_for_children);
+		goto out_cid;
+	}
+	new_nsp->cid_ns = get_cid_ns(tsk->nsproxy->cid_ns);
+
 	return new_nsp;
 
+out_cid:
+	put_time_ns(new_nsp->time_ns);
+	put_time_ns(new_nsp->time_ns_for_children);
 out_time:
 	put_net(new_nsp->net_ns);
 out_net:
@@ -174,7 +192,8 @@ int copy_namespaces(u64 flags, struct task_struct *tsk)
 
 	if (likely(!(flags & (CLONE_NS_ALL & ~CLONE_NEWUSER)))) {
 		if ((flags & CLONE_VM) ||
-		    likely(old_ns->time_ns_for_children == old_ns->time_ns)) {
+		    (likely(old_ns->time_ns_for_children == old_ns->time_ns) &&
+		     likely(old_ns->cid_ns_for_children == old_ns->cid_ns))) {
 			get_nsproxy(old_ns);
 			return 0;
 		}
@@ -196,8 +215,10 @@ int copy_namespaces(u64 flags, struct task_struct *tsk)
 	if (IS_ERR(new_ns))
 		return  PTR_ERR(new_ns);
 
-	if ((flags & CLONE_VM) == 0)
+	if ((flags & CLONE_VM) == 0) {
 		timens_on_fork(new_ns, tsk);
+		cidns_on_fork(new_ns, tsk);
+	}
 
 	nsproxy_ns_active_get(new_ns);
 	tsk->nsproxy = new_ns;
@@ -251,6 +272,9 @@ void switch_task_namespaces(struct task_struct *p, struct nsproxy *new)
 	if (new)
 		nsproxy_ns_active_get(new);
 
+	/* Membership of the concurrency ID namespace's domain follows nsproxy. */
+	sched_cid_switch_ns(p, new);
+
 	task_lock(p);
 	ns = p->nsproxy;
 	p->nsproxy = new;
@@ -286,7 +310,8 @@ int exec_task_namespaces(void)
 	struct task_struct *tsk = current;
 	struct nsproxy *new;
 
-	if (tsk->nsproxy->time_ns_for_children == tsk->nsproxy->time_ns)
+	if (tsk->nsproxy->time_ns_for_children == tsk->nsproxy->time_ns &&
+	    tsk->nsproxy->cid_ns_for_children == tsk->nsproxy->cid_ns)
 		return 0;
 
 	new = create_new_namespaces(0, tsk, current_user_ns(), tsk->fs);
@@ -294,6 +319,7 @@ int exec_task_namespaces(void)
 		return PTR_ERR(new);
 
 	timens_on_fork(new, tsk);
+	cidns_on_fork(new, tsk);
 	switch_task_namespaces(tsk, new);
 	return 0;
 }
@@ -329,6 +355,10 @@ static int check_setns_flags(unsigned long flags)
 #endif
 #ifndef CONFIG_TIME_NS
 	if (flags & CLONE_NEWTIME)
+		return -EINVAL;
+#endif
+#ifndef CONFIG_CID_NS
+	if (flags & CLONE_NEWCID)
 		return -EINVAL;
 #endif
 
@@ -514,6 +544,14 @@ static int validate_nsset(struct nsset *nsset, struct pid *pid)
 #ifdef CONFIG_TIME_NS
 	if (flags & CLONE_NEWTIME) {
 		ret = validate_ns(nsset, &nsp->time_ns->ns);
+		if (ret)
+			goto out;
+	}
+#endif
+
+#ifdef CONFIG_CID_NS
+	if (flags & CLONE_NEWCID) {
+		ret = validate_ns(nsset, &nsp->cid_ns->ns);
 		if (ret)
 			goto out;
 	}

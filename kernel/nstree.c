@@ -64,6 +64,11 @@ struct ns_tree_root time_ns_tree = {
 	.ns_list_head = LIST_HEAD_INIT(time_ns_tree.ns_list_head),
 };
 
+struct ns_tree_root cid_ns_tree = {
+	.ns_rb = RB_ROOT,
+	.ns_list_head = LIST_HEAD_INIT(cid_ns_tree.ns_list_head),
+};
+
 /**
  * ns_tree_node_init - Initialize a namespace tree node
  * @node: The node to initialize
@@ -302,6 +307,8 @@ static struct ns_tree_root *ns_tree_from_type(int ns_type)
 		return &uts_ns_tree;
 	case CLONE_NEWTIME:
 		return &time_ns_tree;
+	case CLONE_NEWCID:
+		return &cid_ns_tree;
 	}
 
 	return NULL;
@@ -416,7 +423,7 @@ static void __free_klistns_free(const struct klistns *kls)
 		put_user_ns(kls->user_ns);
 }
 
-#define NS_ALL (PID_NS | USER_NS | MNT_NS | UTS_NS | IPC_NS | NET_NS | CGROUP_NS | TIME_NS)
+#define NS_ALL (PID_NS | USER_NS | MNT_NS | UTS_NS | IPC_NS | NET_NS | CGROUP_NS | TIME_NS | CID_NS)
 
 static int copy_ns_id_req(const struct ns_id_req __user *req,
 			  struct ns_id_req *kreq)

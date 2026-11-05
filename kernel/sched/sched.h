@@ -543,6 +543,7 @@ struct conc_class {
 #define conc_class_live(c)	((struct cpumask *)((char *)(c)->mask + cpumask_size()))
 struct tg_concurrency {
 	raw_spinlock_t		lock;
+	struct list_head	cid_namespaces;	/* created under the group: fed its effective limit */
 	atomic_t __percpu	*present;
 	cpumask_var_t		used;
 	cpumask_var_t		unused_cores;	/* CPUs of the SMT cores no used CPU is on */
@@ -577,6 +578,7 @@ struct tg_concurrency {
 	bool			active;		/* counting enabled: self or an ancestor is limited */
 	bool			propagate;	/* parent counts this group's slots as entities */
 	bool			shrink_pending;	/* nr_used > effective: over the limit */
+	bool			ns_closed;	/* offline: takes no more namespaces, see conc_ns_anchor() */
 
 	/*
 	 * The value reported dropped, and the concurrency bounds of the

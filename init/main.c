@@ -106,6 +106,7 @@
 #include <linux/fs_struct.h>
 #include <linux/ptdump.h>
 #include <linux/time_namespace.h>
+#include <linux/cid_namespace.h>
 #include <linux/unaligned.h>
 #include <linux/vdso_datastore.h>
 #include <net/net_namespace.h>
@@ -1222,6 +1223,7 @@ void start_kernel(void)
 	proc_caches_init();
 	uts_ns_init();
 	time_ns_init();
+	cid_ns_init();
 	key_init();
 	security_init();
 	dbg_late_init();

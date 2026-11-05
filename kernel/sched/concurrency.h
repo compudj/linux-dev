@@ -10,24 +10,6 @@
 /* Included by sched.h, after the runqueue and task group definitions. */
 
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
-/* Filled in by a later patch. */
-static inline int conc_pin_check(struct cgroup_taskset *tset)
-{
-	return 0;
-}
-
-/* Filled in by a later patch. */
-static inline int conc_pin_fork_check(struct task_struct *p, struct kernel_clone_args *kargs)
-{
-	return 0;
-}
-
-/* Filled in by a later patch. */
-static inline bool conc_task_ns_allows(struct task_struct *t, struct task_group *tg)
-{
-	return false;
-}
-
 /*
  * Concurrency accounting primitives, see
  * Documentation/scheduler/sched-max-concurrency.rst.
@@ -307,6 +289,12 @@ int cpu_concurrency_effective_show(struct seq_file *sf, void *v);
 int conc_attach_check(struct cgroup_taskset *tset);
 
 #ifdef CONFIG_SCHED_MM_CID
+void conc_ns_home(struct cid_namespace *ns, struct task_struct *t);
+
+void conc_ns_unhome(struct cid_namespace *ns);
+
+bool conc_ns_may_join(struct cid_namespace *ns);
+
 unsigned int conc_dom_bound(struct cid_domain *dom);
 
 void conc_dom_grow_tops(struct cid_domain *dom);
@@ -324,9 +312,6 @@ void conc_dom_drop_stale_cids(struct cid_domain *dom);
 void conc_bounds_lock(void);
 
 void conc_bounds_unlock(void);
-
-/* conc_mutex, for the namespace admissions of cid.c. */
-DEFINE_LOCK_GUARD_0(conc_bounds, conc_bounds_lock(), conc_bounds_unlock())
 #endif /* CONFIG_SCHED_MM_CID */
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
@@ -449,6 +434,12 @@ static inline int conc_attach_check(struct cgroup_taskset *tset) { return 0; }
 static inline void conc_bounds_lock(void) { }
 
 static inline void conc_bounds_unlock(void) { }
+
+static inline void conc_ns_home(struct cid_namespace *ns, struct task_struct *t) { }
+
+static inline void conc_ns_unhome(struct cid_namespace *ns) { }
+
+static inline bool conc_ns_may_join(struct cid_namespace *ns) { return true; }
 
 static inline unsigned int conc_dom_bound(struct cid_domain *dom) { return 0; }
 

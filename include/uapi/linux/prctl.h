@@ -416,4 +416,11 @@ struct prctl_mm_map {
 # define PR_CFI_DISABLE		_BITUL(1)
 # define PR_CFI_LOCK		_BITUL(2)
 
+/*
+ * The exclusive upper bound of the ns_cid field of struct rseq in the
+ * calling thread's concurrency ID namespace, which never changes for the
+ * life of the namespace: size per-ID data by it once. See
+ * Documentation/scheduler/sched-max-concurrency.rst.
+ */
+#define PR_GET_NS_CID_MAX		82
 #endif /* _LINUX_PRCTL_H */

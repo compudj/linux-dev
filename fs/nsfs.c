@@ -15,6 +15,7 @@
 #include <linux/mnt_namespace.h>
 #include <linux/ipc_namespace.h>
 #include <linux/time_namespace.h>
+#include <linux/cid_namespace.h>
 #include <linux/utsname.h>
 #include <linux/exportfs.h>
 #include <linux/nstree.h>
@@ -501,6 +502,10 @@ bool is_current_namespace(struct ns_common *ns)
 	case CLONE_NEWTIME:
 		return current_in_namespace(to_time_ns(ns));
 #endif
+#ifdef CONFIG_CID_NS
+	case CLONE_NEWCID:
+		return current_in_namespace(to_cid_ns(ns));
+#endif
 #ifdef CONFIG_USER_NS
 	case CLONE_NEWUSER:
 		return current_in_namespace(to_user_ns(ns));
@@ -611,6 +616,12 @@ static struct dentry *nsfs_fh_to_dentry(struct super_block *sb, struct fid *fh,
 			owning_ns = to_time_ns(ns)->user_ns;
 		break;
 #endif
+#ifdef CONFIG_CID_NS
+	case CLONE_NEWCID:
+		if (!current_in_namespace(to_cid_ns(ns)))
+			owning_ns = to_cid_ns(ns)->user_ns;
+		break;
+#endif
 #ifdef CONFIG_USER_NS
 	case CLONE_NEWUSER:
 		if (!current_in_namespace(to_user_ns(ns)))
@@ -698,6 +709,8 @@ void nsproxy_ns_active_get(struct nsproxy *ns)
 	ns_ref_active_get(ns->net_ns);
 	ns_ref_active_get(ns->time_ns);
 	ns_ref_active_get(ns->time_ns_for_children);
+	ns_ref_active_get(ns->cid_ns);
+	ns_ref_active_get(ns->cid_ns_for_children);
 }
 
 void nsproxy_ns_active_put(struct nsproxy *ns)
@@ -710,4 +723,6 @@ void nsproxy_ns_active_put(struct nsproxy *ns)
 	ns_ref_active_put(ns->net_ns);
 	ns_ref_active_put(ns->time_ns);
 	ns_ref_active_put(ns->time_ns_for_children);
+	ns_ref_active_put(ns->cid_ns);
+	ns_ref_active_put(ns->cid_ns_for_children);
 }
