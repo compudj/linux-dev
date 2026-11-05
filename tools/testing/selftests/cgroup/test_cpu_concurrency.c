@@ -6,6 +6,8 @@
  */
 
 #include "cpu_concurrency_util.h"
+#include <sys/ipc.h>
+#include <sys/shm.h>
 /*
  * A workload which measures itself from user space, for the cases with
  * more runnable tasks than slots.
@@ -2106,6 +2108,9 @@ cleanup:
 #ifndef MFD_CID_NS
 #define MFD_CID_NS	0x0020U
 #endif
+#ifndef SHM_CID_NS
+#define SHM_CID_NS	020000
+#endif
 
 /* The parent's side of the memfd test, read by the child. */
 struct ns_cid_memfd_shared {
@@ -2114,6 +2119,8 @@ struct ns_cid_memfd_shared {
 	size_t huge_len;	/* a huge page, 0 without huge pages */
 	int child_fd;		/* the child's bound memfd, for /proc/<child>/fd/N */
 	int huge_fd;		/* the parent's bound hugetlb memfd, -1 without */
+	int shmid;		/* the parent's bound System V segment, -1 without */
+	void *parent_shm;	/* the parent's attach of it */
 };
 
 /* Return the size of a huge page, or 0 when there are none. */
@@ -2168,6 +2175,13 @@ static int ns_cid_memfd_child(struct ns_cid_memfd_shared *sh, int parent_fd, int
 		if (map != MAP_FAILED || errno != EPERM)
 			return 33;
 	}
+	/* The parent's segment is not inherited and cannot be attached. */
+	if (sh->shmid >= 0) {
+		if (mincore(sh->parent_shm, sh->len, vec) == 0 || errno != ENOMEM)
+			return 34;
+		if (shmat(sh->shmid, NULL, 0) != (void *)-1 || errno != EPERM)
+			return 35;
+	}
 	fd = memfd_create("ns_cid_child", MFD_CID_NS);
 	if (fd < 0)
 		return 23;
@@ -2196,18 +2210,24 @@ static int ns_cid_memfd_child(struct ns_cid_memfd_shared *sh, int parent_fd, int
 	map = mmap(NULL, sh->len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (map != MAP_FAILED || errno != EPERM)
 		return 32;
+	if (sh->shmid >= 0 && shmat(sh->shmid, NULL, 0) == (void *)-1)
+		return 36;
 	return 0;
 }
 
 /*
  * Run a child in the namespace of the parent. Return 0 if it did not
- * inherit the mapping of the parent.
+ * inherit the mapping and the attach of the parent.
  */
 static int ns_cid_memfd_same_ns_child(struct ns_cid_memfd_shared *sh)
 {
 	unsigned char vec[16];
 
-	return mincore(sh->parent_map, sh->len, vec) == 0 || errno != ENOMEM ? 40 : 0;
+	if (mincore(sh->parent_map, sh->len, vec) == 0 || errno != ENOMEM)
+		return 40;
+	if (sh->shmid >= 0 && (mincore(sh->parent_shm, sh->len, vec) == 0 || errno != ENOMEM))
+		return 41;
+	return 0;
 }
 
 /*
@@ -2222,6 +2242,15 @@ static int ns_cid_memfd_same_ns_child(struct ns_cid_memfd_shared *sh)
  *  4. The second child runs ns_cid_memfd_child().
  *  5. While the second child waits, the parent opens the bound memfd of
  *     that child through /proc/<child>/fd. Its mmap() fails with EPERM.
+ *
+ * The parent also creates a bound hugetlb memfd, when the system has huge
+ * pages, and a bound System V segment (SHM_CID_NS), which it attaches:
+ *  - madvise(MADV_DOFORK) on the attach fails with EINVAL;
+ *  - no child inherits the attach;
+ *  - in the second child, mmap() of the hugetlb memfd and shmat() of the
+ *    segment fail with EPERM;
+ *  - after the setns(2) of the second child to the parent's namespace, its
+ *    shmat() succeeds.
  */
 static int ns_cid_memfd_run(void)
 {
@@ -2254,6 +2283,20 @@ static int ns_cid_memfd_run(void)
 		return 15;
 	sh->huge_len = ns_cid_huge_page_size();
 	sh->huge_fd = sh->huge_len ? memfd_create("ns_cid_huge", MFD_HUGETLB | MFD_CID_NS) : -1;
+	if (sh->huge_fd < 0)
+		ksft_print_msg("no hugetlb memfd (%s): its part skipped\n",
+			       sh->huge_len ? strerror(errno) : "no huge pages");
+	/* Create a bound System V segment and attach it. */
+	sh->shmid = shmget(IPC_PRIVATE, sh->len, IPC_CREAT | 0600 | SHM_CID_NS);
+	if (sh->shmid < 0)
+		ksft_print_msg("no System V segment (%s): its part skipped\n", strerror(errno));
+	if (sh->shmid >= 0) {
+		sh->parent_shm = shmat(sh->shmid, NULL, 0);
+		if (sh->parent_shm == (void *)-1)
+			return 18;
+		if (madvise(sh->parent_shm, sh->len, MADV_DOFORK) == 0 || errno != EINVAL)
+			return 19;
+	}
 	child = fork();
 	if (child < 0)
 		return 16;
@@ -2291,6 +2334,8 @@ static int ns_cid_memfd_run(void)
 		return 12;
 	if (waitpid(child, &status, 0) != child)
 		return 13;
+	if (sh->shmid >= 0)
+		shmctl(sh->shmid, IPC_RMID, NULL);
 	return WIFEXITED(status) ? WEXITSTATUS(status) : 14;
 }
 

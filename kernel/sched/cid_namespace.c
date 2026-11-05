@@ -146,7 +146,8 @@ void free_cid_ns(struct cid_namespace *ns)
  * Memory bound to a namespace.
  *
  * A memfd created with MFD_CID_NS, with or without MFD_HUGETLB, belongs to
- * the namespace of its creator.
+ * the namespace of its creator. So does a System V segment created with
+ * SHM_CID_NS: shmat(2) maps the shmem or hugetlbfs file of the segment.
  * Only the processes of that namespace can map the memory. So a table
  * sized by the maximum is never indexed with an ID of another namespace.
  *

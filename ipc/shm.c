@@ -44,6 +44,7 @@
 #include <linux/nsproxy.h>
 #include <linux/mount.h>
 #include <linux/ipc_namespace.h>
+#include <linux/cid_namespace.h>
 #include <linux/rhashtable.h>
 
 #include <linux/uaccess.h>
@@ -766,6 +767,15 @@ static int newseg(struct ipc_namespace *ns, struct ipc_params *params)
 	error = PTR_ERR(file);
 	if (IS_ERR(file))
 		goto no_file;
+	/*
+	 * Bind before the segment has an id, so that no process outside the
+	 * namespace can attach it first.
+	 */
+	if (shmflg & SHM_CID_NS) {
+		error = cid_ns_bind_file(file);
+		if (error)
+			goto no_bind;
+	}
 
 	shp->shm_cprid = get_pid(task_tgid(current));
 	shp->shm_lprid = NULL;
@@ -806,6 +816,8 @@ no_id:
 	fput(file);
 	ipc_rcu_putref(&shp->shm_perm, shm_rcu_free);
 	return error;
+no_bind:
+	fput(file);
 no_file:
 	call_rcu(&shp->shm_perm.rcu, shm_rcu_free);
 	return error;
