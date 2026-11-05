@@ -225,20 +225,6 @@ struct tmpmasks {
 	cpumask_var_t new_cpus;		/* For update_cpumasks_hier() */
 };
 
-void inc_dl_tasks_cs(struct task_struct *p)
-{
-	struct cpuset *cs = task_cs(p);
-
-	atomic_inc(&cs->nr_deadline_tasks);
-}
-
-void dec_dl_tasks_cs(struct task_struct *p)
-{
-	struct cpuset *cs = task_cs(p);
-
-	atomic_dec(&cs->nr_deadline_tasks);
-}
-
 static inline bool is_partition_valid(const struct cpuset *cs)
 {
 	return cs->partition_root_state > 0;
@@ -963,54 +949,6 @@ done:
 	*domains    = doms;
 	*attributes = dattr;
 	return ndoms;
-}
-
-static void dl_update_tasks_root_domain(struct cpuset *cs)
-{
-	struct css_task_iter it;
-	struct task_struct *task;
-
-	if (atomic_read(&cs->nr_deadline_tasks) == 0)
-		return;
-
-	css_task_iter_start(&cs->css, 0, &it);
-
-	while ((task = css_task_iter_next(&it)))
-		dl_add_task_root_domain(task);
-
-	css_task_iter_end(&it);
-}
-
-void dl_rebuild_rd_accounting(void)
-{
-	struct cpuset *cs = NULL;
-	struct cgroup_subsys_state *pos_css;
-
-	lockdep_assert_cpuset_lock_held();
-	lockdep_assert_cpus_held();
-	lockdep_assert_held(&sched_domains_mutex);
-
-	dl_clear_root_domains();
-
-	rcu_read_lock();
-
-	cpuset_for_each_descendant_pre(cs, pos_css, &top_cpuset) {
-
-		if (cpumask_empty(cs->effective_cpus)) {
-			pos_css = css_rightmost_descendant(pos_css);
-			continue;
-		}
-
-		css_get(&cs->css);
-
-		rcu_read_unlock();
-
-		dl_update_tasks_root_domain(cs);
-
-		rcu_read_lock();
-		css_put(&cs->css);
-	}
-	rcu_read_unlock();
 }
 
 /*
@@ -3181,9 +3119,7 @@ static void clear_attach_data(struct llist_head *head, bool cancel)
 	llist_for_each_entry_safe(cs, next, lnode, attach_node) {
 		init_llist_node(&cs->attach_node);
 		if (cs->nr_migrate_dl_tasks) {
-			if (!cancel)
-				atomic_add(cs->nr_migrate_dl_tasks, &cs->nr_deadline_tasks);
-			else if (cs->dl_bw_cpu >= 0) /* && cancel */
+			if (cancel && cs->dl_bw_cpu >= 0)
 				dl_bw_free(cs->dl_bw_cpu, cs->sum_migrate_dl_bw);
 			cs->nr_migrate_dl_tasks = 0;
 			cs->sum_migrate_dl_bw = 0;
@@ -3272,7 +3208,6 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 			 * contribute to sum_migrate_dl_bw.
 			 */
 			cs->nr_migrate_dl_tasks++;
-			oldcs->nr_migrate_dl_tasks--;
 			if (dl_task_needs_bw_move(task, cs->effective_cpus))
 				cs->sum_migrate_dl_bw += task->dl.dl_bw;
 		}
