@@ -3594,6 +3594,15 @@ void dl_add_task_root_domain(struct task_struct *p)
 		cpu = p->dl.dl_departed_cpu;
 		if (!cpu_active(cpu))
 			goto unlock;
+	} else if (READ_ONCE(p->__state) == TASK_DEAD) {
+		/*
+		 * Dead and not departed: its bandwidth was released at its
+		 * last schedule, under its runqueue lock and not this one,
+		 * and dl_bw may still say otherwise. do_task_dead() sets
+		 * TASK_DEAD under pi_lock before that, so a task found alive
+		 * here dies after this walk, and releases what it counted.
+		 */
+		goto unlock;
 	}
 	rq = cpu_rq(cpu);
 	dl_b = &rq->rd->dl_bw;
