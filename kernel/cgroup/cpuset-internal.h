@@ -166,11 +166,7 @@ struct cpuset {
 	 */
 	bool remote_partition_updating;
 
-	/*
-	 * number of SCHED_DEADLINE tasks attached to this cpuset, so that we
-	 * know when to rebuild associated root domain bandwidth information.
-	 */
-	atomic_t nr_deadline_tasks;
+	/* Number of SCHED_DEADLINE tasks the attach in progress moves here. */
 	int nr_migrate_dl_tasks;
 	/* DL bandwidth that needs destination reservation for this attach. */
 	u64 sum_migrate_dl_bw;
