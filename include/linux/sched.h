@@ -735,6 +735,22 @@ struct sched_dl_entity {
 	struct hrtimer			inactive_timer;
 
 	/*
+	 * A task that leaves SCHED_DEADLINE, or dies, before its "0-lag
+	 * time" keeps its bandwidth in its root domain until the inactive
+	 * timer removes it. Meanwhile, @dl_departed_node links the task on
+	 * the list that a rebuild of the root domains' accounting reads.
+	 * @dl_departed_cpu is a CPU of the root domain that counts the
+	 * bandwidth. It stays recorded while priority inheritance boosts the
+	 * task back into the class. Otherwise @dl_departed_cpu is -1.
+	 *
+	 * @dl_bw_gen is the value of dl_bw_gen when the bandwidth was last
+	 * counted. If a rebuild dropped it since, there is nothing to remove.
+	 */
+	struct list_head		dl_departed_node;
+	int				dl_departed_cpu;
+	unsigned int			dl_bw_gen;
+
+	/*
 	 * Bits for DL-server functionality. Also see the comment near
 	 * dl_server_update().
 	 *
