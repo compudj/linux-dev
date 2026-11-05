@@ -1067,7 +1067,13 @@ void rebuild_sched_domains_locked(void)
 
 static void rebuild_sched_domains_cpuslocked(void)
 {
-	mutex_lock(&cpuset_mutex);
+	/*
+	 * An attach in progress has set aside, in the root domain its tasks
+	 * move to, the deadline bandwidth it moves once it takes
+	 * cpuset_mutex again: the rebuild of the accounting would drop that
+	 * reservation, and the move would go through on its strength.
+	 */
+	wait_attach_done_lock();
 	rebuild_sched_domains_locked();
 	mutex_unlock(&cpuset_mutex);
 }
