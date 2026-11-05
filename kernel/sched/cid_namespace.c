@@ -22,6 +22,7 @@
 #include <linux/sched/task.h>
 #include <linux/proc_ns.h>
 #include <linux/shmem_fs.h>
+#include <linux/hugetlb.h>
 #include <linux/mm.h>
 #include <linux/nstree.h>
 #include <linux/slab.h>
@@ -144,7 +145,8 @@ void free_cid_ns(struct cid_namespace *ns)
 /*
  * Memory bound to a namespace.
  *
- * A memfd created with MFD_CID_NS belongs to the namespace of its creator.
+ * A memfd created with MFD_CID_NS, with or without MFD_HUGETLB, belongs to
+ * the namespace of its creator.
  * Only the processes of that namespace can map the memory. So a table
  * sized by the maximum is never indexed with an ID of another namespace.
  *
@@ -165,6 +167,10 @@ static struct cid_namespace **cid_ns_file_slot(struct file *file)
 {
 	if (shmem_file(file))
 		return &SHMEM_I(file_inode(file))->cid_ns;
+#ifdef CONFIG_HUGETLBFS
+	if (is_file_hugepages(file))
+		return &HUGETLBFS_I(file_inode(file))->cid_ns;
+#endif
 	return NULL;
 }
 
