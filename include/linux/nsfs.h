@@ -27,6 +27,7 @@ void nsfs_init(void);
 #define __current_namespace_from_type(__ns)				\
 	_Generic((__ns),						\
 		struct cgroup_namespace *: current->nsproxy->cgroup_ns,	\
+		struct cid_namespace *:    current->nsproxy->cid_ns,	\
 		struct ipc_namespace *:    current->nsproxy->ipc_ns,	\
 		struct net *:              current->nsproxy->net_ns,	\
 		struct pid_namespace *:    task_active_pid_ns(current),	\

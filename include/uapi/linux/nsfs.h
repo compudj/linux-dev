@@ -44,6 +44,12 @@ struct mnt_ns_info {
 #define NS_GET_MNTNS_ID		_IOR(NSIO, 5,  __u64)
 #define NS_GET_ID		_IOR(NSIO, 13, __u64)
 
+/*
+ * Concurrency ID namespace: the ID of the cgroup the namespace lives in,
+ * or 0 when it lives in none.
+ */
+#define NS_GET_CID_CGROUP	_IOR(NSIO, 14, __u64)
+
 enum init_ns_ino {
 	IPC_NS_INIT_INO		= 0xEFFFFFFFU,
 	UTS_NS_INIT_INO		= 0xEFFFFFFEU,
@@ -53,8 +59,9 @@ enum init_ns_ino {
 	TIME_NS_INIT_INO	= 0xEFFFFFFAU,
 	NET_NS_INIT_INO		= 0xEFFFFFF9U,
 	MNT_NS_INIT_INO		= 0xEFFFFFF8U,
+	CID_NS_INIT_INO		= 0xEFFFFFF7U,
 #ifdef __KERNEL__
-	MNT_NS_ANON_INO		= 0xEFFFFFF7U,
+	MNT_NS_ANON_INO		= 0xEFFFFFF6U,
 	MNT_NS_INO_SPECIAL_MAX	= MNT_NS_ANON_INO,
 #endif
 };
@@ -77,12 +84,14 @@ enum init_ns_id {
 	TIME_NS_INIT_ID		= 6ULL,
 	NET_NS_INIT_ID		= 7ULL,
 	MNT_NS_INIT_ID		= 8ULL,
+	CID_NS_INIT_ID		= 9ULL,
 #ifdef __KERNEL__
-	NS_LAST_INIT_ID		= MNT_NS_INIT_ID,
+	NS_LAST_INIT_ID		= CID_NS_INIT_ID,
 #endif
 };
 
 enum ns_type {
+	CID_NS     = (1ULL << 6),  /* CLONE_NEWCID */
 	TIME_NS    = (1ULL << 7),  /* CLONE_NEWTIME */
 	MNT_NS     = (1ULL << 17), /* CLONE_NEWNS */
 	CGROUP_NS  = (1ULL << 25), /* CLONE_NEWCGROUP */

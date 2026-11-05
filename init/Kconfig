@@ -1244,6 +1244,17 @@ config TIME_NS
 config TIME_NS_VDSO
 	def_bool TIME_NS && GENERIC_GETTIMEOFDAY
 
+config CID_NS
+	bool "Concurrency ID namespace"
+	depends on SCHED_MM_CID
+	default y
+	help
+	  The processes of a concurrency ID namespace share one space of
+	  concurrency IDs. rseq(2) reports the ID in the ns_cid field. Tasks
+	  which run at the same time have different IDs. Each ID is below a
+	  maximum which is fixed when the namespace is created.
+	  See Documentation/scheduler/sched-max-concurrency.rst.
+
 config IPC_NS
 	bool "IPC namespace"
 	depends on (SYSVIPC || POSIX_MQUEUE)

@@ -8,9 +8,21 @@
 #include <linux/sched/mm.h>
 #include <linux/cpuset.h>
 #include <linux/stop_machine.h>
+#include <linux/cid_namespace.h>
+#include <linux/nsproxy.h>
 
 #include "sched.h"
 #include "smp.h"
+
+/*
+ * Globals and forward declarations
+ */
+
+#ifdef CONFIG_CID_NS
+static void sched_cid_leave_ns(struct task_struct *t);
+#else
+static inline void sched_cid_leave_ns(struct task_struct *t) { }
+#endif
 
 /*
  * Concurrency IDentifier management
@@ -395,6 +407,23 @@ static void cid_fixup_tasks_to_cpus(struct cid_domain *dom)
 	cid_complete_transit(dom, MM_CID_ONCPU);
 }
 
+/*
+ * Add the allowed CPUs of @t to those of @dom. The members of a namespace
+ * can have any affinity, so each join can widen the domain. For an mm
+ * this changes nothing: a new thread has the mask of its creator.
+ */
+static void cid_join_cpus_allowed(struct cid_domain *dom, struct task_struct *t)
+{
+	unsigned int weight;
+
+	lockdep_assert_held(&dom->lock);
+	weight = cpumask_weighted_or(dom->cpus_allowed, dom->cpus_allowed, &t->cpus_mask);
+	if (weight == dom->nr_cpus_allowed)
+		return;
+	WRITE_ONCE(dom->nr_cpus_allowed, weight);
+	if (cid_on_cpu(dom->mode))
+		dom->pcpu_thrs = cid_calc_pcpu_thrs(dom);
+}
 static bool cid_add_user(struct cid_domain *dom, struct cid_user *u)
 {
 	unsigned int bound;
@@ -637,19 +666,25 @@ static void cid_add_first_user(struct cid_domain *dom, struct task_struct *t, st
 }
 
 /*
- * @t joins @dom: fork(2) and execve(2) for the mm, setns(2) and
- * unshare(2) for a namespace.
+ * Make @t a user of @dom. The first user is handled by
+ * cid_add_first_user().
  *
- * In per CPU mode a joining user takes no ID of its own. It borrows the ID
- * of the CPU it runs on at its schedule in. A task which joins while it is
- * running reaches user space before any schedule in. So it takes its ID
- * here, as a schedule in would.
+ * For an mm, the callers are fork(2) and execve(2). For a namespace, they
+ * are fork(2) and the commit of a namespace switch. That commit is
+ * setns(2), or execve(2) after unshare(2). unshare(2) itself joins
+ * nothing: it only sets the namespace of the children.
  *
- * A task joins while it is running in two cases. The first is setns(2).
- * The second is the failure path of execve(2), which rejoins an mm whose
- * other threads are still users. A fork(2) child does not run yet. In the
- * other cases execve(2) and unshare(2) join a domain which they create, as
- * its first user.
+ * In per-task mode a joining user takes its ID here. In per CPU mode it
+ * takes no ID of its own: it borrows the ID of its CPU when it is
+ * scheduled in. A task which joins while it runs returns to user space
+ * before any schedule in. So it takes its ID here, as a schedule in would.
+ *
+ * These callers join while they run:
+ *  - setns(2);
+ *  - execve(2) into a namespace which has members already;
+ *  - the failure path of execve(2), which rejoins an mm that other
+ *    threads still use.
+ * A fork(2) child does not run yet.
  */
 static void cid_user_join(struct cid_domain *dom, struct task_struct *t, struct cid_user *u)
 {
@@ -667,7 +702,8 @@ static void cid_user_join(struct cid_domain *dom, struct task_struct *t, struct 
 	scoped_guard(cid_local, dom) {
 		struct cid_pcpu *pcp = this_cpu_ptr(dom->pcpu);
 
-		/* The new user's group may widen the bound. */
+		/* The new user's mask and group may widen the CPUs and the bound. */
+		cid_join_cpus_allowed(dom, t);
 		conc_dom_fork(dom, t);
 
 		flip = cid_add_user(dom, u);
@@ -789,7 +825,6 @@ static void cid_user_leave(struct cid_domain *dom, struct task_struct *t, struct
 			}
 			if (flip)
 				cid_fixup_cpus_to_tasks(dom);
-			/* The ID the task held is back in the pool. */
 			cid_wake_waiters(dom);
 			return;
 		}
@@ -819,22 +854,35 @@ static void cid_user_leave(struct cid_domain *dom, struct task_struct *t, struct
  * A user worker (io_uring, vhost) never returns to user space and has no
  * rseq area. It needs no CID.
  */
-void sched_mm_cid_fork(struct task_struct *t)
+static void sched_mm_cid_fork(struct task_struct *t)
 {
 	if (t->mm && !(t->flags & PF_USER_WORKER))
 		cid_user_join(&t->mm->mm_cid, t, &t->mm_cid);
 }
 
-void sched_mm_cid_exit(struct task_struct *t)
+static void sched_mm_cid_leave(struct task_struct *t)
 {
 	if (t->mm)
 		cid_user_leave(&t->mm->mm_cid, t, &t->mm_cid);
 }
 
-/* Deactivate MM CID allocation across execve() */
+/*
+ * Leave the domain of the mm and the domain of the namespace at exit. A
+ * failed fork(2) never joined them, see sched_post_fork().
+ */
+void sched_mm_cid_exit(struct task_struct *t)
+{
+	sched_mm_cid_leave(t);
+	sched_cid_leave_ns(t);
+}
+
+/*
+ * Leave the domain of the mm before execve(2). exec_task_namespaces()
+ * switches the namespace.
+ */
 void sched_mm_cid_before_execve(struct task_struct *t)
 {
-	sched_mm_cid_exit(t);
+	sched_mm_cid_leave(t);
 }
 
 /* Reactivate MM CID after execve() */
@@ -1143,6 +1191,164 @@ void mm_init_cid(struct mm_struct *mm, struct task_struct *p)
 			mm_cpus_allowed(mm), p);
 }
 
+#ifdef CONFIG_CID_NS
+/*
+ * The domain of a concurrency ID namespace, see
+ * Documentation/scheduler/sched-max-concurrency.rst.
+ *
+ * The members are the tasks with an mm whose nsproxy names the namespace.
+ * User workers are not members. A member holds a reference on the
+ * namespace. It caches the domain in task_struct::ns_dom for the context
+ * switch.
+ *
+ * The membership changes at fork(2), at the commit of a namespace switch
+ * and at exit. A cgroup migration does not change it. The members stay in
+ * the subtree of the home of the namespace, see conc_ns_home().
+ *
+ * The bound of the domain is the soft limit of the namespace, see
+ * conc_ns_home() and conc_ns_feed(). No ID is handed out at or above it. A
+ * member which finds none free waits for one at its return to user space,
+ * see sched_cid_resume().
+ */
+DEFINE_STATIC_KEY_FALSE(cid_ns_used);
+
+int cid_ns_domain_init(struct cid_namespace *ns)
+{
+	struct cid_pcpu __percpu *pcpu;
+	struct cpumask *cpus;
+	unsigned long *cidmask;
+
+	/*
+	 * A process in a user namespace can create these. Charge the memory
+	 * to its cgroup.
+	 */
+	pcpu = alloc_percpu_gfp(struct cid_pcpu, GFP_KERNEL_ACCOUNT);
+	cidmask = bitmap_zalloc(num_possible_cpus(), GFP_KERNEL_ACCOUNT);
+	cpus = kzalloc(cpumask_size(), GFP_KERNEL_ACCOUNT);
+	if (!pcpu || !cidmask || !cpus) {
+		kfree(cpus);
+		bitmap_free(cidmask);
+		free_percpu(pcpu);
+		return -ENOMEM;
+	}
+	cid_domain_init(&ns->dom, CID_DOMAIN_NS, pcpu, cidmask, cpus, NULL);
+	ns->dom.bound = conc_dom_bound(&ns->dom);
+	static_branch_enable(&cid_ns_used);
+	return 0;
+}
+
+void cid_ns_domain_exit(struct cid_namespace *ns)
+{
+	struct cid_domain *dom = &ns->dom;
+
+	WARN_ON_ONCE(dom->users);
+	irq_work_sync(&dom->irq_work);
+	cancel_work_sync(&dom->work);
+	conc_dom_destroy(dom);
+	cid_domain_exit(dom);
+	free_percpu(dom->pcpu);
+	bitmap_free(dom->cidmask);
+	kfree(dom->cpus_allowed);
+}
+
+static inline struct cid_namespace *cid_domain_ns(struct cid_domain *dom)
+{
+	return container_of(dom, struct cid_namespace, dom);
+}
+
+/*
+ * Make @t a member of @ns. Set t->ns_dom before the join. The leave clears
+ * it after the user left. In between, the context switch sees an inactive
+ * user and does nothing with it.
+ */
+static void sched_cid_join_ns(struct task_struct *t, struct cid_namespace *ns)
+{
+	get_cid_ns(ns);
+	/*
+	 * A namespace made by clone3(2) gets its home, its maximum and its
+	 * soft limit here, from the cgroup of the child, before any ID is
+	 * taken. One made by unshare(2) has them already.
+	 */
+	conc_ns_home(ns, t);
+	task_lock(t);
+	t->ns_dom = &ns->dom;
+	task_unlock(t);
+	cid_user_join(&ns->dom, t, &t->ns_cid);
+}
+
+static void sched_cid_leave_ns(struct task_struct *t)
+{
+	struct cid_domain *dom = t->ns_dom;
+
+	if (!dom)
+		return;
+	cid_user_leave(dom, t, &t->ns_cid);
+	task_lock(t);
+	t->ns_dom = NULL;
+	task_unlock(t);
+	put_cid_ns(cid_domain_ns(dom));
+}
+
+/*
+ * Return the namespace which @t is a member of under @nsproxy. Return NULL
+ * for the initial namespace, for a task without an mm and for a user
+ * worker.
+ */
+static struct cid_namespace *sched_cid_task_ns(struct task_struct *t, struct nsproxy *nsproxy)
+{
+	struct cid_namespace *ns;
+
+	if (!nsproxy || !t->mm || (t->flags & PF_USER_WORKER))
+		return NULL;
+	ns = nsproxy->cid_ns;
+	return ns == &init_cid_ns ? NULL : ns;
+}
+
+/*
+ * Make the fork(2) child @t a user of the domain of its mm. Make it a
+ * member of its namespace too, if it is in one.
+ */
+void sched_cid_fork(struct task_struct *t)
+{
+	struct cid_namespace *ns;
+
+	sched_mm_cid_fork(t);
+	ns = sched_cid_task_ns(t, t->nsproxy);
+	if (ns && !t->ns_dom)
+		sched_cid_join_ns(t, ns);
+}
+
+/*
+ * Follow a switch of the namespaces of @t to @new. @new is NULL at exit.
+ * Leave the domain of the old namespace and join the domain of the new
+ * one. The callers which change the namespace are setns(2) and execve(2),
+ * where @t is current, and exit. unshare(2) comes here too, but it does
+ * not change the namespace of @t.
+ */
+void sched_cid_switch_ns(struct task_struct *t, struct nsproxy *new)
+{
+	struct cid_namespace *ns = sched_cid_task_ns(t, new);
+
+	if ((ns ? &ns->dom : NULL) == t->ns_dom)
+		return;
+	sched_cid_leave_ns(t);
+	if (ns)
+		sched_cid_join_ns(t, ns);
+	/*
+	 * The task now reports an ID of another namespace. Update its rseq
+	 * area before it returns to user space.
+	 */
+	if (t == current)
+		rseq_force_update();
+}
+
+#else /* !CONFIG_CID_NS */
+void sched_cid_fork(struct task_struct *t)
+{
+	sched_mm_cid_fork(t);
+}
+#endif /* !CONFIG_CID_NS */
+
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
 /*
  * Release the IDs of @dom which CPUs own while they run no user of it.
@@ -1301,12 +1507,14 @@ static void cid_drop_lowered(struct cid_domain *dom, struct task_struct *t, stru
 }
 
 /*
- * Called from resume_user_mode_work(). There are two cases. Current found
- * no ID free below the bound of its mm's domain at its schedule in. Or the
- * bound was lowered below the ID of current while it ran: drop that ID
- * first. Its ID of that domain reads MM_CID_UNSET until it has one. Kernel
- * code which uses the ID must test for that. User space never sees it: the
- * task returns with its IDs, or exits.
+ * Give current the IDs it lacks. Called from resume_user_mode_work(),
+ * after a pending hold. There are two cases. Current found no ID free
+ * below the bound of a domain at its schedule in. Or the bound was
+ * lowered below the ID of current while it ran: drop that ID first. The
+ * domain is the one of its mm or the one of its namespace. Its ID of
+ * that domain reads MM_CID_UNSET until it has one. A user of the ID in
+ * the kernel tests for that value. User space never sees it: the task
+ * returns with its IDs or goes to its exit.
  */
 void sched_cid_resume(void)
 {
@@ -1324,6 +1532,13 @@ void sched_cid_resume(void)
 		if (t->mm_cid.cid == MM_CID_UNSET)
 			cid_resume(&t->mm->mm_cid, t, &t->mm_cid);
 	}
+#ifdef CONFIG_CID_NS
+	if (t->ns_dom) {
+		cid_drop_lowered(t->ns_dom, t, &t->ns_cid);
+		if (t->ns_cid.cid == MM_CID_UNSET)
+			cid_resume(t->ns_dom, t, &t->ns_cid);
+	}
+#endif
 	rseq_force_update();
 }
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */

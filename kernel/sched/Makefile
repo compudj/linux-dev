@@ -43,4 +43,5 @@ obj-y += fair.o
 obj-y += build_policy.o
 obj-y += build_utility.o
 obj-$(CONFIG_SCHED_MM_CID) += cid.o
+obj-$(CONFIG_CID_NS) += cid_namespace.o
 obj-$(CONFIG_SCHED_MAX_CONCURRENCY) += concurrency.o

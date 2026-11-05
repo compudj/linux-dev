@@ -69,8 +69,9 @@ struct rseq_event {
  * @cpu_id:	The CPU ID which was written last to user space
  * @mm_cid:	The MM CID which was written last to user space
  * @node_id:	The node ID which was written last to user space
+ * @ns_cid:	The NS CID which was written last to user space
  *
- * @cpu_id, @mm_cid and @node_id are updated when the data is written to user space.
+ * @cpu_id, @mm_cid, @node_id and @ns_cid are updated when the data is written to user space.
  */
 struct rseq_ids {
 	union {
@@ -81,6 +82,7 @@ struct rseq_ids {
 		};
 	};
 	u32			node_id;
+	u32			ns_cid;
 };
 
 /**

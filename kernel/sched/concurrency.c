@@ -6,6 +6,7 @@
  * scheduler calls are inline in concurrency.h.
  */
 
+#include <linux/cid_namespace.h>
 #include <linux/delay.h>
 #include <linux/sched/isolation.h>
 #include <linux/sched/clock.h>
@@ -220,6 +221,22 @@ static void conc_dom_update_bound(struct cid_domain *dom);
 #endif /* CONFIG_SCHED_MM_CID */
 
 static struct task_group *conc_pin_task_group(struct task_struct *p);
+
+#ifdef CONFIG_SCHED_MM_CID
+static void conc_ns_feed(struct task_group *tg);
+static void conc_ns_unhome_all(struct task_group *tg);
+static bool conc_ns_task_may_live(struct task_struct *t, struct task_group *tg);
+static bool conc_ns_fork_may_live(struct task_struct *p);
+#else
+static inline void conc_ns_feed(struct task_group *tg) { }
+static inline void conc_ns_unhome_all(struct task_group *tg) { }
+static inline bool conc_ns_task_may_live(struct task_struct *t, struct task_group *tg)
+{
+	return true;
+}
+
+static inline bool conc_ns_fork_may_live(struct task_struct *p) { return true; }
+#endif
 
 static void conc_notify_tree(struct task_group *top);
 
@@ -600,6 +617,7 @@ int alloc_conc_sched_group(struct task_group *tg)
 
 	raw_spin_lock_init(&conc->lock);
 	INIT_LIST_HEAD(&conc->pass_node);
+	INIT_LIST_HEAD(&conc->cid_namespaces);
 	conc->irq_work = IRQ_WORK_INIT_HARD(conc_irq_work);
 	INIT_WORK(&conc->work, conc_cleaner_work);
 	return 1;
@@ -1358,12 +1376,17 @@ static void __conc_remove_slot(struct task_group *tg, int cpu)
 /* Drop a reference on the object which @dom is embedded in. */
 static void cid_domain_put(struct cid_domain *dom)
 {
-	mmdrop(cid_domain_mm(dom));
+	if (dom->kind == CID_DOMAIN_MM)
+		mmdrop(cid_domain_mm(dom));
+	else
+		put_cid_ns(container_of(dom, struct cid_namespace, dom));
 }
 
 /*
- * The domains of @t, each with a reference held: its mm's. Returns their
- * number.
+ * Fill @doms with the domains of @t whose bound follows the group of @t,
+ * and take a reference on each. That is the domain of its mm. The domain
+ * of its namespace is not included: conc_ns_feed() sets its bound. Return
+ * the number of domains.
  */
 static int conc_task_domains(struct task_struct *t, struct cid_domain **doms)
 {
@@ -1449,6 +1472,31 @@ static void conc_task_update_bounds(struct task_struct *t, u64 walk)
 		}
 		cid_domain_put(doms[i]);
 	}
+#ifdef CONFIG_CID_NS
+	/*
+	 * A bounds walk also applies the bound of the namespace's domain.
+	 * conc_ns_feed() wrote the new soft limit just before. The bound is
+	 * applied here, before the walk returns, as for the mm. So the
+	 * effective file shows the new value only once the IDs follow it. A
+	 * migration (@walk == 0) does not touch the namespace.
+	 */
+	if (walk) {
+		struct cid_domain *dom;
+
+		task_lock(t);
+		dom = t->ns_dom;
+		if (dom)
+			get_cid_ns(container_of(dom, struct cid_namespace, dom));
+		task_unlock(t);
+		if (!dom)
+			return;
+		if (dom->bounds_walk != walk) {
+			dom->bounds_walk = walk;
+			conc_dom_update_bound(dom);
+		}
+		cid_domain_put(dom);
+	}
+#endif
 }
 
 /* Refresh the CID bounds of the tasks being attached. */
@@ -1606,6 +1654,15 @@ static void conc_bounds_apply(struct task_group *top)
 		guard(raw_spinlock_irqsave)(&conc->lock);
 		conc->bounds_pending = false;
 	}
+	rcu_read_unlock();
+
+	/*
+	 * Write the new soft limit to the namespaces whose home is in the
+	 * subtree. The walk below applies it.
+	 */
+	rcu_read_lock();
+	css_for_each_descendant_pre(css, &top->css)
+		conc_ns_feed(css_tg(css));
 	rcu_read_unlock();
 
 	conc_update_mm_bounds(top);
@@ -3826,6 +3883,10 @@ static void conc_cid_refresh(struct task_struct *p)
 #ifdef CONFIG_SCHED_MM_CID
 	if (!cid_in_transit(p->mm_cid.cid))
 		mm_cid_schedin(p);
+#ifdef CONFIG_CID_NS
+	if (!cid_in_transit(p->ns_cid.cid))
+		ns_cid_schedin(p);
+#endif
 	rseq_force_update();
 #endif
 }
@@ -5695,7 +5756,7 @@ void conc_debug_switch(struct rq *rq, struct task_struct *prev, struct task_stru
 	 * conc_hold_request(). So it must not be the user of any ID domain by
 	 * then.
 	 */
-	WARN_ONCE((next->flags & PF_EXITING) && (next->mm_cid.active),
+	WARN_ONCE((next->flags & PF_EXITING) && (next->mm_cid.active || task_ns_dom(next)),
 		  "conc: %s/%d on its way out still takes concurrency IDs\n",
 		  next->comm, next->pid);
 #endif
@@ -6105,6 +6166,7 @@ void conc_tg_offline(struct task_group *tg)
 	int cpu;
 
 	mutex_lock(&conc_mutex);
+	conc_ns_unhome_all(tg);
 	had_request = conc->request || conc->ceiling;
 	conc->request = 0;
 	conc->ceiling = 0;
@@ -6365,8 +6427,18 @@ static int __conc_attach_check(struct cgroup_taskset *tset)
  */
 int conc_attach_check(struct cgroup_taskset *tset)
 {
+	struct cgroup_subsys_state *css;
+	struct task_struct *task;
 	int ret;
 
+	/*
+	 * Refuse to move a task of a concurrency ID namespace out of the
+	 * subtree of the home of that namespace.
+	 */
+	cgroup_taskset_for_each(task, css, tset) {
+		if (!conc_ns_task_may_live(task, css_tg(css)))
+			return -EBUSY;
+	}
 	/*
 	 * While no group counts, only count the migration as pending, with no
 	 * lock. This side increments the count, then reads the static key. A
@@ -6392,6 +6464,16 @@ int conc_attach_check(struct cgroup_taskset *tset)
 	ret = __conc_attach_check(tset);
 	conc_cfg_unlock();
 	return ret;
+}
+
+/*
+ * Check the fork of child @p. Refuse a child of a concurrency ID namespace
+ * which would be born outside the subtree of the home of that namespace.
+ * Return 0 or -EBUSY.
+ */
+int conc_fork_check(struct task_struct *p)
+{
+	return conc_ns_fork_may_live(p) ? 0 : -EBUSY;
 }
 
 #ifdef CONFIG_SCHED_MM_CID
@@ -6436,6 +6518,278 @@ static bool conc_tg_is_ancestor(struct task_group *anc, struct task_group *tg)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * The home of a concurrency ID namespace, see
+ * Documentation/scheduler/sched-max-concurrency.rst.
+ *
+ * A namespace is created in a cgroup: the cgroup of the caller for
+ * unshare(2), the cgroup of the new child for clone3(2). The home is the
+ * nearest cgroup with a limit or a ceiling, at or above that cgroup. The
+ * home keeps its namespaces on a list (conc.cid_namespaces).
+ *
+ * The namespace takes two numbers:
+ *  - The maximum. It is the effective ceiling of the nearest cgroup with a
+ *    ceiling, at or above the cgroup the namespace is created in. It is
+ *    capped by the number of possible CPUs, which is also the value when
+ *    there is no ceiling. It never changes, as a ceiling never does.
+ *  - The soft limit. It is the effective limit in force at the home,
+ *    capped by the maximum. conc_ns_feed() updates it.
+ *
+ * The nearest ceiling is used, not the outermost. Limits nest. The
+ * processes of a container size their tables by the ceiling of the
+ * container, whatever cap the host puts on all its containers.
+ *
+ * No member may be in a cgroup outside the home's subtree, see
+ * conc_ns_may_live(). A migration, a clone3(2) into a cgroup, a fork(2)
+ * or a setns(2) which would put one there fails with -EBUSY. So the limit
+ * which places the members is the limit which bounds their IDs.
+ *
+ * The home is decided at the creation, for good. A namespace created where
+ * no limit and no ceiling applies has no home, no soft limit and no
+ * boundary. A member which joins later where a limit applies does not give
+ * it one.
+ *
+ * The home cannot be removed while the namespace exists. The rmdir of
+ * its cgroup fails with -EBUSY, and so does a write which disables the cpu
+ * controller for it, see conc_tg_removable(). The file
+ * "cpu.concurrency.namespaces" of the home lists its namespaces. The
+ * namespace leaves the list when it is freed, see conc_ns_unhome().
+ */
+static DEFINE_SPINLOCK(cid_ns_home_lock);
+
+/*
+ * Return the soft limit of a namespace whose home is @tg. It is the
+ * effective limit of the nearest group with a limit or a ceiling at or
+ * above @tg, capped by @max. It is @max when there is no such group or
+ * when that effective limit reads "max".
+ */
+static unsigned int conc_ns_soft(struct task_group *tg, unsigned int max)
+{
+	for (; tg; tg = tg->parent) {
+		if (READ_ONCE(tg->conc.request) || READ_ONCE(tg->conc.ceiling)) {
+			unsigned int eff = conc_effective_report(tg);
+
+			return eff ? min(eff, max) : max;
+		}
+	}
+	return max;
+}
+
+/* Decide the maximum and the home of @ns, see conc_ns_home(). */
+static void __conc_ns_home(struct cid_namespace *ns, struct task_struct *t)
+{
+	struct task_group *tg, *g;
+
+	lockdep_assert_held(&cgroup_mutex);
+	guard(rcu)();
+	tg = task_group(t);
+	guard(spinlock)(&cid_ns_home_lock);
+	if (ns->home_fixed)
+		return;
+	WRITE_ONCE(ns->home_fixed, true);
+	if (!ns->max_fixed) {
+		for (g = tg; g; g = g->parent) {
+			if (READ_ONCE(g->conc.ceiling))
+				break;
+		}
+		if (g) {
+			unsigned int ceiling;
+
+			ceiling = READ_ONCE(g->conc.ceiling_effective);
+			if (!ceiling)
+				ceiling = READ_ONCE(g->conc.ceiling);
+			ns->max = min_t(unsigned int, ceiling, num_possible_cpus());
+		}
+		ns->max_fixed = true;
+	}
+	for (g = tg; g; g = g->parent) {
+		if (READ_ONCE(g->conc.request) || READ_ONCE(g->conc.ceiling))
+			break;
+	}
+	/*
+	 * No limit and no ceiling applies, or the group went offline. An
+	 * offline group has no task left, so @t is not in it.
+	 */
+	if (!g || g->conc.ns_closed)
+		return;
+	ns->home = g;
+	ns->soft = conc_ns_soft(g, ns->max);
+	list_add(&ns->home_node, &g->conc.cid_namespaces);
+}
+
+/*
+ * Give @ns its maximum and its home, from the cgroup of @t. @t is the
+ * caller of unshare(2), or the child of the clone3(2) which created @ns.
+ * Do nothing once they are decided: they never change.
+ *
+ * cgroup_mutex keeps @t in its group and keeps the group from being
+ * removed meanwhile, see conc_tg_removable().
+ */
+void conc_ns_home(struct cid_namespace *ns, struct task_struct *t)
+{
+	if (READ_ONCE(ns->home_fixed))
+		return;
+	cgroup_lock();
+	__conc_ns_home(ns, t);
+	cgroup_unlock();
+}
+
+void conc_ns_unhome(struct cid_namespace *ns)
+{
+	guard(spinlock)(&cid_ns_home_lock);
+	if (ns->home) {
+		list_del(&ns->home_node);
+		ns->home = NULL;
+	}
+}
+
+/*
+ * Return true if a member of @ns may be in @tg: @tg is in the subtree of
+ * the home, or the namespace has no home.
+ */
+static bool conc_ns_may_live(struct cid_namespace *ns, struct task_group *tg)
+{
+	guard(spinlock)(&cid_ns_home_lock);
+	return !ns->home || conc_tg_is_ancestor(ns->home, tg);
+}
+
+#ifdef CONFIG_CID_NS
+/*
+ * Return false if the namespace of @t has a home and @tg is outside the
+ * subtree of that home.
+ */
+static bool conc_ns_task_may_live(struct task_struct *t, struct task_group *tg)
+{
+	struct cid_namespace *ns;
+	bool ok = true;
+
+	if (!static_branch_unlikely(&cid_ns_used))
+		return true;
+	task_lock(t);
+	ns = t->nsproxy ? t->nsproxy->cid_ns : NULL;
+	if (ns && ns != &init_cid_ns)
+		ok = conc_ns_may_live(ns, tg);
+	task_unlock(t);
+	return ok;
+}
+
+/*
+ * Return false if the namespace of the new task @p has a home and the
+ * group of @p is outside the subtree of that home.
+ */
+static bool conc_ns_fork_may_live(struct task_struct *p)
+{
+	struct cid_namespace *ns;
+
+	if (!static_branch_unlikely(&cid_ns_used))
+		return true;
+	ns = p->nsproxy ? p->nsproxy->cid_ns : NULL;
+	return !ns || ns == &init_cid_ns || conc_ns_may_live(ns, task_group(p));
+}
+#else /* !CONFIG_CID_NS */
+static bool conc_ns_task_may_live(struct task_struct *t, struct task_group *tg) { return true; }
+static bool conc_ns_fork_may_live(struct task_struct *p) { return true; }
+#endif /* !CONFIG_CID_NS */
+
+/* Return true if current may join @ns with setns(2) from its cgroup. */
+bool conc_ns_may_join(struct cid_namespace *ns)
+{
+	guard(rcu)();
+	return conc_ns_may_live(ns, task_group(current));
+}
+
+/* Queue the deferred bound update of a namespace's domain, from any context. */
+static void conc_ns_bound_changed(struct cid_namespace *ns)
+{
+	struct cid_domain *dom = &ns->dom;
+
+	guard(raw_spinlock_irqsave)(&dom->lock);
+	if (dom->bound_update)
+		return;
+	dom->bound_update = 1;
+	irq_work_queue(&dom->irq_work);
+}
+
+/*
+ * The effective limit of @tg or of an ancestor changed. Write the new soft
+ * limit to each namespace whose home is @tg, and queue the deferred bound
+ * update of its domain. The bounds walk which follows also applies the new
+ * bound, for the domains of the tasks it visits, see
+ * conc_task_update_bounds().
+ *
+ * conc_effective_report() shows a decrease only once the group is within
+ * the new limit. So a decrease reaches the IDs at that time.
+ */
+static void conc_ns_feed(struct task_group *tg)
+{
+	struct cid_namespace *ns;
+
+	guard(spinlock)(&cid_ns_home_lock);
+	list_for_each_entry(ns, &tg->conc.cid_namespaces, home_node) {
+		unsigned int soft = conc_ns_soft(tg, ns->max);
+
+		if (soft == READ_ONCE(ns->soft))
+			continue;
+		WRITE_ONCE(ns->soft, soft);
+		conc_ns_bound_changed(ns);
+	}
+}
+
+/*
+ * Return false while a namespace has @tg as its home. cgroup core then
+ * refuses the removal of the group. The caller holds cgroup_mutex, as
+ * conc_ns_home() does, so no namespace takes @tg as its home meanwhile.
+ */
+bool conc_tg_removable(struct task_group *tg)
+{
+	guard(spinlock)(&cid_ns_home_lock);
+	return list_empty(&tg->conc.cid_namespaces);
+}
+
+/*
+ * Show the concurrency ID namespaces whose home is the group, one inode
+ * number per line. It is the number which /proc/<pid>/ns/cid shows.
+ */
+int cpu_concurrency_namespaces_show(struct seq_file *sf, void *v)
+{
+	struct task_group *tg = css_tg(seq_css(sf));
+	struct cid_namespace *ns;
+
+	guard(spinlock)(&cid_ns_home_lock);
+	list_for_each_entry(ns, &tg->conc.cid_namespaces, home_node)
+		seq_printf(sf, "%u\n", ns->ns.inum);
+	return 0;
+}
+
+/* Return the cgroup ID of the home of @ns, or 0 if it has none. */
+u64 conc_ns_home_id(struct cid_namespace *ns)
+{
+	guard(spinlock)(&cid_ns_home_lock);
+	return ns->home ? cgroup_id(ns->home->css.cgroup) : 0;
+}
+
+/*
+ * @tg goes offline. Close it to new namespaces. It has none left: a group
+ * with a namespace cannot be removed, see conc_tg_removable(). Should one
+ * be left, unhook it and give it its maximum as soft limit.
+ */
+static void conc_ns_unhome_all(struct task_group *tg)
+{
+	struct cid_namespace *ns, *tmp;
+
+	guard(spinlock)(&cid_ns_home_lock);
+	tg->conc.ns_closed = true;
+	WARN_ON_ONCE(!list_empty(&tg->conc.cid_namespaces));
+	list_for_each_entry_safe(ns, tmp, &tg->conc.cid_namespaces, home_node) {
+		list_del_init(&ns->home_node);
+		ns->home = NULL;
+		if (READ_ONCE(ns->soft) != ns->max) {
+			WRITE_ONCE(ns->soft, ns->max);
+			conc_ns_bound_changed(ns);
+		}
+	}
 }
 
 /*
@@ -6568,8 +6922,18 @@ static unsigned int __conc_dom_bound(struct cid_domain *dom)
 	return sum;
 }
 
+/*
+ * Return the bound of @dom, or 0 for no bound. For the domain of a
+ * namespace it is the soft limit. There is no bound when the soft limit is
+ * not below the number of possible CPUs.
+ */
 unsigned int conc_dom_bound(struct cid_domain *dom)
 {
+	if (dom->kind == CID_DOMAIN_NS) {
+		unsigned int soft = READ_ONCE(container_of(dom, struct cid_namespace, dom)->soft);
+
+		return soft < num_possible_cpus() ? soft : 0;
+	}
 	return __conc_dom_bound(dom);
 }
 
@@ -6623,6 +6987,9 @@ void conc_dom_fork(struct cid_domain *dom, struct task_struct *t)
 	struct task_group *tg = task_group(t);
 
 	lockdep_assert_held(&dom->lock);
+	/* conc_ns_feed() sets the bound of the domain of a namespace. */
+	if (dom->kind == CID_DOMAIN_NS)
+		return;
 	if (!dom->users)
 		dom->lca = tg;
 	else if (!dom->lca || !conc_tg_is_ancestor(dom->lca, tg))
@@ -6659,7 +7026,8 @@ void conc_cid_left_cpu(struct cid_domain *dom, struct task_struct *prev)
 {
 	struct task_group *tg;
 
-	if (!conc_task_active(prev))
+	/* cid_reclaim() gives back the cached IDs of a namespace on demand. */
+	if (dom->kind == CID_DOMAIN_NS || !conc_task_active(prev))
 		return;
 	tg = task_group(prev);
 	if (atomic_read(per_cpu_ptr(tg->conc.present, smp_processor_id())) <= 0)
@@ -6706,6 +7074,8 @@ void conc_dom_user_exited(struct cid_domain *dom, struct task_struct *t)
 	struct task_group *old = dom->lca;
 
 	lockdep_assert_held(&dom->lock);
+	if (dom->kind == CID_DOMAIN_NS)
+		return;
 	/*
 	 * This CPU owns the ID. The exiting task cannot drop it at its last
 	 * schedule out: its mm is gone then, see conc_cid_left_cpu(). Drop

@@ -299,6 +299,7 @@ static void rseq_slowpath_update_usr(struct pt_regs *regs)
 		t->rseq.event.all &= evt_mask.all;
 		ids.cpu_id = task_cpu(t);
 		ids.mm_cid = task_mm_cid(t);
+		ids.ns_cid = task_ns_cid(t);
 	}
 
 	if (!event)
@@ -407,6 +408,9 @@ static bool rseq_reset_ids(void)
 		unsafe_put_user(RSEQ_CPU_ID_UNINITIALIZED, &rseq->cpu_id, efault);
 		unsafe_put_user(0, &rseq->node_id, efault);
 		unsafe_put_user(0, &rseq->mm_cid, efault);
+		/* ns_cid exists in registrations past the original size only */
+		if (rseq_has_ns_cid(current))
+			unsafe_put_user(0, &rseq->ns_cid, efault);
 	}
 	return true;
 
@@ -414,9 +418,6 @@ efault:
 	force_sig(SIGSEGV);
 	return false;
 }
-
-/* The original rseq structure size (including padding) is 32 bytes. */
-#define ORIG_RSEQ_SIZE		32
 
 static long rseq_register(struct rseq __user * rseq, u32 rseq_len, int flags, u32 sig)
 {
@@ -460,11 +461,14 @@ static long rseq_register(struct rseq __user * rseq, u32 rseq_len, int flags, u3
 		unsafe_put_user(0U, &rseq->mm_cid, efault);
 
 		/*
-		 * All fields past mm_cid are only valid for non-legacy v2
-		 * registrations.
+		 * The fields past mm_cid are only part of a registration
+		 * past the original size. ns_cid is maintained for every
+		 * such one, the time slice extension for non-legacy v2
+		 * registrations only.
 		 */
-		if (version > 1) {
-			if (IS_ENABLED(CONFIG_RSEQ_SLICE_EXTENSION))
+		if (rseq_len > ORIG_RSEQ_SIZE) {
+			unsafe_put_user(0U, &rseq->ns_cid, efault);
+			if (version > 1 && IS_ENABLED(CONFIG_RSEQ_SLICE_EXTENSION))
 				unsafe_put_user(0U, &rseq->slice_ctrl.all, efault);
 		}
 	}

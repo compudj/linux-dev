@@ -60,6 +60,7 @@
 #include <linux/psi.h>
 #include <linux/rcuwait_api.h>
 #include <linux/rseq.h>
+#include <linux/cid_namespace.h>
 #include <linux/sched/wake_q.h>
 #include <linux/scs.h>
 #include <linux/slab.h>
@@ -2813,6 +2814,7 @@ void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx
 	cpumask_copy(&p->cpus_mask, ctx->new_mask);
 	p->nr_cpus_allowed = cpumask_weight(ctx->new_mask);
 	mm_update_cpus_allowed(p->mm, ctx->new_mask);
+	cid_update_cpus_allowed(task_ns_dom(p), ctx->new_mask);
 
 	/*
 	 * Swap in a new user_cpus_ptr if SCA_USER flag set
@@ -5139,6 +5141,7 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
 {
 	unsigned long flags;
+	int ret;
 
 	/*
 	 * Because we're not yet on the pid-hash, p->pi_lock isn't strictly
@@ -5163,7 +5166,11 @@ int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
 		p->sched_class->task_fork(p);
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
 
-	return scx_fork(p, kargs);
+	ret = scx_fork(p, kargs);
+	if (ret)
+		return ret;
+	/* A concurrency ID namespace can refuse the cgroup of the child. */
+	return conc_fork_check(p);
 }
 
 void sched_cancel_fork(struct task_struct *p)
@@ -5173,7 +5180,7 @@ void sched_cancel_fork(struct task_struct *p)
 
 void sched_post_fork(struct task_struct *p)
 {
-	sched_mm_cid_fork(p);
+	sched_cid_fork(p);
 	uclamp_post_fork(p);
 	scx_post_fork(p);
 }
@@ -9816,6 +9823,12 @@ static void cpu_cgroup_css_offline(struct cgroup_subsys_state *css)
 	scx_tg_offline(tg);
 }
 
+/* Refuse the removal while a concurrency ID namespace lives in the group. */
+static bool cpu_cgroup_css_removable(struct cgroup_subsys_state *css)
+{
+	return conc_tg_removable(css_tg(css));
+}
+
 static void cpu_cgroup_css_released(struct cgroup_subsys_state *css)
 {
 	struct task_group *tg = css_tg(css);
@@ -10877,6 +10890,13 @@ static struct cftype cpu_files[] = {
 		.seq_show = cpu_concurrency_child_ceiling_show,
 		.write = cpu_concurrency_child_ceiling_write,
 	},
+#ifdef CONFIG_CID_NS
+	{
+		.name = "concurrency.namespaces",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = cpu_concurrency_namespaces_show,
+	},
+#endif
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 	{
@@ -10899,6 +10919,7 @@ struct cgroup_subsys cpu_cgrp_subsys = {
 	.css_alloc	= cpu_cgroup_css_alloc,
 	.css_online	= cpu_cgroup_css_online,
 	.css_offline	= cpu_cgroup_css_offline,
+	.css_removable	= cpu_cgroup_css_removable,
 	.css_released	= cpu_cgroup_css_released,
 	.css_free	= cpu_cgroup_css_free,
 	.css_extra_stat_show = cpu_extra_stat_show,

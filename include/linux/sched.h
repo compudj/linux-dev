@@ -1549,6 +1549,14 @@ struct task_struct {
 	struct rseq_data		rseq;
 	/* Concurrency ID state of the task, one field per kind of domain */
 	struct cid_user			mm_cid;
+#ifdef CONFIG_CID_NS
+	struct cid_user			ns_cid;
+	/*
+	 * The domain of the namespace the task is a member of, or NULL. The
+	 * task holds a reference on that namespace.
+	 */
+	struct cid_domain		*ns_dom;
+#endif
 
 	struct tlbflush_unmap_batch	tlb_ubc;
 
@@ -2472,6 +2480,30 @@ static __always_inline int task_mm_cid(struct task_struct *t)
 {
 	return t->mm_cid.cid & ~(MM_CID_ONCPU | MM_CID_TRANSIT);
 }
+
+/* Return the domain of the namespace @t is a member of, or NULL. */
+static __always_inline struct cid_domain *task_ns_dom(struct task_struct *t)
+{
+#ifdef CONFIG_CID_NS
+	return READ_ONCE(t->ns_dom);
+#else
+	return NULL;
+#endif
+}
+
+/*
+ * Return the cross-process concurrency ID of @t. For a member of a
+ * concurrency ID namespace it is the ID of @t in that namespace. For any
+ * other task it is the CPU number.
+ */
+static __always_inline int task_ns_cid(struct task_struct *t)
+{
+#ifdef CONFIG_CID_NS
+	if (t->ns_dom)
+		return t->ns_cid.cid & ~(MM_CID_ONCPU | MM_CID_TRANSIT);
+#endif
+	return task_cpu(t);
+}
 #else
 static inline void sched_mm_cid_before_execve(struct task_struct *t) { }
 static inline void sched_mm_cid_after_execve(struct task_struct *t) { }
@@ -2485,6 +2517,17 @@ static __always_inline int task_mm_cid(struct task_struct *t)
 	 * in user-space, althrough it won't provide the memory usage benefits.
 	 */
 	return task_cpu(t);
+}
+
+static __always_inline int task_ns_cid(struct task_struct *t)
+{
+	return task_cpu(t);
+}
+
+struct cid_domain;
+static __always_inline struct cid_domain *task_ns_dom(struct task_struct *t)
+{
+	return NULL;
 }
 #endif
 
@@ -2638,13 +2681,13 @@ DEFINE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
 
 struct cgroup;
 #ifdef CONFIG_SCHED_MAX_CONCURRENCY
+extern void sched_cid_resume(void);
 extern void conc_pass_begin(void);
 extern void conc_pass_end(void);
 extern void conc_dl_rebuild_caps(void);
 extern bool conc_dl_domain_busy(struct cgroup *cgrp);
 extern void conc_fatal_signal(struct task_struct *t);
 extern void conc_hold_resume(void);
-extern void sched_cid_resume(void);
 
 /*
  * Called from resume_user_mode_work(). First hold the task if a hold of the

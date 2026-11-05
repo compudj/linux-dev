@@ -10,11 +10,12 @@
 
 #ifdef CONFIG_SCHED_MM_CID
 /*
- * The concurrency ID engine works on a cid domain. The only domain is the mm of
- * a process (mm_cid). The users of a domain are tasks. A domain hands out IDs
- * to its users that run at the same time. In per-task mode, with few users,
- * each user owns its ID for its lifetime. In per-CPU mode the CPU owns the ID
- * while a user runs on it.
+ * The concurrency ID engine works on a cid domain. A domain is the mm of a
+ * process (mm_cid) or the concurrency ID namespace of a task (ns_cid), see
+ * Documentation/scheduler/sched-max-concurrency.rst. The users of a domain are
+ * tasks. A domain hands out IDs below its bound to its users that run at the
+ * same time. In per-task mode, with few users, each user owns its ID for its
+ * lifetime. In per-CPU mode the CPU owns the ID while a user runs on it.
  */
 static __always_inline bool cid_on_cpu(unsigned int cid)
 {
@@ -52,29 +53,50 @@ static __always_inline bool cid_on_task(unsigned int cid)
 	return cid < MM_CID_TRANSIT;
 }
 
-/* The mm a domain is embedded in. */
+/* The mm a domain of the mm kind is embedded in. */
 static inline struct mm_struct *cid_domain_mm(struct cid_domain *dom)
 {
 	return container_of(dom, struct mm_struct, mm_cid);
 }
 
+#ifdef CONFIG_CID_NS
 /* The per-task user state of @t in @dom. */
 static __always_inline struct cid_user *cid_task_user(struct cid_domain *dom, struct task_struct *t)
 {
-	return &t->mm_cid;
+	return dom->kind == CID_DOMAIN_MM ? &t->mm_cid : &t->ns_cid;
 }
 
 /* The task a user state belongs to. */
 static inline struct task_struct *cid_user_task(struct cid_domain *dom, struct cid_user *u)
 {
-	return container_of(u, struct task_struct, mm_cid);
+	if (dom->kind == CID_DOMAIN_MM)
+		return container_of(u, struct task_struct, mm_cid);
+	return container_of(u, struct task_struct, ns_cid);
 }
 
 /* Is @t an active user of @dom? */
 static __always_inline bool cid_task_in_domain(struct task_struct *t, struct cid_domain *dom)
 {
+	if (dom->kind == CID_DOMAIN_MM)
+		return t->mm == cid_domain_mm(dom) && t->mm_cid.active;
+	return t->ns_dom == dom && t->ns_cid.active;
+}
+#else /* !CONFIG_CID_NS */
+static __always_inline struct cid_user *cid_task_user(struct cid_domain *dom, struct task_struct *t)
+{
+	return &t->mm_cid;
+}
+
+static inline struct task_struct *cid_user_task(struct cid_domain *dom, struct cid_user *u)
+{
+	return container_of(u, struct task_struct, mm_cid);
+}
+
+static __always_inline bool cid_task_in_domain(struct task_struct *t, struct cid_domain *dom)
+{
 	return t->mm == cid_domain_mm(dom) && t->mm_cid.active;
 }
+#endif /* !CONFIG_CID_NS */
 
 static __always_inline void cid_drop(struct cid_domain *dom, unsigned int cid)
 {
@@ -487,10 +509,49 @@ static __always_inline void mm_cid_schedout(struct task_struct *prev)
 	conc_debug_cid_kept(&prev->mm->mm_cid, prev);
 }
 
+#ifdef CONFIG_CID_NS
+/*
+ * Enabled when the first concurrency ID namespace is created. Until then
+ * the hooks below return at once.
+ */
+DECLARE_STATIC_KEY_FALSE(cid_ns_used);
+
+/* Update the ID of @next in its namespace at its schedule in. */
+static __always_inline void ns_cid_schedin(struct task_struct *next)
+{
+	struct cid_domain *dom;
+
+	if (!static_branch_unlikely(&cid_ns_used))
+		return;
+	dom = READ_ONCE(next->ns_dom);
+	if (likely(!dom) || !next->ns_cid.active || conc_task_unplaced(next))
+		return;
+	__cid_schedin(dom, next, &next->ns_cid);
+}
+
+static __always_inline void ns_cid_schedout(struct task_struct *prev)
+{
+	struct cid_domain *dom;
+
+	if (!static_branch_unlikely(&cid_ns_used))
+		return;
+	dom = READ_ONCE(prev->ns_dom);
+	if (likely(!dom) || prev->ns_cid.cid == MM_CID_UNSET)
+		return;
+	__cid_schedout(dom, prev, &prev->ns_cid);
+	conc_debug_cid_kept(dom, prev);
+}
+#else /* !CONFIG_CID_NS */
+static inline void ns_cid_schedin(struct task_struct *next) { }
+static inline void ns_cid_schedout(struct task_struct *prev) { }
+#endif /* !CONFIG_CID_NS */
+
 static inline void mm_cid_switch_to(struct task_struct *prev, struct task_struct *next)
 {
 	mm_cid_schedout(prev);
+	ns_cid_schedout(prev);
 	mm_cid_schedin(next);
+	ns_cid_schedin(next);
 }
 
 /* Called from outside cid.c. */
@@ -498,7 +559,7 @@ void __init cid_init_cpus(void);
 void cid_update_cpus_allowed(struct cid_domain *dom, const struct cpumask *affmsk);
 void mm_update_cpus_allowed(struct mm_struct *mm, const struct cpumask *affmsk);
 
-void sched_mm_cid_fork(struct task_struct *t);
+void sched_cid_fork(struct task_struct *t);
 void cid_apply_bound(struct cid_domain *dom);
 
 #else /* !CONFIG_SCHED_MM_CID */
@@ -507,7 +568,7 @@ static inline void mm_cid_switch_to(struct task_struct *prev, struct task_struct
 static inline void cid_update_cpus_allowed(struct cid_domain *dom, const struct cpumask *affmsk) { }
 static inline void mm_update_cpus_allowed(struct mm_struct *mm, const struct cpumask *affmsk) { }
 
-static inline void sched_mm_cid_fork(struct task_struct *t) { }
+static inline void sched_cid_fork(struct task_struct *t) { }
 #endif /* !CONFIG_SCHED_MM_CID */
 
 #endif /* _KERNEL_SCHED_CID_H */

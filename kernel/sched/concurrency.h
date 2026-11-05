@@ -285,6 +285,7 @@ extern int conc_pick_dest(struct task_struct *p, const struct cpumask *valid,
 			const struct cpumask *allowed, struct affinity_context *ctx);
 extern void conc_task_affinity_changed(struct task_struct *p, struct affinity_context *ctx);
 extern void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx);
+extern int conc_fork_check(struct task_struct *p);
 extern int conc_dl_admit(struct task_struct *p);
 extern void conc_dl_wait(struct task_struct *p);
 /* Defined in deadline.c, for the deadline domains of concurrency.c. */
@@ -339,6 +340,17 @@ int cpu_concurrency_events_show(struct seq_file *sf, void *v);
 int conc_attach_check(struct cgroup_taskset *tset);
 
 #ifdef CONFIG_SCHED_MM_CID
+void conc_ns_home(struct cid_namespace *ns, struct task_struct *t);
+
+void conc_ns_unhome(struct cid_namespace *ns);
+
+u64 conc_ns_home_id(struct cid_namespace *ns);
+
+bool conc_tg_removable(struct task_group *tg);
+
+int cpu_concurrency_namespaces_show(struct seq_file *sf, void *v);
+
+bool conc_ns_may_join(struct cid_namespace *ns);
 
 unsigned int conc_dom_bound(struct cid_domain *dom);
 
@@ -357,10 +369,9 @@ void conc_dom_drop_stale_cids(struct cid_domain *dom);
 void conc_bounds_lock(void);
 
 void conc_bounds_unlock(void);
-
-/* Lock guard for conc_bounds_lock() and conc_bounds_unlock(). */
-DEFINE_LOCK_GUARD_0(conc_bounds, conc_bounds_lock(), conc_bounds_unlock())
 #else /* !CONFIG_SCHED_MM_CID */
+static inline bool conc_tg_removable(struct task_group *tg) { return true; }
+
 static inline void conc_mm_task_moved(struct task_struct *p) { }
 #endif /* !CONFIG_SCHED_MM_CID */
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
@@ -423,6 +434,8 @@ static inline void conc_task_affinity_changed(struct task_struct *p,
 
 static inline void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx) { }
 
+static inline int conc_fork_check(struct task_struct *p) { return 0; }
+
 static inline int conc_dl_admit(struct task_struct *p) { return 0; }
 
 static inline void conc_dl_wait(struct task_struct *p) { }
@@ -456,6 +469,8 @@ static inline void conc_tg_online(struct task_group *tg) { }
 
 static inline void conc_tg_offline(struct task_group *tg) { }
 
+static inline bool conc_tg_removable(struct task_group *tg) { return true; }
+
 static inline void conc_mm_task_moved(struct task_struct *p) { }
 
 static inline int conc_attach_record_srcs(struct cgroup_taskset *tset) { return 0; }
@@ -468,6 +483,14 @@ static inline int conc_attach_check(struct cgroup_taskset *tset) { return 0; }
 static inline void conc_bounds_lock(void) { }
 
 static inline void conc_bounds_unlock(void) { }
+
+static inline void conc_ns_home(struct cid_namespace *ns, struct task_struct *t) { }
+
+static inline void conc_ns_unhome(struct cid_namespace *ns) { }
+
+static inline u64 conc_ns_home_id(struct cid_namespace *ns) { return 0; }
+
+static inline bool conc_ns_may_join(struct cid_namespace *ns) { return true; }
 
 static inline unsigned int conc_dom_bound(struct cid_domain *dom) { return 0; }
 

@@ -10,6 +10,7 @@
 #include <uapi/linux/sched.h>
 
 struct cgroup_namespace;
+struct cid_namespace;
 struct dentry;
 struct ipc_namespace;
 struct mnt_namespace;
@@ -21,6 +22,7 @@ struct user_namespace;
 struct uts_namespace;
 
 extern struct cgroup_namespace init_cgroup_ns;
+extern struct cid_namespace init_cid_ns;
 extern struct ipc_namespace init_ipc_ns;
 extern struct mnt_namespace init_mnt_ns;
 extern struct net init_net;
@@ -30,6 +32,8 @@ extern struct user_namespace init_user_ns;
 extern struct uts_namespace init_uts_ns;
 
 extern const struct proc_ns_operations cgroupns_operations;
+extern const struct proc_ns_operations cidns_operations;
+extern const struct proc_ns_operations cidns_for_children_operations;
 extern const struct proc_ns_operations ipcns_operations;
 extern const struct proc_ns_operations mntns_operations;
 extern const struct proc_ns_operations netns_operations;
@@ -127,6 +131,8 @@ struct ns_common {
 	_Generic((__ns),                                      \
 		struct cgroup_namespace *:       &(__ns)->ns, \
 		const struct cgroup_namespace *: &(__ns)->ns, \
+		struct cid_namespace *:          &(__ns)->ns, \
+		const struct cid_namespace *:    &(__ns)->ns, \
 		struct ipc_namespace *:          &(__ns)->ns, \
 		const struct ipc_namespace *:    &(__ns)->ns, \
 		struct mnt_namespace *:          &(__ns)->ns, \
@@ -145,6 +151,7 @@ struct ns_common {
 #define ns_init_inum(__ns)                                     \
 	_Generic((__ns),                                       \
 		struct cgroup_namespace *: CGROUP_NS_INIT_INO, \
+		struct cid_namespace *:    CID_NS_INIT_INO,    \
 		struct ipc_namespace *:    IPC_NS_INIT_INO,    \
 		struct mnt_namespace *:    MNT_NS_INIT_INO,    \
 		struct net *:              NET_NS_INIT_INO,    \
@@ -156,6 +163,7 @@ struct ns_common {
 #define ns_init_ns(__ns)                                    \
 	_Generic((__ns),                                    \
 		struct cgroup_namespace *: &init_cgroup_ns, \
+		struct cid_namespace *:    &init_cid_ns,    \
 		struct ipc_namespace *:    &init_ipc_ns,    \
 		struct mnt_namespace *:    &init_mnt_ns,     \
 		struct net *:              &init_net,       \
@@ -167,6 +175,7 @@ struct ns_common {
 #define ns_init_id(__ns)						\
 	_Generic((__ns),						\
 		struct cgroup_namespace *:	CGROUP_NS_INIT_ID,	\
+		struct cid_namespace *:		CID_NS_INIT_ID,		\
 		struct ipc_namespace *:		IPC_NS_INIT_ID,		\
 		struct mnt_namespace *:		MNT_NS_INIT_ID,		\
 		struct net *:			NET_NS_INIT_ID,		\
@@ -178,6 +187,7 @@ struct ns_common {
 #define to_ns_operations(__ns)                                                                         \
 	_Generic((__ns),                                                                               \
 		struct cgroup_namespace *: (IS_ENABLED(CONFIG_CGROUPS) ? &cgroupns_operations : NULL), \
+		struct cid_namespace *:    (IS_ENABLED(CONFIG_CID_NS)  ? &cidns_operations : NULL),  \
 		struct ipc_namespace *:    (IS_ENABLED(CONFIG_IPC_NS)  ? &ipcns_operations    : NULL), \
 		struct mnt_namespace *:    &mntns_operations,                                          \
 		struct net *:              (IS_ENABLED(CONFIG_NET_NS)  ? &netns_operations    : NULL), \
@@ -198,6 +208,7 @@ struct ns_common {
  */
 #define FOR_EACH_NS_TYPE(X)                  \
 	X(cgroup_namespace, CLONE_NEWCGROUP) \
+	X(cid_namespace, CLONE_NEWCID)       \
 	X(ipc_namespace, CLONE_NEWIPC)       \
 	X(mnt_namespace, CLONE_NEWNS)        \
 	X(net, CLONE_NEWNET)                 \

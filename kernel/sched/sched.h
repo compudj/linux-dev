@@ -517,6 +517,7 @@ enum conc_claim_result {
 };
 struct tg_concurrency {
 	raw_spinlock_t		lock;
+	struct list_head	cid_namespaces;	/* namespaces with this home */
 	atomic_t __percpu	*present;
 	u64 __percpu		*since;		/* when each used CPU joined @used */
 	cpumask_var_t		used;
@@ -535,6 +536,7 @@ struct tg_concurrency {
 	bool			active;		/* counting: self or an ancestor is limited */
 	bool			propagate;	/* parent counts this group's slots as entities */
 	bool			shrink_pending;	/* nr_used > effective: over the limit */
+	bool			ns_closed;	/* offline: no longer a home */
 
 	/*
 	 * The reported value dropped. The concurrency bounds of the cid
