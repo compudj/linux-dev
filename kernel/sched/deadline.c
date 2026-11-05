@@ -250,10 +250,10 @@ __dl_overflow(struct dl_bw *dl_b, unsigned long cap, u64 old_bw, u64 new_bw)
  * The timer holds a reference to it.
  *
  * A rebuild of the root domains' accounting (dl_clear_root_domains() and
- * dl_add_task_root_domain()) does not find such a task among the deadline
- * tasks of the cpusets. So dl_departed_list holds these tasks, from their
- * departure to their timer. The rebuild puts their bandwidth back in the
- * root domain of the CPU each one was on when it left.
+ * dl_add_task_root_domain()) does not count such a task as a deadline
+ * task. So dl_departed_list holds these tasks, from their departure to
+ * their timer. The rebuild puts their bandwidth back in the root domain
+ * of the CPU each one was on when it left.
  *
  * dl_bw_gen numbers the rebuilds of the accounting: how many times the
  * root domains were wiped and reconstructed (dl_clear_root_domains()
@@ -261,7 +261,7 @@ __dl_overflow(struct dl_bw *dl_b, unsigned long cap, u64 old_bw, u64 new_bw)
  * state, counted or settled. That number dates the state:
  *
  *  - Current: the bandwidth is counted, or a release settled it since
- *    the rebuild began. A release subtracts; the walk of the cpusets
+ *    the rebuild began. A release subtracts; the walk of the task list
  *    skips.
  *  - One behind: the clear that just ran wiped it. The rebuild puts
  *    it back.
@@ -273,8 +273,8 @@ __dl_overflow(struct dl_bw *dl_b, unsigned long cap, u64 old_bw, u64 new_bw)
  *
  * A rebuild drops the bandwidth when the CPU recorded is no longer
  * active. It also drops the bandwidth of a task that dies while the
- * rebuild runs. The cpuset walk skips that task, and it was not dead yet
- * when the list was put back.
+ * rebuild runs. The walk of the task list does not find that task, and
+ * it was not dead yet when the list was put back.
  *
  * dl_departed_lock protects the list and both counts. Take it with
  * interrupts disabled, under the task's rq lock or pi_lock or in the
@@ -3619,7 +3619,7 @@ static void dl_get_task_effective_cpus(struct task_struct *p, struct cpumask *cp
 	cpuset_cpus_allowed_locked(p, cpus);
 }
 
-/* The caller should hold cpuset_mutex */
+/* From dl_rebuild_rd_accounting(), under the locks it asserts. */
 void dl_add_task_root_domain(struct task_struct *p)
 {
 	struct rq_flags rf;
@@ -3629,7 +3629,13 @@ void dl_add_task_root_domain(struct task_struct *p)
 	struct cpumask *msk;
 
 	raw_spin_lock_irqsave(&p->pi_lock, rf.flags);
-	if (!dl_task(p) || dl_entity_is_special(&p->dl)) {
+	/*
+	 * Count nothing for a special entity, or for a task with no
+	 * bandwidth. The walk of the task list also finds exited tasks. An
+	 * exited task whose bandwidth went with its parameters has a dl_bw
+	 * of 0.
+	 */
+	if (!dl_task(p) || dl_entity_is_special(&p->dl) || !p->dl.dl_bw) {
 		raw_spin_unlock_irqrestore(&p->pi_lock, rf.flags);
 		return;
 	}
@@ -3652,6 +3658,14 @@ void dl_add_task_root_domain(struct task_struct *p)
 	if (p->dl.dl_bw_gen == dl_bw_gen)
 		goto unlock;
 	if (p->dl.dl_departed_cpu >= 0) {
+		/*
+		 * The walk also finds a dead task that departed before an
+		 * earlier rebuild, if it is not reaped yet. If that rebuild
+		 * dropped its bandwidth, dl_clear_root_domains() skipped it,
+		 * and its release removes nothing. Skip it here too.
+		 */
+		if (p->dl.dl_bw_gen != dl_bw_gen - 1)
+			goto unlock;
 		cpu = p->dl.dl_departed_cpu;
 		if (!cpu_active(cpu))
 			goto unlock;
@@ -3722,13 +3736,70 @@ void dl_clear_root_domain(struct root_domain *rd)
 		dl_server_add_bw(rd, i);
 }
 
+#ifndef CONFIG_CPUSETS
+/*
+ * With cpusets, cpuset_mutex keeps an admission of bandwidth from running
+ * against a rebuild of the accounting. __sched_setscheduler() takes it for
+ * every change of or into SCHED_DEADLINE. The callers of
+ * partition_sched_domains() hold it from the attachment of the new root
+ * domains to the rebuild. Without cpusets, cpuset_lock() is a stub, and
+ * this mutex takes its place in both.
+ */
+static DEFINE_MUTEX(dl_accounting_mutex);
+
+void dl_accounting_lock(void)
+{
+	mutex_lock(&dl_accounting_mutex);
+}
+
+void dl_accounting_unlock(void)
+{
+	mutex_unlock(&dl_accounting_mutex);
+}
+
+void lockdep_assert_dl_accounting_held(void)
+{
+	lockdep_assert_held(&dl_accounting_mutex);
+}
+#endif /* !CONFIG_CPUSETS */
+
+/*
+ * Rebuild the root domains' accounting. Clear it, then walk all tasks and
+ * count each deadline task again. The caller holds the locks that this
+ * function asserts.
+ */
+void dl_rebuild_rd_accounting(void)
+{
+	struct task_struct *g, *p;
+
+	lockdep_assert_cpus_held();
+	lockdep_assert_held(&sched_domains_mutex);
+	lockdep_assert_cpuset_lock_held();
+	lockdep_assert_dl_accounting_held();
+
+	dl_clear_root_domains();
+
+	read_lock(&tasklist_lock);
+	for_each_process_thread(g, p) {
+		/*
+		 * Test the class without the task's locks, and take them only
+		 * for a deadline task. A task enters the class under the locks
+		 * this rebuild holds, or by a boost. A boost brings no
+		 * bandwidth of its own to count.
+		 */
+		if (dl_task(p))
+			dl_add_task_root_domain(p);
+	}
+	read_unlock(&tasklist_lock);
+}
+
 /*
  * Clear every root domain before a rebuild of their accounting, and count
  * the rebuild in dl_bw_gen. Put back the bandwidth of their servers. Put
- * back the bandwidth of the tasks on dl_departed_list, which no cpuset
- * holds as deadline tasks. Put each in the root domain of the CPU
- * recorded for it, or drop it if that CPU is not active.
- * dl_add_task_root_domain() then adds the deadline tasks of the cpusets.
+ * back the bandwidth of the tasks on dl_departed_list, which the walk of
+ * the deadline tasks does not count. Put each in the root domain of the
+ * CPU recorded for it, or drop it if that CPU is not active.
+ * dl_add_task_root_domain() then adds the deadline tasks.
  */
 void dl_clear_root_domains(void)
 {
@@ -3792,12 +3863,6 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
 		p->dl.deadline = 0;
 		p->dl.runtime = 0;
 	}
-
-	/*
-	 * In case a task is setscheduled out from SCHED_DEADLINE we need to
-	 * keep track of that on its cpuset (for correct bandwidth tracking).
-	 */
-	dec_dl_tasks_cs(p);
 
 	if (!task_on_rq_queued(p)) {
 		/*
@@ -3867,12 +3932,6 @@ static void switched_to_dl(struct rq *rq, struct task_struct *p)
 	 */
 	if (!list_empty(&p->dl.dl_departed_node))
 		dl_task_undepart(p);
-
-	/*
-	 * In case a task is setscheduled to SCHED_DEADLINE we need to keep
-	 * track of that on its cpuset (for correct bandwidth tracking).
-	 */
-	inc_dl_tasks_cs(p);
 
 	/* If p is not queued we will update its parameters at next wakeup. */
 	if (!task_on_rq_queued(p)) {
@@ -4130,10 +4189,12 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 	 * A task that comes back before its 0-lag time still has the
 	 * bandwidth it left with. The new bandwidth replaces it, so remove the
 	 * old one from the root domain that keeps it (dl_task_release_bw()).
-	 * No rebuild can run meanwhile: the caller holds cpuset_mutex.
+	 * No rebuild can run meanwhile: the caller holds cpuset_mutex, or
+	 * dl_accounting_mutex without cpusets.
 	 */
 	if (!err && dl_policy(policy) && !task_has_dl_policy(p)) {
 		lockdep_assert_cpuset_lock_held();
+		lockdep_assert_dl_accounting_held();
 		if (p->dl.dl_departed_cpu >= 0)
 			dl_task_release_bw(p, -1);
 		p->dl.dl_bw_gen = dl_bw_gen;
