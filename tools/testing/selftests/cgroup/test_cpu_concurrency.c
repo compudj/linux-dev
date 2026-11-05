@@ -1099,25 +1099,995 @@ cleanup:
 }
 
 /*
- * clone3(2) into @cg a child that exits at once: 0 when it was born,
- * otherwise the errno of the refusal.
+ * Cross-process concurrency IDs: the concurrency ID namespace. A process
+ * in a child of a cgroup limited to 2 with the ceiling 3, itself in a
+ * cgroup with the ceiling 4, the ceilings given by their parents'
+ * child_ceiling files, unshares a namespace: the namespace of its
+ * children, as unshare(2) does with a time namespace. Two forked members
+ * read a maximum of 3 from prctl(PR_GET_NS_CID_MAX), that of the nearest
+ * cgroup with a ceiling, and their threads never see an ns_cid at or
+ * above the limit 2 in force for the cgroup the namespace lives in, the
+ * one its first member joined in; the creator, outside, reads a maximum
+ * no smaller than the CPU count, and its /proc/self/ns/cid is that of
+ * init while the members' is not. Moving a member to a sibling of the
+ * limited cgroup, outside the subtree, is refused with EBUSY; one moved
+ * within the subtree keeps its IDs. A single-threaded process's setns(2)
+ * from outside the subtree is refused with EBUSY too; moved in, it joins
+ * and reports an ID from the first read on; once multi-threaded, its
+ * setns(2) fails with EUSERS. A child born with clone3(CLONE_NEWCID |
+ * CLONE_INTO_CGROUP) has an ID whether born outside or inside the
+ * subtree, in a namespace of its own that lives where it was born, both
+ * reading the maximum 3. Lowering the limit to 1 follows into the
+ * namespace: once in force, every ID is 0, the maximum standing at 3.
  */
-static int ns_cid_clone_into(const char *cg)
+#ifndef CLONE_NEWCID
+#define CLONE_NEWCID	0x00000040
+#endif
+#ifndef PR_GET_NS_CID_MAX
+#define PR_GET_NS_CID_MAX	82
+#endif
+#define NS_CID_THREADS	3
+#define NS_CID_PHASES	6
+#define NS_CID_SKIP	100
+/* What a member's threads saw, by phase. */
+struct ns_cid_seen {
+	unsigned int max_cid[NS_CID_PHASES];	/* largest ns_cid seen */
+	unsigned long ids[NS_CID_PHASES];	/* samples */
+	volatile int violation;			/* an ID at or above the maximum */
+	unsigned long violations;		/* how many such samples */
+};
+struct ns_cid_shared {
+	volatile int stop;
+	volatile int phase;
+	int max;			/* the maximum the members must read */
+	volatile int threads_up;	/* threads that registered their area */
+	volatile int noext;		/* a thread got no extended rseq area */
+	int member_max[2];		/* what each member read */
+	pid_t member0;			/* the first member, for the helper's setns(2) */
+	struct ns_cid_seen seen[2];	/* what each member's threads saw */
+	/* The joining process: its own thread's samples right after setns(2). */
+	unsigned int join_cid;
+	unsigned long join_ids;
+};
+
+struct ns_cid_spinner {
+	struct ns_cid_shared *sh;
+	struct ns_cid_seen *seen;
+	pthread_t thread;
+	int sleepy;
+};
+
+/*
+ * Unsigned: an ID the kernel never assigned reads as a large value, not
+ * as a negative one, so a signed sample would pass every check below.
+ */
+static unsigned int ns_cid_note(struct ns_cid_shared *sh, struct ns_cid_seen *seen,
+				const struct rseq *r)
 {
-	int fd = open(cg, O_RDONLY | O_DIRECTORY), err = 0;
+	unsigned int cid = rseq_field(r, RSEQ_NS_CID_OFFSET);
+	int phase = sh->phase;
+	unsigned int *m = &seen->max_cid[phase];
+	unsigned int old;
+
+	__atomic_add_fetch(&seen->ids[phase], 1, __ATOMIC_RELAXED);
+	if (cid >= (unsigned int)sh->max) {
+		seen->violation = 1;
+		__atomic_add_fetch(&seen->violations, 1, __ATOMIC_RELAXED);
+	}
+	old = __atomic_load_n(m, __ATOMIC_RELAXED);
+	while (cid > old &&
+	       !__atomic_compare_exchange_n(m, &old, cid, true,
+					    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+		;
+	return cid;
+}
+
+static void *ns_cid_spin(void *arg)
+{
+	struct ns_cid_spinner *sp = arg;
+	struct ns_cid_shared *sh = sp->sh;
+	size_t len = 0;
+	struct rseq *r = rseq_ext_register(&len);
+	unsigned int n = 0;
+
+	if (!r)
+		sh->noext = 1;
+	__atomic_add_fetch(&sh->threads_up, 1, __ATOMIC_RELEASE);
+	if (!r)
+		return NULL;
+	while (!sh->stop) {
+		ns_cid_note(sh, sp->seen, r);
+		if (sp->sleepy && ++n % 300 == 0)
+			usleep(100);
+	}
+	rseq_ext_unregister(r, len);
+	return NULL;
+}
+
+static int ns_cid_start(struct ns_cid_shared *sh, struct ns_cid_seen *seen,
+			struct ns_cid_spinner *sp, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		sp[i].sh = sh;
+		sp[i].seen = seen;
+		sp[i].sleepy = i & 1;
+		if (pthread_create(&sp[i].thread, NULL, ns_cid_spin, &sp[i]))
+			return -1;
+	}
+	return 0;
+}
+
+static void ns_cid_join(struct ns_cid_spinner *sp, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		pthread_join(sp[i].thread, NULL);
+}
+
+/* A member: reads the maximum, samples with its threads until told to stop. */
+static int ns_cid_member(struct ns_cid_shared *sh, int idx)
+{
+	struct ns_cid_spinner sp[NS_CID_THREADS];
+
+	sh->member_max[idx] = prctl(PR_GET_NS_CID_MAX, 0, 0, 0, 0);
+	if (ns_cid_start(sh, &sh->seen[idx], sp, NS_CID_THREADS))
+		return 1;
+	ns_cid_join(sp, NS_CID_THREADS);
+	return 0;
+}
+
+/* Samples right after the join, before anything can block. */
+#define NS_CID_JOIN_SAMPLES	4096
+static int ns_cid_sample_join(struct ns_cid_shared *sh, struct ns_cid_seen *seen,
+			      const struct rseq *r)
+{
+	unsigned int max = 0;
+	int i;
+
+	sh->join_ids = 0;
+	for (i = 0; i < NS_CID_JOIN_SAMPLES; i++) {
+		unsigned int cid = ns_cid_note(sh, seen, r);
+
+		sh->join_ids++;
+		if (cid > max)
+			max = cid;
+	}
+	sh->join_cid = max;
+	return seen->violation;
+}
+
+/*
+ * A helper process that starts outside the namespace, single-threaded. On
+ * command it joins through /proc/<member>/ns/cid ('s', replying errno, and
+ * sampling the ID of its own thread right after), samples once more ('j'),
+ * reads the maximum ('m'), starts sampling threads ('r') or quits ('q').
+ *
+ * The joining thread returns to user space without a context switch, so
+ * it reports an ID of its own from the first read on.
+ */
+static int ns_cid_helper(int cmdfd, int ackfd, struct ns_cid_shared *sh)
+{
+	struct ns_cid_spinner sp[NS_CID_THREADS];
+	struct ns_cid_seen seen = { };
+	int running = 0, status;
+	struct rseq *r = NULL;
+	size_t rlen = 0;
+	char c;
+
+	while (read(cmdfd, &c, 1) == 1) {
+		status = 0;
+		switch (c) {
+		case 's': {
+			char path[64];
+			int fd;
+
+			if (!r) {
+				r = rseq_ext_register(&rlen);
+				if (!r) {
+					status = -1;
+					break;
+				}
+			}
+			snprintf(path, sizeof(path), "/proc/%d/ns/cid", (int)sh->member0);
+			fd = open(path, O_RDONLY);
+			if (fd < 0) {
+				status = errno;
+				break;
+			}
+			if (setns(fd, CLONE_NEWCID))
+				status = errno;
+			close(fd);
+			if (!status)
+				ns_cid_sample_join(sh, &seen, r);
+			break;
+		}
+		case 'j':
+			status = ns_cid_sample_join(sh, &seen, r);
+			break;
+		case 'm':
+			status = prctl(PR_GET_NS_CID_MAX, 0, 0, 0, 0);
+			break;
+		case 'r':
+			if (ns_cid_start(sh, &seen, sp, NS_CID_THREADS))
+				status = -1;
+			else
+				running = 1;
+			break;
+		case 'q':
+			if (running)
+				ns_cid_join(sp, NS_CID_THREADS);
+			rseq_ext_unregister(r, rlen);
+			return 0;
+		}
+		if (write(ackfd, &status, sizeof(status)) != sizeof(status))
+			return 1;
+	}
+	return 1;
+}
+
+static int ns_cid_cmd(int cmdfd, int ackfd, char c)
+{
+	int status;
+
+	if (write(cmdfd, &c, 1) != 1)
+		return -1;
+	if (c == 'q')
+		return 0;
+	if (read(ackfd, &status, sizeof(status)) != sizeof(status))
+		return -1;
+	return status;
+}
+
+/* The inode number of the namespace of @pid, -1 when unreadable. */
+static long ns_cid_inode(pid_t pid, const char *link)
+{
+	char path[64], buf[64];
+	ssize_t n;
+	char *p;
+
+	snprintf(path, sizeof(path), "/proc/%d/ns/%s", (int)pid, link);
+	n = readlink(path, buf, sizeof(buf) - 1);
+	if (n < 0)
+		return -1;
+	buf[n] = 0;
+	p = strchr(buf, '[');
+	return p ? atol(p + 1) : -1;
+}
+
+struct ns_cid_param {
+	char *base, *outer, *parent, *a, *in, *out;
+};
+
+/*
+ * clone3(CLONE_NEWCID | CLONE_INTO_CGROUP) into @cg: a child in a
+ * namespace of its own, which reports in its exit status whether it has
+ * an ID below @max (0), read a maximum other than @max (2) or an ID at or
+ * above it (4); the errno of the refusal, as a negative value, when it
+ * was not born.
+ */
+static int ns_cid_clone_into(const char *cg, int max)
+{
+	int fd = open(cg, O_RDONLY | O_DIRECTORY), status;
+	struct clone_args args = {
+		.flags = CLONE_INTO_CGROUP | CLONE_NEWCID,
+		.exit_signal = SIGCHLD,
+	};
 	pid_t c;
 
 	if (fd < 0)
-		return errno;
-	c = clone_into_cgroup(fd);
-	if (!c)
-		_exit(0);
-	if (c < 0)
-		err = errno;
-	else
-		waitpid(c, NULL, 0);
+		return -errno;
+	args.cgroup = fd;
+	c = syscall(__NR_clone3, &args, sizeof(args));
+	if (c == 0) {
+		struct rseq *r;
+		size_t len = 0;
+		unsigned int cid;
+
+		if (prctl(PR_GET_NS_CID_MAX, 0, 0, 0, 0) != max)
+			_exit(2);
+		r = rseq_ext_register(&len);
+		if (!r)
+			_exit(3);
+		cid = rseq_field(r, RSEQ_NS_CID_OFFSET);
+		_exit(cid >= (unsigned int)max ? 4 : 0);
+	}
+	if (c < 0) {
+		status = -errno;
+	} else {
+		waitpid(c, &status, 0);
+		status = WIFEXITED(status) ? WEXITSTATUS(status) : 5;
+	}
 	close(fd);
-	return err;
+	return status;
+}
+
+/* Let the threads sample for a while under a new phase, then judge it. */
+static void ns_cid_phase(struct ns_cid_shared *sh, int phase)
+{
+	usleep(50000);
+	sh->phase = phase;
+	usleep(300000);
+}
+
+static int ns_cid_run(const char *cgroup, void *arg)
+{
+	struct ns_cid_param *p = arg;
+	struct ns_cid_shared *sh;
+	int cmd[2], ack[2], i, ret, status, outside_max;
+	pid_t helper, member[2] = { -1, -1 };
+	long init_ns, self_ns, child_ns;
+	char buf[32];
+
+	sh = mmap(NULL, sizeof(*sh), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (sh == MAP_FAILED)
+		return 1;
+	memset(sh, 0, sizeof(*sh));
+	/* The limit the creator's cgroup is under: no ID reaches it, the maximum 3 aside. */
+	sh->max = 2;
+	if (pipe(cmd) || pipe(ack))
+		return 1;
+	helper = fork();
+	if (helper < 0)
+		return 1;
+	if (helper == 0)
+		exit(ns_cid_helper(cmd[0], ack[1], sh));
+
+	init_ns = ns_cid_inode(1, "cid");
+	if (unshare(CLONE_NEWCID)) {
+		if (errno == EINVAL || errno == EPERM) {
+			ret = NS_CID_SKIP;
+			ksft_print_msg("no concurrency ID namespace (CLONE_NEWCID)\n");
+		} else {
+			fprintf(stderr, "unshare(CLONE_NEWCID): %s\n", strerror(errno));
+			ret = 2;
+		}
+		goto out;
+	}
+	/* The creator stays in its namespace, the initial one: its children get the new one. */
+	self_ns = ns_cid_inode(getpid(), "cid");
+	child_ns = ns_cid_inode(getpid(), "cid_for_children");
+	if (init_ns < 0 || self_ns != init_ns || child_ns < 0 || child_ns == init_ns) {
+		fprintf(stderr, "ns/cid %ld, ns/cid_for_children %ld after unshare(CLONE_NEWCID), init's %ld\n",
+			self_ns, child_ns, init_ns);
+		ret = 3;
+		goto out;
+	}
+	outside_max = prctl(PR_GET_NS_CID_MAX, 0, 0, 0, 0);
+	if (outside_max < get_nprocs()) {
+		fprintf(stderr, "PR_GET_NS_CID_MAX %d in the initial namespace, %d CPUs online\n",
+			outside_max, get_nprocs());
+		ret = 4;
+		goto out;
+	}
+
+	/* Two members: the IDs are unique across both. */
+	for (i = 0; i < 2; i++) {
+		member[i] = fork();
+		if (member[i] < 0) {
+			ret = 1;
+			goto stop;
+		}
+		if (member[i] == 0)
+			exit(ns_cid_member(sh, i));
+	}
+	/* The helper reads the pid through the shared mapping, stored by the parent alone. */
+	sh->member0 = member[0];
+	while (__atomic_load_n(&sh->threads_up, __ATOMIC_ACQUIRE) < 2 * NS_CID_THREADS)
+		usleep(1000);
+	if (sh->noext) {
+		fprintf(stderr, "a thread could not register an extended rseq area\n");
+		ret = 5;
+		goto stop;
+	}
+	if (ns_cid_inode(member[0], "cid") != child_ns || ns_cid_inode(member[1], "cid") != child_ns) {
+		fprintf(stderr, "the members are not in the namespace unshared for them\n");
+		ret = 6;
+		goto stop;
+	}
+	if (sh->member_max[0] != 3 || sh->member_max[1] != 3) {
+		fprintf(stderr, "PR_GET_NS_CID_MAX %d and %d read by the members under the ceiling 3\n",
+			sh->member_max[0], sh->member_max[1]);
+		ret = 7;
+		goto stop;
+	}
+
+	/* Both in "a": IDs below the limit 2. */
+	ns_cid_phase(sh, 1);
+	for (i = 0; i < 2; i++) {
+		if (!sh->seen[i].ids[1]) {
+			fprintf(stderr, "member %d: no sample in the limited cgroup\n", i);
+			ret = 8;
+			goto stop;
+		}
+	}
+
+	/* Member 1 cannot leave the limited cgroup's subtree, where its namespace lives. */
+	snprintf(buf, sizeof(buf), "%d", (int)member[1]);
+	ret = cg_write(p->out, "cgroup.procs", buf);
+	if (ret != -EBUSY) {
+		fprintf(stderr, "moving a member out of the limited cgroup: %s, expected EBUSY\n",
+			ret ? strerror(-ret) : "succeeded");
+		ret = 9;
+		goto stop;
+	}
+	ns_cid_phase(sh, 2);
+	for (i = 0; i < 2; i++) {
+		if (!sh->seen[i].ids[2]) {
+			fprintf(stderr, "member %d: no sample after the refused move\n", i);
+			ret = 10;
+			goto stop;
+		}
+	}
+	ret = cg_write(p->in, "cgroup.procs", buf);
+	if (!ret)
+		ret = cg_write(p->a, "cgroup.procs", buf);
+	if (ret) {
+		fprintf(stderr, "moving a member within the limited cgroup's subtree: %s\n",
+			strerror(-ret));
+		ret = 12;
+		goto stop;
+	}
+	ns_cid_phase(sh, 3);
+	for (i = 0; i < 2; i++) {
+		if (!sh->seen[i].ids[3]) {
+			fprintf(stderr, "member %d: no sample back under the limited cgroup\n", i);
+			ret = 13;
+			goto stop;
+		}
+	}
+
+	/* A child born outside the subtree has an ID, as one born inside. */
+	status = ns_cid_clone_into(p->out, 3);
+	if (status != 0 && status != -ENOSYS) {
+		fprintf(stderr, "clone3(CLONE_NEWCID | CLONE_INTO_CGROUP) outside the limited cgroup: %d (%s)\n",
+			status, status < 0 ? strerror(-status) : "an ID below the maximum expected");
+		ret = 14;
+		goto stop;
+	}
+	status = ns_cid_clone_into(p->in, 3);
+	if (status != 0 && status != -ENOSYS) {
+		fprintf(stderr, "clone3(CLONE_NEWCID | CLONE_INTO_CGROUP) under the limited cgroup: %d (%s)\n",
+			status, status < 0 ? strerror(-status) : "an ID below the maximum expected");
+		ret = 15;
+		goto stop;
+	}
+
+	/* setns(2) from outside the subtree is refused; moved in, the process joins with an ID. */
+	snprintf(buf, sizeof(buf), "%d", (int)helper);
+	if (cg_write(p->out, "cgroup.procs", buf)) {
+		ret = 16;
+		goto stop;
+	}
+	status = ns_cid_cmd(cmd[1], ack[0], 's');
+	if (status < 0) {
+		fprintf(stderr, "the joining process could not register an extended rseq area\n");
+		ret = 5;
+		goto stop;
+	}
+	if (status != EBUSY) {
+		fprintf(stderr, "setns(2) from outside the limited cgroup: %s, expected EBUSY\n",
+			status ? strerror(status) : "succeeded");
+		ret = 17;
+		goto stop;
+	}
+	if (ns_cid_inode(helper, "cid") == child_ns) {
+		fprintf(stderr, "the refused process is in the namespace\n");
+		ret = 19;
+		goto stop;
+	}
+	if (cg_write(p->a, "cgroup.procs", buf)) {
+		ret = 16;
+		goto stop;
+	}
+	status = ns_cid_cmd(cmd[1], ack[0], 's');
+	if (status) {
+		fprintf(stderr, "setns(2) under the limited cgroup: %s\n", strerror(status));
+		ret = 17;
+		goto stop;
+	}
+	if (!sh->join_ids || sh->join_cid >= 2) {
+		fprintf(stderr, "the thread that joined saw %lu IDs, the largest %u\n",
+			sh->join_ids, sh->join_cid);
+		ret = 18;
+		goto stop;
+	}
+	if (ns_cid_inode(helper, "cid") != child_ns) {
+		fprintf(stderr, "the joining process is not in the namespace\n");
+		ret = 19;
+		goto stop;
+	}
+	/* Moved within the subtree, it keeps its ID: sample again. */
+	if (cg_write(p->in, "cgroup.procs", buf) || cg_write(p->a, "cgroup.procs", buf)) {
+		ret = 16;
+		goto stop;
+	}
+	usleep(50000);
+	status = ns_cid_cmd(cmd[1], ack[0], 'j');
+	if (status || !sh->join_ids || sh->join_cid >= 2) {
+		fprintf(stderr, "the joined process moved within the subtree saw %lu IDs, the largest %u, violation %d\n",
+			sh->join_ids, sh->join_cid, status);
+		ret = 20;
+		goto stop;
+	}
+	status = ns_cid_cmd(cmd[1], ack[0], 'm');
+	if (status != 3) {
+		fprintf(stderr, "PR_GET_NS_CID_MAX %d read by the joining process, expected 3\n", status);
+		ret = 21;
+		goto stop;
+	}
+	if (ns_cid_cmd(cmd[1], ack[0], 'r')) {
+		ret = 1;
+		goto stop;
+	}
+	/* Multi-threaded now: no second join. */
+	status = ns_cid_cmd(cmd[1], ack[0], 's');
+	if (status != EUSERS) {
+		fprintf(stderr, "setns(2) by a multi-threaded process: %s, expected EUSERS\n",
+			status ? strerror(status) : "succeeded");
+		ret = 22;
+		goto stop;
+	}
+	ns_cid_phase(sh, 4);
+	for (i = 0; i < 2; i++) {
+		if (!sh->seen[i].ids[4]) {
+			fprintf(stderr, "member %d: no sample with three processes\n", i);
+			ret = 23;
+			goto stop;
+		}
+	}
+
+	/* The limit lowered to 1 follows into the namespace: every ID is 0. The maximum stands. */
+	if (cg_write(p->parent, "cpu.concurrency.max", "1")) {
+		ret = 24;
+		goto stop;
+	}
+	for (i = 0; i < 200; i++) {
+		if (!cg_read_strcmp(p->parent, "cpu.concurrency.effective", "1 3\n"))
+			break;
+		usleep(10000);
+	}
+	if (i == 200) {
+		fprintf(stderr, "cpu.concurrency.effective did not reach \"1 3\"\n");
+		ret = 25;
+		goto stop;
+	}
+	ns_cid_phase(sh, 5);
+	for (i = 0; i < 2; i++) {
+		if (!sh->seen[i].ids[5] || sh->seen[i].max_cid[5]) {
+			fprintf(stderr, "member %d under the limit 1: %lu samples, the largest ID %u\n",
+				i, sh->seen[i].ids[5], sh->seen[i].max_cid[5]);
+			ret = 26;
+			goto stop;
+		}
+	}
+	status = ns_cid_cmd(cmd[1], ack[0], 'm');
+	if (status != 3) {
+		fprintf(stderr, "PR_GET_NS_CID_MAX %d under the limit 1, expected 3\n", status);
+		ret = 21;
+		goto stop;
+	}
+	if (sh->seen[0].violation || sh->seen[1].violation) {
+		fprintf(stderr, "an ns_cid at or above the limit 2 was seen\n");
+		ret = 27;
+		goto stop;
+	}
+	ret = 0;
+stop:
+	sh->stop = 1;
+out:
+	sh->stop = 1;
+	ns_cid_cmd(cmd[1], ack[0], 'q');
+	waitpid(helper, &status, 0);
+	for (i = 0; i < 2; i++) {
+		if (member[i] > 0)
+			waitpid(member[i], &status, 0);
+	}
+	return ret;
+}
+
+/*
+ * In the initial namespace, where every other test runs, ns_cid is the CPU
+ * number: pinned to one CPU, a thread reads that number. A kernel that
+ * does not maintain the field at all leaves it 0, which none of the bound
+ * checks above would catch. Returns KSFT_SKIP when the field is not there
+ * at all.
+ */
+#define NS_CID_CPUS	4
+static int ns_cid_is_cpu(void)
+{
+	cpu_set_t old, one;
+	struct rseq *r;
+	size_t len = 0;
+	int cpu, n, ret = 0;
+
+	r = rseq_ext_register(&len);
+	if (!r)
+		return skip("cannot register an extended rseq area");
+	if (sched_getaffinity(0, sizeof(old), &old))
+		goto out;
+	for (cpu = 0, n = 0; cpu < CPU_SETSIZE && n < NS_CID_CPUS; cpu++) {
+		unsigned int cid;
+
+		if (!CPU_ISSET(cpu, &old))
+			continue;
+		CPU_ZERO(&one);
+		CPU_SET(cpu, &one);
+		if (sched_setaffinity(0, sizeof(one), &one))
+			break;
+		n++;
+		/* The migration updated the IDs before this returned. */
+		cid = rseq_field(r, RSEQ_NS_CID_OFFSET);
+		if (cid != (unsigned int)cpu) {
+			fprintf(stderr, "ns_cid %u pinned to CPU %d in the initial namespace\n",
+				cid, cpu);
+			ret = 1;
+			break;
+		}
+	}
+	sched_setaffinity(0, sizeof(old), &old);
+out:
+	rseq_ext_unregister(r, len);
+	return ret;
+}
+
+static int test_concurrency_ns_cid(const char *root)
+{
+	struct ns_cid_param param = { };
+	int ret = KSFT_FAIL, r;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	r = ns_cid_is_cpu();
+	if (r == KSFT_SKIP)
+		return KSFT_SKIP;
+	if (r)
+		return KSFT_FAIL;
+	param.base = cg_name(root, "cc_test_ns_cid_base");
+	if (!param.base)
+		goto cleanup;
+	param.outer = cg_name(param.base, "outer");
+	if (!param.outer)
+		goto cleanup;
+	param.parent = cg_name(param.outer, "cc_test_ns_cid");
+	param.out = cg_name(param.outer, "cc_test_ns_cid_out");
+	if (!param.parent || !param.out)
+		goto cleanup;
+	param.a = cg_name(param.parent, "a");
+	param.in = cg_name(param.parent, "in");
+	if (!param.a || !param.in)
+		goto cleanup;
+	/* The namespace takes the nearest ceiling, not the outer one. */
+	if (cg_create(param.base) || cg_write(param.base, "cgroup.subtree_control", "+cpu") ||
+	    cg_write(param.base, "cpu.concurrency.child_ceiling", "4") ||
+	    cg_create(param.outer) || cg_write(param.outer, "cgroup.subtree_control", "+cpu") ||
+	    cg_write(param.outer, "cpu.concurrency.child_ceiling", "3") ||
+	    cg_create(param.parent) || cg_write(param.parent, "cgroup.subtree_control", "+cpu") ||
+	    cg_create(param.a) || cg_create(param.in) || cg_create(param.out))
+		goto cleanup;
+	if (cg_write(param.parent, "cpu.concurrency.max", "2") ||
+	    cg_read_strcmp(param.parent, "cpu.concurrency.effective", "2 3\n") ||
+	    cg_read_strcmp(param.out, "cpu.concurrency.ceiling", "3\n"))
+		goto cleanup;
+
+	r = cg_run(param.a, ns_cid_run, &param);
+	if (r == NS_CID_SKIP)
+		ret = KSFT_SKIP;
+	if (r)
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (param.a)
+		cg_destroy(param.a);
+	if (param.in)
+		cg_destroy(param.in);
+	if (param.parent)
+		cg_destroy(param.parent);
+	if (param.out)
+		cg_destroy(param.out);
+	if (param.outer)
+		cg_destroy(param.outer);
+	if (param.base)
+		cg_destroy(param.base);
+	free(param.a);
+	free(param.in);
+	free(param.parent);
+	free(param.out);
+	free(param.outer);
+	free(param.base);
+	return ret;
+}
+
+/*
+ * Members moved within the limited cgroup's subtree while they run, with
+ * the ID space as tight as the limit: a cgroup with the ceiling 2,
+ * limited to 2, holds three members of a namespace with the maximum 2,
+ * their threads sampling. For a few seconds the test moves one member
+ * between the cgroup and a child of it, tries to move another to a
+ * sibling outside the subtree, refused every time, while a
+ * single-threaded process joins the namespace with setns(2) and leaves
+ * it again, moved the same way as the second: its joins from outside are
+ * refused, the others go through. No sample of any thread is at or above
+ * the maximum, and the kernel reports no ID handed out above the bound
+ * (its debug option checks it). The plain-process twin moves its second
+ * process out and back.
+ */
+#define NS_MOVES_SECONDS	3
+struct ns_moves_shared {
+	struct ns_cid_shared cid;
+	struct ns_cid_seen seen[3];
+	volatile int members_up;
+	volatile unsigned long moves_out, moves_refused, moves_in, joins, join_fail;
+	pid_t member[3];
+};
+
+struct ns_moves_param {
+	char *parent, *a, *in, *out;
+	struct ns_moves_shared *sh;
+	int ns;		/* in a namespace; otherwise plain processes, for their mm_cid */
+};
+
+static int ns_moves_member(struct ns_moves_shared *sh, int idx, int ns)
+{
+	struct ns_cid_spinner sp[NS_CID_THREADS];
+
+	if (ns && prctl(PR_GET_NS_CID_MAX, 0, 0, 0, 0) != 2)
+		return 2;
+	if (ns_cid_start(&sh->cid, &sh->seen[idx], sp, NS_CID_THREADS))
+		return 1;
+	__atomic_add_fetch(&sh->members_up, 1, __ATOMIC_RELEASE);
+	ns_cid_join(sp, NS_CID_THREADS);
+	return 0;
+}
+
+/* Outside the namespace, in "a": setns(2) in and out of it until the end. */
+static int ns_moves_joiner(struct ns_moves_shared *sh)
+{
+	struct ns_cid_seen seen = { };
+	int fd_ns, fd_orig;
+	struct rseq *r;
+	char path[64];
+	size_t len = 0;
+
+	r = rseq_ext_register(&len);
+	if (!r)
+		return 11;
+	snprintf(path, sizeof(path), "/proc/%d/ns/cid", (int)sh->member[0]);
+	fd_ns = open(path, O_RDONLY);
+	fd_orig = open("/proc/self/ns/cid", O_RDONLY);
+	if (fd_ns < 0 || fd_orig < 0) {
+		char st[256] = "";
+		int e = errno;
+
+		snprintf(st, sizeof(st), "/proc/%d/status", (int)sh->member[0]);
+		proc_read_text(sh->member[0], false, "status", st, sizeof(st));
+		fprintf(stderr, "joiner: open %s: %s (%d %d) members_up %d; status: %.80s\n", path,
+			strerror(e), fd_ns, fd_orig, sh->members_up, st);
+		return 12;
+	}
+	while (!sh->cid.stop) {
+		int i;
+
+		if (setns(fd_ns, CLONE_NEWCID)) {
+			/* From outside the subtree, EBUSY: expected while moved out. */
+			if (errno != EBUSY) {
+				fprintf(stderr, "joiner: setns in: %s\n", strerror(errno));
+				return 14;
+			}
+			sh->join_fail++;
+			continue;
+		}
+		sh->joins++;
+		for (i = 0; i < 64; i++)
+			ns_cid_note(&sh->cid, &seen, r);
+		if (setns(fd_orig, CLONE_NEWCID)) {
+			fprintf(stderr, "joiner: setns back: %s after %lu joins\n", strerror(errno), sh->joins);
+			return 13;
+		}
+	}
+	return seen.violation ? 3 : 0;
+}
+
+/* Move member 1 between "a" and "in", until the end. */
+static void *ns_moves_inner(void *arg)
+{
+	struct ns_moves_param *p = arg;
+	struct ns_moves_shared *sh = p->sh;
+
+	while (!sh->cid.stop) {
+		if (cg_enter(p->in, sh->member[1]))
+			continue;
+		cg_enter(p->a, sh->member[1]);
+		sh->moves_in++;
+	}
+	return NULL;
+}
+
+static int ns_moves_run(const char *cgroup, void *arg)
+{
+	struct ns_moves_param *p = arg;
+	struct ns_moves_shared *sh = p->sh;
+	int i, ret, status, r;
+	struct timespec end;
+	pthread_t inner;
+	pid_t joiner = -1;
+
+	memset(sh, 0, sizeof(*sh));
+	sh->cid.max = p->ns ? 2 : INT_MAX;
+	joiner = fork();
+	if (joiner < 0)
+		return 1;
+	if (joiner == 0) {
+		/* Waits for the members, and for their pids to be in place. */
+		while (__atomic_load_n(&sh->members_up, __ATOMIC_ACQUIRE) < 4)
+			usleep(1000);
+		exit(p->ns ? ns_moves_joiner(sh) : 0);
+	}
+	if (p->ns && unshare(CLONE_NEWCID)) {
+		if (errno == EINVAL || errno == EPERM) {
+			ret = NS_CID_SKIP;
+			ksft_print_msg("no concurrency ID namespace (CLONE_NEWCID)\n");
+		} else {
+			fprintf(stderr, "unshare(CLONE_NEWCID): %s\n", strerror(errno));
+			ret = 2;
+		}
+		sh->cid.stop = 1;
+		waitpid(joiner, &status, 0);
+		return ret;
+	}
+	for (i = 0; i < 3; i++) {
+		pid_t pid = fork();
+
+		if (pid < 0) {
+			ret = 1;
+			goto stop;
+		}
+		if (pid == 0)
+			exit(ns_moves_member(sh, i, p->ns));
+		/* Stored by the parent alone: the child's copy of the return value stays its own. */
+		sh->member[i] = pid;
+	}
+	while (__atomic_load_n(&sh->members_up, __ATOMIC_ACQUIRE) < 3)
+		usleep(1000);
+	if (sh->cid.noext) {
+		fprintf(stderr, "a thread could not register an extended rseq area\n");
+		ret = 4;
+		goto stop;
+	}
+	/* The joiner may start: the pids are in place. */
+	__atomic_store_n(&sh->members_up, 4, __ATOMIC_RELEASE);
+	if (pthread_create(&inner, NULL, ns_moves_inner, p)) {
+		ret = 1;
+		goto stop;
+	}
+	/* Member 2 and the joiner go out and come back. */
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	ts_add_ms(&end, NS_MOVES_SECONDS * 1000);
+	for (;;) {
+		struct timespec now;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (!ts_before(&now, &end))
+			break;
+		r = cg_enter(p->out, sh->member[2]);
+		if (r == -EBUSY)
+			sh->moves_refused++;
+		else if (!r && !cg_enter(p->a, sh->member[2]))
+			sh->moves_out++;
+		/* A member while joined: refused then, moved otherwise. */
+		if (!cg_enter(p->out, joiner))
+			cg_enter(p->a, joiner);
+	}
+	sh->cid.stop = 1;
+	pthread_join(inner, NULL);
+	waitpid(joiner, &status, 0);
+	r = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+	joiner = -1;
+	if (r) {
+		fprintf(stderr, "the joining process failed: %d\n", r);
+		ret = 5;
+		goto stop;
+	}
+	if (p->ns ? (sh->moves_out || !sh->moves_refused || !sh->joins) : !sh->moves_out) {
+		fprintf(stderr, "moves out %lu, refused %lu, joins %lu\n",
+			sh->moves_out, sh->moves_refused, sh->joins);
+		ret = 6;
+		goto stop;
+	}
+	if (!sh->moves_in) {
+		fprintf(stderr, "no move within the subtree went through\n");
+		ret = 6;
+		goto stop;
+	}
+	for (i = 0; p->ns && i < 3; i++) {
+		if (sh->seen[i].violation) {
+			fprintf(stderr, "member %d saw an ns_cid at or above the maximum 2: %lu of %lu samples, largest %#x\n",
+				i, sh->seen[i].violations, sh->seen[i].ids[0], sh->seen[i].max_cid[0]);
+			ret = 7;
+			goto stop;
+		}
+	}
+	if (p->ns)
+		ksft_print_msg("%lu moves out refused, %lu moves in, %lu joins (%lu refused from outside)\n",
+			       sh->moves_refused, sh->moves_in, sh->joins, sh->join_fail);
+	ret = 0;
+stop:
+	sh->cid.stop = 1;
+	if (joiner > 0)
+		waitpid(joiner, &status, 0);
+	for (i = 0; i < 3; i++) {
+		if (sh->member[i] > 0)
+			waitpid(sh->member[i], &status, 0);
+	}
+	return ret;
+}
+
+static int __test_concurrency_ns_cid_moves(const char *root, int ns)
+{
+	struct ns_moves_param p = { .ns = ns };
+	int ret = KSFT_FAIL, r;
+	char *base = NULL;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	p.sh = mmap(NULL, sizeof(*p.sh), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (p.sh == MAP_FAILED)
+		return KSFT_FAIL;
+	base = cg_name(root, "cc_test_ns_moves");
+	if (!base)
+		goto cleanup;
+	p.parent = cg_name(base, "p");
+	p.out = cg_name(base, "out");
+	if (!p.parent || !p.out)
+		goto cleanup;
+	p.a = cg_name(p.parent, "a");
+	p.in = cg_name(p.parent, "in");
+	if (!p.a || !p.in)
+		goto cleanup;
+	if (cg_create(base) || cg_write(base, "cgroup.subtree_control", "+cpu") ||
+	    cg_write(base, "cpu.concurrency.child_ceiling", "2") ||
+	    cg_create(p.parent) || cg_write(p.parent, "cgroup.subtree_control", "+cpu") ||
+	    cg_create(p.a) || cg_create(p.in) || cg_create(p.out) ||
+	    cg_write(p.parent, "cpu.concurrency.max", "2"))
+		goto cleanup;
+
+	r = cg_run(p.a, ns_moves_run, &p);
+	if (r == NS_CID_SKIP)
+		ret = KSFT_SKIP;
+	if (r)
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (p.a)
+		cg_destroy(p.a);
+	if (p.in)
+		cg_destroy(p.in);
+	if (p.parent)
+		cg_destroy(p.parent);
+	if (p.out)
+		cg_destroy(p.out);
+	if (base)
+		cg_destroy(base);
+	free(p.a);
+	free(p.in);
+	free(p.parent);
+	free(p.out);
+	free(base);
+	munmap(p.sh, sizeof(*p.sh));
+	return ret;
+}
+
+static int test_concurrency_ns_cid_moves(const char *root)
+{
+	return __test_concurrency_ns_cid_moves(root, 1);
+}
+
+/* The same moves of plain processes: their mm_cid under the kernel's own checks. */
+static int test_concurrency_mm_cid_moves(const char *root)
+{
+	return __test_concurrency_ns_cid_moves(root, 0);
 }
 
 /*
@@ -5230,6 +6200,9 @@ struct cc_test {
 	T(test_concurrency_cpuset_refused),
 	T(test_concurrency_sleepers),
 	T(test_concurrency_cpuset_class),
+	T(test_concurrency_ns_cid),
+	T(test_concurrency_ns_cid_moves),
+	T(test_concurrency_mm_cid_moves),
 	T(test_concurrency_dormant),
 	T(test_concurrency_deadline),
 	T(test_concurrency_deadline_unadmitted),
