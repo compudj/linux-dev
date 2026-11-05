@@ -3557,6 +3557,16 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
 		task_non_contending(&p->dl, false);
 
 	/*
+	 * A task with no parameters of its own was boosted into the class.
+	 * Its deadline and runtime are the donor's. Reset them, so that its
+	 * next entry into the class starts a new period.
+	 */
+	if (!p->dl.dl_runtime) {
+		p->dl.deadline = 0;
+		p->dl.runtime = 0;
+	}
+
+	/*
 	 * In case a task is setscheduled out from SCHED_DEADLINE we need to
 	 * keep track of that on its cpuset (for correct bandwidth tracking).
 	 */
@@ -3971,7 +3981,8 @@ bool __checkparam_dl(const struct sched_attr *attr)
 }
 
 /*
- * This function clears the sched_dl_entity static params.
+ * Clear the static parameters of @dl_se. Also reset its deadline and its
+ * runtime, so that its next enqueue starts a new period.
  */
 static void __dl_clear_params(struct sched_dl_entity *dl_se)
 {
@@ -3981,6 +3992,9 @@ static void __dl_clear_params(struct sched_dl_entity *dl_se)
 	dl_se->flags			= 0;
 	dl_se->dl_bw			= 0;
 	dl_se->dl_density		= 0;
+
+	dl_se->deadline			= 0;
+	dl_se->runtime			= 0;
 
 	dl_se->dl_throttled		= 0;
 	dl_se->dl_yielded		= 0;
