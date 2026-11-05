@@ -1185,6 +1185,8 @@ SYSCALL_DEFINE4(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
 
 int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 {
+	unsigned int cpu;
+
 	/*
 	 * If the task isn't a deadline task or admission control is
 	 * disabled then we don't care about affinity changes.
@@ -1204,9 +1206,16 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 	 * if admission test is enabled, we only admit -deadline
 	 * tasks allowed to run on all the CPUs in the task's
 	 * root_domain.
+	 *
+	 * That is the root domain that counts the bandwidth of the task:
+	 * the one of the CPU recorded with it. A task moved asleep to
+	 * another cpuset is still on a CPU of the root domain it left. A
+	 * bandwidth of 0 is counted nowhere, and no move updates its
+	 * record: use the CPU the task is on.
 	 */
+	cpu = READ_ONCE(p->dl.dl_bw) ? dl_task_root_domain_cpu(p) : task_cpu(p);
 	guard(rcu)();
-	if (!cpumask_subset(task_rq(p)->rd->span, mask))
+	if (!cpumask_subset(cpu_rq(cpu)->rd->span, mask))
 		return -EBUSY;
 
 	return 0;
