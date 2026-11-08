@@ -272,7 +272,6 @@ struct cpuset top_cpuset = {
 	.flags = BIT(CS_CPU_EXCLUSIVE) |
 		 BIT(CS_MEM_EXCLUSIVE) | BIT(CS_SCHED_LOAD_BALANCE),
 	.partition_root_state = PRS_ROOT,
-	.dl_bw_cpu = -1,
 };
 
 /**
@@ -476,28 +475,24 @@ static inline bool partition_is_populated(struct cpuset *cs,
 }
 
 /*
- * Return in pmask the portion of a task's cpusets's cpus_allowed that
- * are online and are capable of running the task.  If none are found,
- * walk up the cpuset hierarchy until we find one that does have some
- * appropriate cpus.
+ * Return in pmask the portion of the cpus_allowed of @cs that are online
+ * and are capable of running @tsk.  If none are found, walk up the cpuset
+ * hierarchy until we find one that does have some appropriate cpus.
  *
  * One way or another, we guarantee to return some non-empty subset
  * of cpu_active_mask.
  *
  * Call with callback_lock or cpuset_mutex held.
  */
-static void guarantee_active_cpus(struct task_struct *tsk,
+static void guarantee_active_cpus(struct cpuset *cs, struct task_struct *tsk,
 				  struct cpumask *pmask)
 {
 	const struct cpumask *possible_mask = task_cpu_possible_mask(tsk);
-	struct cpuset *cs;
 
 	if (WARN_ON(!cpumask_and(pmask, possible_mask, cpu_active_mask)))
 		cpumask_copy(pmask, cpu_active_mask);
 
 	rcu_read_lock();
-	cs = task_cs(tsk);
-
 	while (!cpumask_intersects(cs->effective_cpus, pmask)) {
 		cs = parent_cs(cs);
 		if (unlikely(!cs)) {
@@ -619,7 +614,6 @@ struct cpuset *dup_or_alloc_cpuset(struct cpuset *cs)
 	if (!trial)
 		return NULL;
 
-	trial->dl_bw_cpu = -1;
 	init_llist_node(&trial->attach_node);
 
 	/* Setup cpumask pointer array */
@@ -3095,61 +3089,87 @@ static int cpuset_can_attach_check(struct cpuset *cs, struct cpuset *oldcs,
 	return 0;
 }
 
+/*
+ * The deadline bandwidth of the attach in progress, per CPU. When the
+ * bandwidth of a deadline task moves to another root domain, the move
+ * records it with the CPU that dl_task_bw_move_cpu() returns.
+ * cpuset_can_attach() sums the bandwidth of these tasks per such CPU. It
+ * reserves each sum in the root domain of its CPU. cpuset_attach_task()
+ * counts what it moves, and cpuset_attach() gives back the rest.
+ * dl_attach_cpus holds the CPUs with a sum. cgroup_mutex lets one attach
+ * run at a time, and cpuset_mutex protects these.
+ */
+struct cpuset_dl_bw {
+	u64	sum;
+	u64	moved;		/* the part of sum moved */
+	bool	reserved;	/* dl_bw_alloc() took sum */
+};
+
+static DEFINE_PER_CPU(struct cpuset_dl_bw, cpuset_dl_bw);
+static cpumask_var_t dl_attach_cpus;
+
 static int cpuset_reserve_dl_bw(void)
 {
-	struct cpuset *cs;
 	int cpu, ret;
 
-	llist_for_each_entry(cs, dst_cs_head.first, attach_node) {
-		if (!cs->sum_migrate_dl_bw)
-			continue;
+	for_each_cpu(cpu, dl_attach_cpus) {
+		struct cpuset_dl_bw *b = per_cpu_ptr(&cpuset_dl_bw, cpu);
 
-		cpu = cpumask_any_and(cpu_active_mask, cs->effective_cpus);
-		if (unlikely(cpu >= nr_cpu_ids))
-			return -EINVAL;
-
-		ret = dl_bw_alloc(cpu, cs->sum_migrate_dl_bw);
+		ret = dl_bw_alloc(cpu, b->sum);
 		if (ret)
 			return ret;
-
-		cs->dl_bw_cpu = cpu;
+		b->reserved = true;
 	}
 	return 0;
 }
 
 /*
- * Clear and optionally apply (@cancel is false) the attach related data in the
- * source or destination cpuset.
+ * Give back the bandwidth the attach reserved and did not move. If the
+ * attach is cancelled, that is all of the reservation. Otherwise, it is
+ * what no move used, such as the part for a task that left
+ * SCHED_DEADLINE. The class it left releases its own bandwidth, from the
+ * root domain that counts it.
  */
-static void clear_attach_data(struct llist_head *head, bool cancel)
+static void cpuset_free_dl_bw(void)
+{
+	int cpu;
+
+	for_each_cpu(cpu, dl_attach_cpus) {
+		struct cpuset_dl_bw *b = per_cpu_ptr(&cpuset_dl_bw, cpu);
+
+		if (b->reserved && b->sum != b->moved)
+			dl_bw_free(cpu, b->sum - b->moved);
+		*b = (struct cpuset_dl_bw){ };
+	}
+	cpumask_clear(dl_attach_cpus);
+}
+
+/* Empty @head, the list of the source or destination cpusets. */
+static void clear_attach_data(struct llist_head *head)
 {
 	struct cpuset *cs, *next;
 	struct llist_node *lnode = __llist_del_all(head);
 
-	llist_for_each_entry_safe(cs, next, lnode, attach_node) {
+	llist_for_each_entry_safe(cs, next, lnode, attach_node)
 		init_llist_node(&cs->attach_node);
-		if (cs->nr_migrate_dl_tasks) {
-			/*
-			 * Give back the bandwidth the attach did not move.
-			 * If the attach is cancelled, that is all of the
-			 * reservation. Otherwise, it is what no move used,
-			 * such as the part for a task that left
-			 * SCHED_DEADLINE. The class it left releases its own
-			 * bandwidth, from the root domain that counts it.
-			 */
-			if (cs->dl_bw_cpu >= 0) {
-				u64 bw = cancel ? cs->sum_migrate_dl_bw :
-					 cs->sum_migrate_dl_bw - cs->sum_moved_dl_bw;
+}
 
-				if (bw)
-					dl_bw_free(cs->dl_bw_cpu, bw);
-			}
-			cs->nr_migrate_dl_tasks = 0;
-			cs->sum_migrate_dl_bw = 0;
-			cs->sum_moved_dl_bw = 0;
-			cs->dl_bw_cpu = -1;
-		}
-	}
+/*
+ * Protected by cpuset_mutex. cpus_attach is used by cpuset_can_attach() and
+ * cpuset_attach_task(), but we can't allocate it dynamically there. Define
+ * it global and allocate from cpuset_init().
+ */
+static cpumask_var_t cpus_attach;
+
+/* Set @mask to the CPUs that an attach to @cs gives @task. */
+static void cpuset_attach_cpus(struct cpuset *cs, struct task_struct *task,
+			       struct cpumask *mask)
+{
+	if (cs != &top_cpuset)
+		guarantee_active_cpus(cs, task, mask);
+	else
+		cpumask_andnot(mask, task_cpu_possible_mask(task),
+			       subpartitions_cpus);
 }
 
 /* Called by cgroups to determine if a cpuset is usable; cpuset_mutex held */
@@ -3159,7 +3179,7 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 	struct cpuset *cs, *oldcs;
 	struct task_struct *task;
 	bool setsched_check;
-	int ret;
+	int cpu, ret;
 
 	cs = oldcs = NULL;
 	mutex_lock(&cpuset_mutex);
@@ -3225,15 +3245,20 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 				goto out_unlock;
 		}
 
-		if (dl_task(task)) {
-			/*
-			 * Count all migrating DL tasks for cpuset task accounting.
-			 * Only tasks that need a root-domain bandwidth move
-			 * contribute to sum_migrate_dl_bw.
-			 */
-			cs->nr_migrate_dl_tasks++;
-			if (dl_task_needs_bw_move(task, cs->effective_cpus))
-				cs->sum_migrate_dl_bw += task->dl.dl_bw;
+		if (!dl_task(task))
+			continue;
+		/*
+		 * Sum the bandwidth of the deadline tasks that move to another
+		 * root domain, per CPU that the move records. That CPU depends
+		 * on the CPUs the task gets. A cpuset can span more than one
+		 * root domain, and the affinity of a task can keep it in any
+		 * of them.
+		 */
+		cpuset_attach_cpus(cs, task, cpus_attach);
+		cpu = dl_task_bw_move_cpu(task, cpus_attach);
+		if (cpu >= 0) {
+			per_cpu_ptr(&cpuset_dl_bw, cpu)->sum += task->dl.dl_bw;
+			cpumask_set_cpu(cpu, dl_attach_cpus);
 		}
 	}
 
@@ -3257,8 +3282,9 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 
 out_unlock:
 	if (ret) {
-		clear_attach_data(&src_cs_head, true);
-		clear_attach_data(&dst_cs_head, true);
+		clear_attach_data(&src_cs_head);
+		clear_attach_data(&dst_cs_head);
+		cpuset_free_dl_bw();
 	} else {
 		attach_ctx.in_progress++;
 	}
@@ -3271,53 +3297,49 @@ static void cpuset_cancel_attach(struct cgroup_taskset *tset)
 {
 	mutex_lock(&cpuset_mutex);
 	dec_attach_in_progress_locked();
-	clear_attach_data(&src_cs_head, true);
-	clear_attach_data(&dst_cs_head, true);
+	clear_attach_data(&src_cs_head);
+	clear_attach_data(&dst_cs_head);
+	cpuset_free_dl_bw();
 	mutex_unlock(&cpuset_mutex);
 }
 
-/*
- * Protected by cpuset_mutex. cpus_attach is used only by cpuset_attach_task()
- * but we can't allocate it dynamically there.  Define it global and
- * allocate from cpuset_init().
- */
-static cpumask_var_t cpus_attach;
-
 static void cpuset_attach_task(struct cpuset *cs, struct task_struct *task)
 {
-	bool reserved = false;
+	struct cpuset_dl_bw *b = NULL;
 	struct mm_struct *mm;
+	int cpu = -1;
 
 	lockdep_assert_cpuset_lock_held();
 
-	if (cs != &top_cpuset)
-		guarantee_active_cpus(task, cpus_attach);
-	else
-		cpumask_andnot(cpus_attach, task_cpu_possible_mask(task),
-			       subpartitions_cpus);
+	cpuset_attach_cpus(cs, task, cpus_attach);
 	/*
-	 * cpuset_reserve_dl_bw() made room in @cs for the bandwidth of the
-	 * deadline tasks that cpuset_can_attach() counted. Flag the move, so
-	 * that the bandwidth of this task moves with it.
+	 * cpuset_reserve_dl_bw() made room for the bandwidth of the deadline
+	 * tasks that cpuset_can_attach() counted, on the CPU each move
+	 * records. Flag the move, so that the bandwidth of this task moves
+	 * with it.
 	 *
-	 * Nothing was reserved for a task that became a deadline task since.
-	 * Flag its move only if the rest of the reservation covers its
-	 * bandwidth.
+	 * Nothing was reserved for a task that became a deadline task since,
+	 * or that changed its affinity. Flag its move only if the rest of the
+	 * reservation on its CPU covers its bandwidth.
 	 */
-	if (dl_task(task) && dl_task_needs_bw_move(task, cs->effective_cpus) &&
-	    cs->sum_moved_dl_bw + task->dl.dl_bw <= cs->sum_migrate_dl_bw)
-		reserved = true;
+	if (dl_task(task))
+		cpu = dl_task_bw_move_cpu(task, cpus_attach);
+	if (cpu >= 0) {
+		b = per_cpu_ptr(&cpuset_dl_bw, cpu);
+		if (b->moved + task->dl.dl_bw > b->sum)
+			b = NULL;
+	}
 	/*
 	 * can_attach beforehand should guarantee that this doesn't
 	 * fail.  TODO: have a better way to handle failure here
 	 */
-	if (reserved) {
+	if (b) {
 		u64 moved;
 
 		/* Count what the move reports it moved. */
 		WARN_ON_ONCE(set_cpus_allowed_bw_reserved(task, cpus_attach,
-							  &moved));
-		cs->sum_moved_dl_bw += moved;
+							  cpu, &moved));
+		b->moved += moved;
 	} else {
 		WARN_ON_ONCE(set_cpus_allowed_ptr(task, cpus_attach));
 	}
@@ -3401,8 +3423,9 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 		schedule_flush_migrate_mm();
 	cs->old_mems_allowed = attach_ctx.nodemask_to;
 out:
-	clear_attach_data(&src_cs_head, false);
-	clear_attach_data(&dst_cs_head, false);
+	clear_attach_data(&src_cs_head);
+	clear_attach_data(&dst_cs_head);
+	cpuset_free_dl_bw();
 	dec_attach_in_progress_locked();
 
 	mutex_unlock(&cpuset_mutex);
@@ -3907,6 +3930,7 @@ int __init cpuset_init(void)
 	cpuset1_init(&top_cpuset);
 
 	BUG_ON(!alloc_cpumask_var(&cpus_attach, GFP_KERNEL));
+	BUG_ON(!zalloc_cpumask_var(&dl_attach_cpus, GFP_KERNEL));
 
 	if (housekeeping_enabled(HK_TYPE_DOMAIN_BOOT))
 		cpumask_andnot(isolated_cpus, cpu_possible_mask,
@@ -4205,7 +4229,7 @@ static void __cpuset_cpus_allowed_locked(struct task_struct *tsk, struct cpumask
 
 	cs = task_cs(tsk);
 	if (cs != &top_cpuset)
-		guarantee_active_cpus(tsk, pmask);
+		guarantee_active_cpus(cs, tsk, pmask);
 	/*
 	 * Tasks in the top cpuset won't get update to their cpumasks
 	 * when a hotplug online/offline event happens. So we include all

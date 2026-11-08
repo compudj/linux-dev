@@ -50,14 +50,15 @@ extern void dl_accounting_unlock(void);
 extern void lockdep_assert_dl_accounting_held(void);
 #endif
 /*
- * Return whether moving DL task @p to @new_mask requires moving DL
- * bandwidth accounting between root domains. This helper is specific to
- * DL bandwidth move accounting semantics and is shared by
- * cpuset_can_attach() and set_cpus_allowed_dl() so both paths use the
- * same source root-domain test.
+ * Return the CPU that a move of DL task @p to the CPUs of @new_mask
+ * records with its DL bandwidth. Return -1 if the bandwidth stays in the
+ * root domain that counts it. Like the move, keep the CPUs within the
+ * affinity set by the user. cpuset_can_attach() reserves the bandwidth in
+ * the root domain of that CPU. cpuset_attach_task() then moves it there,
+ * and set_cpus_allowed_dl() makes the same test.
  */
-extern bool dl_task_needs_bw_move(struct task_struct *p,
-				  const struct cpumask *new_mask);
+extern int dl_task_bw_move_cpu(struct task_struct *p,
+			       const struct cpumask *new_mask);
 
 static inline bool dl_server(struct sched_dl_entity *dl_se)
 {

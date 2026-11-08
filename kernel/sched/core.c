@@ -3227,6 +3227,22 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 		goto out;
 	}
 
+	/*
+	 * The caller made room for the deadline bandwidth of @p in the root
+	 * domain of ctx->dl_bw_cpu. The new mask can span two root domains:
+	 * keep @p in that one. Also wake a sleeping @p up on dest_cpu, since
+	 * select_fallback_rq() could pick a CPU of the other one.
+	 */
+	if ((ctx->flags & SCA_DL_BW_RESERVED) &&
+	    cpumask_test_cpu(ctx->dl_bw_cpu, cpu_valid_mask) &&
+	    cpumask_test_cpu(ctx->dl_bw_cpu, ctx->new_mask)) {
+		if (!cpumask_test_cpu(dest_cpu,
+				      cpu_rq(ctx->dl_bw_cpu)->rd->span))
+			dest_cpu = ctx->dl_bw_cpu;
+		if (!task_on_rq_queued(p))
+			p->wake_cpu = dest_cpu;
+	}
+
 	do_set_cpus_allowed(p, ctx);
 
 	return affine_move_task(rq, p, rf, dest_cpu, ctx->flags);
@@ -3277,15 +3293,18 @@ EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
 
 /*
  * Like set_cpus_allowed_ptr(), for a caller that has made room for the
- * deadline bandwidth of @p in the root domain of @new_mask. Move that
- * bandwidth there with @p, and set @moved to the bandwidth moved, 0
- * if none. Return 0 on success, or a negative error code.
+ * deadline bandwidth of @p in the root domain of @cpu. If the move records
+ * @cpu with that bandwidth, move the bandwidth there with @p. Set @moved
+ * to the bandwidth moved, 0 if none. Return 0 on success, or a negative
+ * error code.
  */
 int set_cpus_allowed_bw_reserved(struct task_struct *p,
-				 const struct cpumask *new_mask, u64 *moved)
+				 const struct cpumask *new_mask, int cpu,
+				 u64 *moved)
 {
 	struct affinity_context ac = {
 		.new_mask  = new_mask,
+		.dl_bw_cpu = cpu,
 		.flags     = SCA_DL_BW_RESERVED,
 	};
 	int ret;
