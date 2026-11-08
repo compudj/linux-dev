@@ -2664,6 +2664,8 @@ struct affinity_context {
 	struct cpumask		*user_mask;
 	/* Out: the deadline bandwidth moved to the new root domain. */
 	u64			dl_bw_moved;
+	/* In, with SCA_DL_BW_RESERVED: the CPU the caller made room on. */
+	int			dl_bw_cpu;
 	unsigned int		flags;
 };
 
