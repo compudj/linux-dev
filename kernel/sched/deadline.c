@@ -3561,6 +3561,9 @@ static unsigned int dl_task_root_domain_cpu(struct task_struct *p)
 	return cpu;
 }
 
+static int __dl_task_bw_move_cpu(struct task_struct *p,
+				 const struct cpumask *new_mask);
+
 static void set_cpus_allowed_dl(struct task_struct *p,
 				struct affinity_context *ctx)
 {
@@ -3575,14 +3578,17 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 	 * rebuild of the accounting. Moving it without room would leave no
 	 * root domain counting it.
 	 *
+	 * The caller made room in the root domain of ctx->dl_bw_cpu, the CPU
+	 * it expects the move to record. Move the bandwidth only if the move
+	 * records that CPU. The affinity or the CPU of @p may have changed.
+	 *
 	 * Report in @ctx the bandwidth moved. The caller read the record
 	 * without the runqueue lock, so it must count only what this reports.
 	 */
 	if ((ctx->flags & SCA_DL_BW_RESERVED) &&
-	    dl_task_needs_bw_move(p, ctx->new_mask)) {
+	    __dl_task_bw_move_cpu(p, ctx->new_mask) == ctx->dl_bw_cpu) {
 		unsigned int src_cpu = dl_task_root_domain_cpu(p);
 		struct dl_bw *src_dl_b = &cpu_rq(src_cpu)->rd->dl_bw;
-		unsigned int cpu;
 
 		/*
 		 * We now free resources of the root_domain we are migrating
@@ -3596,12 +3602,8 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 			raw_spin_unlock(&src_dl_b->lock);
 		}
 
-		/*
-		 * cpuset_can_attach() made room in the root domain of the new
-		 * mask. That root domain counts the bandwidth from now on.
-		 */
-		cpu = cpumask_any_and(ctx->new_mask, cpu_active_mask);
-		p->dl.dl_bw_cpu = cpu < nr_cpu_ids ? (int)cpu : -1;
+		/* Record the CPU the caller made room on. */
+		p->dl.dl_bw_cpu = ctx->dl_bw_cpu;
 		p->dl.dl_bw_gen = dl_bw_gen;
 		ctx->dl_bw_moved = p->dl.dl_bw;
 	}
@@ -3609,8 +3611,15 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 	set_cpus_allowed_common(p, ctx);
 }
 
-bool dl_task_needs_bw_move(struct task_struct *p,
-			   const struct cpumask *new_mask)
+/*
+ * Return the CPU that a move of @p to the CPUs of @new_mask records with
+ * its bandwidth. That is the CPU @p is on, if @p can stay there. Else it
+ * is the first active CPU of @new_mask, a housekeeping one if there is
+ * one. Return -1 if the bandwidth stays in the root domain that counts
+ * it. The caller holds the rq lock of @p.
+ */
+static int __dl_task_bw_move_cpu(struct task_struct *p,
+				 const struct cpumask *new_mask)
 {
 	unsigned int cpu;
 
@@ -3620,10 +3629,39 @@ bool dl_task_needs_bw_move(struct task_struct *p,
 	 * their bandwidth: dl_add_task_root_domain() leaves them out.
 	 */
 	if (!dl_task(p) || dl_entity_is_special(&p->dl) || !p->dl.dl_bw)
-		return false;
+		return -1;
 
 	cpu = dl_task_root_domain_cpu(p);
-	return !cpumask_intersects(cpu_rq(cpu)->rd->span, new_mask);
+	if (cpumask_intersects(cpu_rq(cpu)->rd->span, new_mask))
+		return -1;
+	/*
+	 * A task moved asleep is still on a CPU of the root domain it left.
+	 * If the new mask holds that CPU, the task wakes up there.
+	 */
+	cpu = task_cpu(p);
+	if (cpu_active(cpu) && cpumask_test_cpu(cpu, new_mask))
+		return cpu;
+	cpu = cpumask_first_and_and(new_mask, cpu_active_mask,
+				    housekeeping_cpumask(HK_TYPE_DOMAIN_BOOT));
+	if (cpu >= nr_cpu_ids)
+		cpu = cpumask_any_and(new_mask, cpu_active_mask);
+	return cpu < nr_cpu_ids ? (int)cpu : -1;
+}
+
+int dl_task_bw_move_cpu(struct task_struct *p, const struct cpumask *new_mask)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+	int cpu;
+
+	/* Like __set_cpus_allowed_ptr(), keep within the user affinity. */
+	rq = task_rq_lock(p, &rf);
+	if (p->user_cpus_ptr &&
+	    cpumask_and(rq->scratch_mask, new_mask, p->user_cpus_ptr))
+		new_mask = rq->scratch_mask;
+	cpu = __dl_task_bw_move_cpu(p, new_mask);
+	task_rq_unlock(rq, p, &rf);
+	return cpu;
 }
 
 /* Assumes rq->lock is held */
