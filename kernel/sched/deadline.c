@@ -113,6 +113,12 @@ void dl_deboost(struct sched_dl_entity *dl_se)
 	}
 	dl_se->pi_se = dl_se;
 }
+
+/* Return true if @p waits on an rt_mutex. The caller holds its pi_lock. */
+static inline bool dl_task_pi_blocked(struct task_struct *p)
+{
+	return p->pi_blocked_on;
+}
 #else /* !CONFIG_RT_MUTEXES: */
 static inline struct sched_dl_entity *pi_of(struct sched_dl_entity *dl_se)
 {
@@ -120,6 +126,11 @@ static inline struct sched_dl_entity *pi_of(struct sched_dl_entity *dl_se)
 }
 
 static inline bool is_dl_boosted(struct sched_dl_entity *dl_se)
+{
+	return false;
+}
+
+static inline bool dl_task_pi_blocked(struct task_struct *p)
 {
 	return false;
 }
@@ -4205,6 +4216,17 @@ static void switched_to_dl(struct rq *rq, struct task_struct *p)
 	/* If p is not queued we will update its parameters at next wakeup. */
 	if (!task_on_rq_queued(p)) {
 		add_rq_bw(&p->dl, &rq->dl);
+
+		/*
+		 * A task that waits on an rt_mutex cannot wait for its wakeup.
+		 * The chain walk sorts its waiter by its deadline first. A task
+		 * new to the class has a deadline of 0, which goes before every
+		 * real one. Start a new period now, as setup_new_dl_entity()
+		 * does at an enqueue.
+		 */
+		if (dl_task_pi_blocked(p) && !p->dl.dl_throttled &&
+		    dl_time_before(p->dl.deadline, rq_clock(rq)))
+			replenish_dl_new_period(&p->dl, rq);
 
 		return;
 	}
