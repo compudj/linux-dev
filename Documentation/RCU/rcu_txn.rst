@@ -33,7 +33,7 @@ A pseudo-transaction is not free, above all on the update side.  Every update
 costs an allocation, which can fail, and a free deferred by a grace period.
 ``rcu_assign_pointer()`` needs neither.  The reader tests the low bits of every
 pointer it loads, which is nearly free.  It pays more only when it meets a
-commit in progress on that pointer.
+commit in progress on that pointer: see `Readers`_ below.
 
 How it works
 ============
@@ -86,10 +86,22 @@ A reader loads a slot with ``rcu_txn_dereference()`` instead of
 ``rcu_txn_dereference()`` is ``rcu_dereference()`` followed by
 ``rcu_txn_resolve()``.  A reader that already has the loaded value, for
 instance because it tests other bits of it, calls ``rcu_txn_resolve()``
-itself.
+itself, with the slot it loaded the value from.
 
-The load and the resolution must happen in one RCU read-side critical section:
-the record a proxy points at is freed with ``kfree_rcu()``.
+When the value is a proxy, ``rcu_txn_resolve()`` resolves it within a *resolve
+section*.  This is an atomic SRCU read-side critical section, which
+``srcu_read_lock_atomic_irqsave()`` enters with interrupts disabled.  The
+section loads the slot again and resolves what the slot holds then.  So the
+engine can wait for every reader that may still read a descriptor.  This wait
+needs no grace period and does not sleep.  ``synchronize_srcu_atomic()`` spins
+until the resolve sections in flight are over, and they are short.  A resolve
+section is also an RCU read-side critical section.  A reader may resolve a slot
+in any context, NMI included, where RCU watches the CPU: not from the idle
+loop, nor from a CPU that RCU sees as offline.
+
+The load and the resolution must happen in one RCU read-side critical section.
+So must every use of the target.  A descriptor is freed with ``kfree_rcu()``,
+and the embedder frees its nodes after a grace period.
 
 Writers
 =======

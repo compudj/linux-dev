@@ -8,12 +8,57 @@
 #define _LIB_RCU_TXN_INTERNAL_H
 
 /*
- * The steps of a commit that installs proxies: see __rcu_txn_commit_desc() in
- * rcu_txn.c.  The KUnit tests include this as well, to stage a transaction
- * between two steps.
+ * The steps of a commit that installs proxies, and the resolve sections that
+ * proxies are read in.  See __rcu_txn_commit_desc() in rcu_txn.c.  The KUnit
+ * tests include this as well.  They stage a transaction between two steps,
+ * and hold resolve sections open.
  */
 
 #include <linux/rcu_txn.h>
+
+/*
+ * Resolve a proxy to its current target.
+ *
+ * @proxy must come from a load of its slot, within the same resolve section as
+ * this call.  What orders the loads below is described under "Store-release /
+ * load-acquire pairs" at the top of <linux/rcu_txn.h>.
+ *
+ * The selector indexes proxy->ptr[] directly, so resolution is a data
+ * dependency rather than a conditional branch.
+ */
+static inline void *__rcu_txn_proxy_resolve(const struct rcu_txn_record *proxy)
+{
+	unsigned long sel;
+
+	/*
+	 * Load-acquire (A) pairs with the store-release (B) of
+	 * __rcu_txn_group_commit().
+	 */
+	sel = smp_load_acquire(&READ_ONCE(proxy->group)->selector);
+	return READ_ONCE(proxy->ptr[sel]);
+}
+
+/*
+ * Resolve sections: see lib/rcu_txn.c.  The KUnit tests hold sections open
+ * with these two.
+ */
+
+/*
+ * Enter a resolve section.  Interrupts must be disabled.  Return its SRCU
+ * index.
+ */
+int __rcu_txn_resolve_enter(void);
+
+/* Leave the section of @idx, which __rcu_txn_resolve_enter() returned. */
+void __rcu_txn_resolve_exit(int idx);
+
+/*
+ * Wait for the resolve sections in flight, without sleeping.  On return, no
+ * reader can still use a proxy that was settled away before the call.  Call it
+ * from any context except NMI and a resolve section.  It disables interrupts
+ * while it waits.
+ */
+void __rcu_txn_synchronize_resolve(void);
 
 static inline void __rcu_txn_group_init(struct rcu_txn_group *group)
 {

@@ -5,17 +5,96 @@
  * Copyright (C) 2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
  *
  * The engine is inline in <linux/rcu_txn.h>.  What lives here is what allocates
- * a transaction's descriptor, and the commit that installs proxies.
+ * a transaction's descriptor, the commit that installs proxies, and the resolve
+ * sections in which readers read them.
  */
 
+#include <kunit/visibility.h>
 #include <linux/export.h>
+#include <linux/hardirq.h>
+#include <linux/irqflags.h>
 #include <linux/overflow.h>
 #include <linux/rcu_txn.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
+#include <linux/srcu.h>
 #include <linux/string.h>
 
 #include "rcu_txn_internal.h"
+
+/*
+ * Resolve sections
+ * ================
+ *
+ * See "Readers and reclaim" in <linux/rcu_txn.h>.  The sections have their own
+ * atomic SRCU domain.  Its readers are NMI-safe.  Every section disables
+ * interrupts, so the wait may run with interrupts disabled, as under a raw
+ * spinlock.  The wait also disables interrupts itself: see
+ * __rcu_txn_synchronize_resolve().
+ */
+DEFINE_STATIC_SRCU_ATOMIC(rcu_txn_resolve_srcu);
+
+/* See rcu_txn_internal.h. */
+int __rcu_txn_resolve_enter(void)
+{
+	RCU_TXN_WARN_ON(!irqs_disabled());
+	return srcu_read_lock_atomic(&rcu_txn_resolve_srcu);
+}
+EXPORT_SYMBOL_IF_KUNIT(__rcu_txn_resolve_enter);
+
+/* See rcu_txn_internal.h. */
+void __rcu_txn_resolve_exit(int idx)
+{
+	RCU_TXN_WARN_ON(!irqs_disabled());
+	srcu_read_unlock_atomic(&rcu_txn_resolve_srcu, idx);
+}
+EXPORT_SYMBOL_IF_KUNIT(__rcu_txn_resolve_exit);
+
+/* See <linux/rcu_txn.h>. */
+void *__rcu_txn_resolve_slow(void __rcu **slot, unsigned long tag)
+{
+	unsigned long flags;
+	void *v;
+	int idx;
+
+	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+			 "rcu_txn: resolve while RCU is not watching");
+	idx = srcu_read_lock_atomic_irqsave(&rcu_txn_resolve_srcu, flags);
+	/*
+	 * The proxy the caller loaded before the section may belong to a
+	 * descriptor that now serves another transaction.  Load the slot
+	 * again, and resolve what it holds.
+	 *
+	 * If the slot is settled now, this load-acquire orders the caller's
+	 * later loads after it.  A proxy gets the same from the load-acquire
+	 * (A) of its selector.
+	 */
+	v = unrcu_pointer(smp_load_acquire(slot));
+	if (rcu_txn_is_proxy(v, tag))
+		v = __rcu_txn_proxy_resolve(__rcu_txn_untag(v, tag));
+	srcu_read_unlock_atomic_irqrestore(&rcu_txn_resolve_srcu, idx, flags);
+	return v;
+}
+EXPORT_SYMBOL_GPL(__rcu_txn_resolve_slow);
+
+/* See rcu_txn_internal.h. */
+void __rcu_txn_synchronize_resolve(void)
+{
+	unsigned long flags;
+
+	/* An NMI would wait for the section it interrupted. */
+	WARN_ON_ONCE(in_nmi());
+	/*
+	 * synchronize_srcu_atomic() keeps other waiters of the domain
+	 * spinning until its grace period ends.  So an interrupt handler that
+	 * waits on this CPU would deadlock: the wait it interrupted cannot
+	 * end.
+	 */
+	local_irq_save(flags);
+	synchronize_srcu_atomic(&rcu_txn_resolve_srcu);
+	local_irq_restore(flags);
+}
+EXPORT_SYMBOL_IF_KUNIT(__rcu_txn_synchronize_resolve);
 
 /*
  * Allocate a transaction descriptor for at least @cap records, with its flip

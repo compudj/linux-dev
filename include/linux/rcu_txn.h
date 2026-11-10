@@ -101,9 +101,29 @@
  *
  * Readers and reclaim
  * -------------------
- * rcu_txn_commit() reclaims the transaction descriptor with kfree_rcu().  A
- * reader must therefore load a slot and resolve what it loaded within one RCU
- * read-side critical section.
+ * A reader dereferences a proxy only within a resolve section.
+ * rcu_txn_resolve() enters one when the value it is given is a proxy.  The
+ * section is an atomic SRCU read-side critical section, with interrupts
+ * disabled.  It loads the slot again and resolves what the slot holds then.
+ * So a proxy loaded before the section is never dereferenced: it may be
+ * stale.  Its descriptor may already serve another transaction.
+ *
+ * Once a commit has settled every slot it installed a proxy in, its descriptor
+ * can be reclaimed in either of two ways:
+ *
+ *   - After a grace period, as rcu_txn_commit() does with kfree_rcu().  A
+ *     resolve section disables interrupts, so it is also an RCU read-side
+ *     critical section.  This needs RCU to watch the CPU: a reader must not
+ *     resolve from the idle loop, or from a CPU that RCU sees as offline.
+ *
+ *   - Once __rcu_txn_synchronize_resolve() returns, without a grace period.
+ *     It waits for the resolve sections in flight with
+ *     synchronize_srcu_atomic().  The sections are short, so this wait spins
+ *     and its caller need not sleep.  See lib/rcu_txn.c.
+ *
+ * A reader must still load a slot and use the target it resolves within one
+ * RCU read-side critical section.  The embedder reclaims its nodes after a
+ * grace period.
  *
  * Allocation
  * ----------
@@ -264,8 +284,8 @@ struct rcu_txn {
  * Reader side
  * ===========
  *
- * A reader loads a transacted slot with rcu_dereference() and passes the value
- * to rcu_txn_resolve().  rcu_txn_dereference() does both.
+ * A reader loads a transacted slot with rcu_dereference() and passes the slot
+ * and the value to rcu_txn_resolve().  rcu_txn_dereference() does both.
  */
 
 /**
@@ -308,41 +328,33 @@ static inline struct rcu_txn_record *__rcu_txn_untag(void *v, unsigned long tag)
 }
 
 /*
- * Resolve a proxy to its current target.
- *
- * @proxy must come from an rcu_dereference() of the slot that holds it.  What
- * orders the loads below is described under "Store-release / load-acquire
- * pairs" at the top of this file.
- *
- * The selector indexes proxy->ptr[] directly, so resolution is a data
- * dependency rather than a conditional branch.
+ * Resolve the value @slot holds, within a resolve section.  See "Readers and
+ * reclaim" above, and lib/rcu_txn.c.  This is out of line because a reader
+ * only gets here while a commit is in flight on the slot.
  */
-static inline void *__rcu_txn_proxy_resolve(const struct rcu_txn_record *proxy)
-{
-	/*
-	 * Load-acquire (A) pairs with the store-release (B) of
-	 * __rcu_txn_group_commit().
-	 */
-	return proxy->ptr[smp_load_acquire(&proxy->group->selector)];
-}
+void *__rcu_txn_resolve_slow(void __rcu **slot, unsigned long tag);
 
 /**
  * rcu_txn_resolve() - resolve a value loaded from a transacted slot
- * @v: value returned by rcu_dereference() on the slot
+ * @slot: the slot
+ * @v: value returned by rcu_dereference() on @slot
  * @tag: the slot's proxy tag
  *
- * Return a plain value as is.  Resolve an installed proxy through its flip
- * group's selector.  It resolves to the slot's old target until the
- * transaction commits, and to its new target from then on.
+ * Return a plain value as is.  For an installed proxy, load @slot again within
+ * a resolve section, and resolve what it holds then.  A proxy gives the slot's
+ * old target before the flip, and its new target after it.  A target settled
+ * in the meantime is returned as is.  See the top of this file.
  *
- * Context: RCU read-side critical section, the one @v was loaded in.
+ * Context: RCU read-side critical section, the one @v was loaded in.  Any
+ * context, NMI included.
  * Return: the slot's target.
  */
-static inline void *rcu_txn_resolve(void *v, unsigned long tag)
+static inline void *rcu_txn_resolve(void __rcu **slot, void *v,
+				    unsigned long tag)
 {
 	if (likely(!rcu_txn_is_proxy(v, tag)))
 		return v;
-	return __rcu_txn_proxy_resolve(__rcu_txn_untag(v, tag));
+	return __rcu_txn_resolve_slow(slot, tag);
 }
 
 /**
@@ -356,9 +368,11 @@ static inline void *rcu_txn_resolve(void *v, unsigned long tag)
  */
 #define rcu_txn_dereference_check(p, tag, c)				\
 ({									\
-	void *__rcu_txn_v = rcu_dereference_check(p, c);		\
+	void __rcu **__rcu_txn_s = rcu_txn_slot(&(p));			\
+	void *__rcu_txn_v = rcu_dereference_check(*__rcu_txn_s, c);	\
 									\
-	(typeof(*(p)) __force __kernel *)rcu_txn_resolve(__rcu_txn_v, tag); \
+	__rcu_txn_v = rcu_txn_resolve(__rcu_txn_s, __rcu_txn_v, tag);	\
+	(typeof(*(p)) __force __kernel *)__rcu_txn_v;			\
 })
 
 /**
@@ -402,7 +416,7 @@ static inline void *rcu_txn_resolve(void *v, unsigned long tag)
 			 "suspicious rcu_txn_dereference_acquire() usage"); \
 	/* Order the reader's later loads after this one. */		\
 	__rcu_txn_v = unrcu_pointer(smp_load_acquire(__rcu_txn_s));	\
-	__rcu_txn_v = rcu_txn_resolve(__rcu_txn_v, tag);		\
+	__rcu_txn_v = rcu_txn_resolve(__rcu_txn_s, __rcu_txn_v, tag);	\
 	(typeof(*(p)) __force __kernel *)__rcu_txn_v;			\
 })
 
