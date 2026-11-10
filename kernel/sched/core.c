@@ -7837,7 +7837,16 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 				p->dl.pi_se = pi_task->dl.pi_se;
 				scope->flags |= ENQUEUE_REPLENISH;
 			} else {
-				p->dl.pi_se = &p->dl;
+				dl_deboost(&p->dl);
+				/*
+				 * dl_deboost() can start a new period. Its
+				 * deadline can then be after the top waiter's.
+				 */
+				if (pi_task && dl_prio(pi_task->prio) &&
+				    dl_entity_preempt(&pi_task->dl, &p->dl)) {
+					p->dl.pi_se = pi_task->dl.pi_se;
+					scope->flags |= ENQUEUE_REPLENISH;
+				}
 			}
 		} else if (rt_prio(prio)) {
 			if (dl_prio(oldprio))

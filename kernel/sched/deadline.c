@@ -93,6 +93,26 @@ static inline bool is_dl_boosted(struct sched_dl_entity *dl_se)
 {
 	return pi_of(dl_se) != dl_se;
 }
+
+/*
+ * End the boost of @dl_se, a task that stays in the class. Its own
+ * reservation never gives it a runtime above dl_runtime. A larger runtime
+ * is what the donor left. In that case, start a new period now, not at
+ * the next enqueue. A task that is not queued can wait on another
+ * rt_mutex. The chain walk then copies its deadline into its waiter node.
+ * The caller holds the rq lock and the pi_lock of the task, and has
+ * updated the rq clock.
+ */
+void dl_deboost(struct sched_dl_entity *dl_se)
+{
+	struct rq *rq = rq_of_dl_se(dl_se);
+
+	if (is_dl_boosted(dl_se) && dl_se->runtime > (s64)dl_se->dl_runtime) {
+		dl_se->deadline = rq_clock(rq) + dl_se->dl_deadline;
+		dl_se->runtime = dl_se->dl_runtime;
+	}
+	dl_se->pi_se = dl_se;
+}
 #else /* !CONFIG_RT_MUTEXES: */
 static inline struct sched_dl_entity *pi_of(struct sched_dl_entity *dl_se)
 {
