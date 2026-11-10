@@ -67,8 +67,12 @@ static inline int get_count_order(unsigned int count)
 #define atomic_long_add(i, v)			((void)((v)->counter += (i)))
 #define atomic_long_add_return_relaxed(i, v)	((v)->counter += (i))
 #define atomic_long_add_return_release(i, v)	((v)->counter += (i))
-#define smp_rmb()				barrier()
+#define atomic_long_sub(i, v)			((void)((v)->counter -= (i)))
 /* The harness runs on one thread: ordering primitives are plain accesses. */
+#define smp_rmb()				barrier()
+#define smp_mb()				barrier()	/* One thread: no reordering. */
+#define preempt_disable()			barrier()
+#define preempt_enable()			barrier()
 #define smp_load_acquire(p)			READ_ONCE(*(p))
 #define smp_store_release(p, v)			WRITE_ONCE(*(p), (v))
 
@@ -82,11 +86,46 @@ static inline bool atomic_long_try_cmpxchg_relaxed(atomic_long_t *v, long *old, 
 	return false;
 }
 
+/*
+ * Stall hook. hpcc_stall_fn() runs once, right after the next fully
+ * ordered update of hpcc_stall_item. This simulates an updater interrupted
+ * there while the other CPUs keep running.
+ */
+extern atomic_long_t *hpcc_stall_item;
+extern void (*hpcc_stall_fn)(void);
+
+static inline void hpcc_stall(atomic_long_t *v)
+{
+	void (*fn)(void) = hpcc_stall_fn;
+
+	if (fn && v == hpcc_stall_item) {
+		hpcc_stall_fn = NULL;
+		fn();
+	}
+}
+
+static inline long atomic_long_add_return(long i, atomic_long_t *v)
+{
+	long r = (v->counter += i);
+
+	hpcc_stall(v);
+	return r;
+}
+
+static inline bool atomic_long_try_cmpxchg(atomic_long_t *v, long *old, long new)
+{
+	if (!atomic_long_try_cmpxchg_relaxed(v, old, new))
+		return false;
+	hpcc_stall(v);
+	return true;
+}
+
 /* Simulated topology, and CPU on which the current code runs. */
 extern unsigned int nr_cpu_ids;
 extern unsigned int hpcc_current_cpu;
 
 #define raw_smp_processor_id()		hpcc_current_cpu
+#define smp_processor_id()		hpcc_current_cpu
 #define for_each_possible_cpu(cpu)	for ((cpu) = 0; (cpu) < (int)nr_cpu_ids; (cpu)++)
 
 /*
@@ -193,6 +232,9 @@ static inline bool __hpcc_this_cpu_try_cmpxchg(s8 *pcp, s8 *old, s8 new)
 }
 
 #define this_cpu_read(pcp)	(*per_cpu_ptr(&(pcp), hpcc_current_cpu))
+#define this_cpu_write(pcp, v)	((void)(*per_cpu_ptr(&(pcp), hpcc_current_cpu) = (v)))
+#define __this_cpu_read(pcp)	this_cpu_read(pcp)
+#define __this_cpu_write(pcp, v)	this_cpu_write(pcp, v)
 #define this_cpu_try_cmpxchg(pcp, ovalp, nval)	\
 	__hpcc_this_cpu_try_cmpxchg(&(pcp), (ovalp), (nval))
 

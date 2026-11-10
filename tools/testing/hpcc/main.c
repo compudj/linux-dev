@@ -33,6 +33,8 @@ unsigned int nr_cpu_ids;
 unsigned int hpcc_current_cpu;
 unsigned long hpcc_nr_warnings;
 long hpcc_nr_allocs;
+atomic_long_t *hpcc_stall_item;
+void (*hpcc_stall_fn)(void);
 
 #include "../../../lib/percpu_counter_tree.c"
 
@@ -389,6 +391,178 @@ static void test_lazy(unsigned long batch_size, unsigned long nr_steps)
 	CHECK(hpcc_nr_allocs == nr_allocs);
 }
 
+/* Each counter of a limit counter errs in one direction only. */
+static void check_limit(struct percpu_counter_tree_limit *l, unsigned long add_total,
+			unsigned long sub_total)
+{
+	struct percpu_counter_tree *add = &l->counters[0], *sub = &l->counters[1];
+	unsigned long accuracy = percpu_counter_tree_approximate_accuracy(add);
+	unsigned long root_add = atomic_long_read(add->approx_sum);
+	unsigned long root_sub = atomic_long_read(sub->approx_sum);
+
+	CHECK(percpu_counter_tree_precise_sum_upper(add) == add_total);
+	CHECK((unsigned long)percpu_counter_tree_precise_sum(sub) == sub_total);
+	CHECK(root_add <= add_total && add_total - root_add <= accuracy);
+	CHECK(root_sub <= sub_total && sub_total - root_sub <= accuracy);
+	CHECK(percpu_counter_tree_limit_precise_sum(l) == add_total - sub_total);
+}
+
+/*
+ * Without concurrency, an addition must fit exactly when the value stays
+ * within the limit. The limit is a few accuracies wide, so the walk often
+ * runs within the accuracy of the limit, where the precise sums decide.
+ */
+static void test_limit(unsigned long batch_size, unsigned long nr_steps)
+{
+	unsigned long value = 0, add_total = 0, sub_total = 0, accuracy, max, step, amount;
+	struct percpu_counter_tree_limit l;
+	bool added;
+
+	if (percpu_counter_tree_limit_init(&l, batch_size, GFP_KERNEL)) {
+		CHECK(0);
+		return;
+	}
+	accuracy = percpu_counter_tree_approximate_accuracy(&l.counters[0]);
+	max = 3 * accuracy + rnd() % (accuracy + 1) + 1;
+	for (step = 0; step < nr_steps; step++) {
+		hpcc_current_cpu = rnd() % nr_cpu_ids;
+		if (value && !(rnd() % 3)) {
+			amount = 1 + rnd() % value;
+			percpu_counter_tree_limit_sub(&l, amount);
+			value -= amount;
+			sub_total += amount;
+		} else {
+			amount = 1 + rnd() % ((rnd() & 1) ? batch_size : 8 * batch_size);
+			added = percpu_counter_tree_limit_add(&l, max, amount);
+			CHECK(added == (value + amount <= max));
+			add_total += amount;
+			if (added)
+				value += amount;
+			else
+				sub_total += amount;	/* Undone by a subtraction. */
+		}
+		check_limit(&l, add_total, sub_total);
+	}
+	/* Fill up: the value stops exactly at the limit. */
+	while (value < max) {
+		hpcc_current_cpu = rnd() % nr_cpu_ids;
+		amount = (max - value + 1) / 2;
+		CHECK(percpu_counter_tree_limit_add(&l, max, amount));
+		value += amount;
+		add_total += amount;
+	}
+	CHECK(!percpu_counter_tree_limit_add(&l, max, 1));
+	add_total++;
+	sub_total++;
+	CHECK(value == max);
+	check_limit(&l, add_total, sub_total);
+	percpu_counter_tree_limit_destroy(&l);
+}
+
+/* State of test_limit_stall(), shared with its stall hook. */
+static struct {
+	struct percpu_counter_tree_limit l;
+	unsigned long max, value;
+	unsigned int stalled_cpu, level1_items;
+} stall;
+
+/* While one addition is stalled, the CPUs sharing its level 1 item add. */
+static void stall_others_add(void)
+{
+	unsigned long batch_size = percpu_counter_tree_batch_size(&stall.l.counters[0]);
+	unsigned int saved = hpcc_current_cpu, mask = stall.level1_items - 1, cpu, i;
+
+	for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
+		if (cpu == stall.stalled_cpu || (cpu & mask) != (stall.stalled_cpu & mask))
+			continue;
+		hpcc_current_cpu = cpu;
+		for (i = 0; i < batch_size; i++) {
+			if (percpu_counter_tree_limit_add(&stall.l, stall.max, 1))
+				stall.value++;
+		}
+		CHECK(stall.value <= stall.max);
+	}
+	hpcc_current_cpu = saved;
+}
+
+/*
+ * Fill each residual of the additions to its largest value. The value is
+ * then the accuracy, and the root is 0. The limit is set to the value.
+ * Then stall an addition right after its carry fills its level 1 item.
+ * While it is stalled, its carry is neither in the root nor within the
+ * item's range. The additions of the CPUs sharing the item must still
+ * fail.
+ */
+static void test_limit_stall(unsigned long batch_size)
+{
+	unsigned int nr_levels = tree_topology.config->nr_levels, level, level_items, i, cpu;
+	unsigned long step, bit_mask;
+	struct percpu_counter_tree *add;
+
+	if (nr_levels < 2)
+		return;
+	if (percpu_counter_tree_limit_init(&stall.l, batch_size, GFP_KERNEL)) {
+		CHECK(0);
+		return;
+	}
+	add = &stall.l.counters[0];
+	stall.max = percpu_counter_tree_approximate_accuracy(add);
+	stall.value = 0;
+	/*
+	 * An amount of bit_mask - step is a multiple of the batch sizes of the
+	 * levels below. It goes through them and stays in item i of this
+	 * level. CPU i updates that item.
+	 */
+	level_items = 1U << tree_topology.nr_cpus_order;
+	bit_mask = batch_size;
+	for (level = 1; level < nr_levels; level++) {
+		step = bit_mask;
+		level_items >>= tree_topology.config->n_arity_order[level - 1];
+		bit_mask <<= tree_topology.config->n_arity_order[level - 1];
+		for (i = 0; i < level_items; i++) {
+			hpcc_current_cpu = i;
+			CHECK(percpu_counter_tree_limit_add(&stall.l, stall.max, bit_mask - step));
+			stall.value += bit_mask - step;
+		}
+	}
+	for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
+		hpcc_current_cpu = cpu;
+		CHECK(percpu_counter_tree_limit_add(&stall.l, stall.max, batch_size - 1));
+		stall.value += batch_size - 1;
+	}
+	CHECK(stall.value == stall.max);
+	CHECK(!atomic_long_read(add->approx_sum));
+
+	stall.stalled_cpu = 0;
+	stall.level1_items = 1U << (tree_topology.nr_cpus_order -
+				    tree_topology.config->n_arity_order[0]);
+	hpcc_stall_item = percpu_counter_tree_items(add);	/* CPU 0's level 1 item. */
+	hpcc_stall_fn = stall_others_add;
+	hpcc_current_cpu = stall.stalled_cpu;
+	if (percpu_counter_tree_limit_add(&stall.l, stall.max, 1))
+		stall.value++;
+	CHECK(!hpcc_stall_fn);	/* The stall happened. */
+	hpcc_stall_fn = NULL;
+	CHECK(stall.value <= stall.max);
+	CHECK(percpu_counter_tree_limit_precise_sum(&stall.l) == stall.value);
+	percpu_counter_tree_limit_destroy(&stall.l);
+}
+
+/* The batch size chosen for an accuracy is the largest within it. */
+static void test_batch_for_accuracy(void)
+{
+	unsigned long multiplier = tree_topology.accuracy_multiplier, accuracy, batch_size;
+
+	for (accuracy = 1; accuracy < 512 * multiplier; accuracy = accuracy * 3 + 1) {
+		batch_size = percpu_counter_tree_batch_for_accuracy(accuracy);
+		CHECK(batch_size >= 2 && batch_size <= PERCPU_COUNTER_TREE_MAX_BATCH);
+		if (batch_size > 2)
+			CHECK(batch_size * multiplier - nr_cpu_ids <= accuracy);
+		if (batch_size < PERCPU_COUNTER_TREE_MAX_BATCH)
+			CHECK(2 * batch_size * multiplier - nr_cpu_ids > accuracy);
+	}
+}
+
 static const unsigned int test_nr_cpus[] = {
 	1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 100, 128, 256, 512,
 	1000, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
@@ -420,6 +594,9 @@ static int run_case(unsigned int nr_cpus, unsigned long batch_size)
 	test_saturated(batch_size, -1);
 	test_random_walk(batch_size, nr_steps);
 	test_lazy(batch_size, nr_steps / 2);
+	test_limit(batch_size, nr_steps / 2);
+	test_limit_stall(batch_size);
+	test_batch_for_accuracy();
 	CHECK(!hpcc_nr_warnings);
 	printf("%sok %d - nr_cpus=%u batch_size=%lu\n", nr_case_failures ? "not " : "",
 	       ++test_num, nr_cpus, batch_size);
