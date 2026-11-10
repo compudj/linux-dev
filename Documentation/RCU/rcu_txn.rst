@@ -31,9 +31,10 @@ snapshot.
 
 A pseudo-transaction is not free, above all on the update side.  Every update
 costs an allocation, which can fail, and a free deferred by a grace period.
-``rcu_assign_pointer()`` needs neither.  The reader tests the low bits of every
-pointer it loads, which is nearly free.  It pays more only when it meets a
-commit in progress on that pointer: see `Readers`_ below.
+``rcu_assign_pointer()`` needs neither.  A small transaction that must not fail
+allocates nothing: see `Local transactions`_ below.  The reader tests the low
+bits of every pointer it loads, which is nearly free.  It pays more only when
+it meets a commit in progress on that pointer: see `Readers`_ below.
 
 How it works
 ============
@@ -153,6 +154,30 @@ non-sleeping ``gfp_t``.  Under a raw or a bit spinlock, only the reserve
 works: ``PREEMPT_RT`` does not allow the allocator there.
 ``rcu_txn_commit()`` and ``rcu_txn_cancel()`` allocate nothing and do not
 sleep.  They may be called under such a lock.
+
+Local transactions
+------------------
+
+Some transactions must not fail for want of memory, such as a removal on a
+teardown path.  If such a transaction has at most ``RCU_TXN_LOCAL_CAP``
+records, initialize it with ``rcu_txn_init_local()`` instead of
+``rcu_txn_init()``.  Its descriptor comes from a pool of the current CPU, so
+the transaction allocates nothing.  ``rcu_txn_record()`` cannot fail, and
+``rcu_txn_commit()`` returns 0.
+
+A local transaction has these limits:
+
+- Preemption stays disabled from ``rcu_txn_init_local()`` until the commit or
+  the cancel.  The writer must not sleep in between.
+- A CPU's task, softirq and hardirq contexts may each hold one local handle at
+  a time.
+- It cannot be used from NMI.
+- ``rcu_txn_init_local()`` never waits for a grace period.  When its pool runs
+  out of descriptors, it spins instead, with interrupts disabled, until the
+  resolve sections in flight are over.
+
+The comment "Local transactions" in ``lib/rcu_txn.c`` describes how the pool
+works.
 
 An update that re-points a single slot needs no transaction.  Every
 transaction settles its slots before its commit returns.  The writers of the

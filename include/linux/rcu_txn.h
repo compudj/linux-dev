@@ -111,7 +111,8 @@
  * Once a commit has settled every slot it installed a proxy in, its descriptor
  * can be reclaimed in either of two ways:
  *
- *   - After a grace period, as rcu_txn_commit() does with kfree_rcu().  A
+ *   - After a grace period, as rcu_txn_commit() does with kfree_rcu(), or with
+ *     call_rcu_hurry() back into its pool for a local handle's descriptor.  A
  *     resolve section disables interrupts, so it is also an RCU read-side
  *     critical section.  This needs RCU to watch the CPU: a reader must not
  *     resolve from the idle loop, or from a CPU that RCU sees as offline.
@@ -119,7 +120,9 @@
  *   - Once __rcu_txn_synchronize_resolve() returns, without a grace period.
  *     It waits for the resolve sections in flight with
  *     synchronize_srcu_atomic().  The sections are short, so this wait spins
- *     and its caller need not sleep.  See lib/rcu_txn.c.
+ *     and its caller need not sleep.  A pool that runs out of descriptors takes
+ *     back this way those still waiting for a grace period.  See
+ *     lib/rcu_txn.c.
  *
  * A reader must still load a slot and use the target it resolves within one
  * RCU read-side critical section.  The embedder reclaims its nodes after a
@@ -135,6 +138,11 @@
  * the allocator cannot be called there.  On PREEMPT_RT, this also holds
  * under a bit spinlock.
  *
+ * A transaction of at most RCU_TXN_LOCAL_CAP records that must not fail is
+ * initialized with rcu_txn_init_local() instead.  Its descriptor comes from
+ * its CPU's pool.  Preemption stays disabled until its commit or cancel.  See
+ * lib/rcu_txn.c.
+ *
  * rcu_txn_commit() and rcu_txn_cancel() allocate nothing, do not sleep, and
  * may be called under a raw or a bit spinlock.
  */
@@ -144,6 +152,7 @@
 #include <linux/compiler.h>
 #include <linux/errno.h>
 #include <linux/gfp_types.h>
+#include <linux/preempt.h>
 #include <linux/rcupdate.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
@@ -274,6 +283,7 @@ struct rcu_txn {
 	gfp_t gfp;			/* for the descriptor */
 	enum rcu_txn_state state;
 	bool disjoint;			/* declared slot-disjoint */
+	bool local;			/* see rcu_txn_init_local() */
 #ifdef CONFIG_DEBUG_RCU_TXN
 	/* Task that initialized or adopted the handle, and drives it. */
 	struct task_struct *owner;
@@ -589,6 +599,15 @@ static inline void rcu_txn_init(struct rcu_txn *t, gfp_t gfp)
 }
 
 /*
+ * The records of a local transaction: enough for the largest operation of
+ * <linux/rcu_txn_list.h>, a move.
+ */
+#define RCU_TXN_LOCAL_CAP	6
+
+/* See lib/rcu_txn.c. */
+void rcu_txn_init_local(struct rcu_txn *t);
+
+/*
  * Move the handle's records to a new descriptor holding at least @cap of them.
  * PREPARE only.  Return false if it cannot allocate.  The handle is then in
  * the RCU_TXN_OOM state.
@@ -638,18 +657,24 @@ static inline bool rcu_txn_reserve(struct rcu_txn *t, unsigned int cap)
  * its first record: nothing may be recorded before the adopt.  The embedder
  * makes sure that the first task is done with the handle.
  *
- * Warn if @t already holds records.  Without CONFIG_DEBUG_RCU_TXN, do
- * nothing.
+ * Warn if @t already holds records, or if @t is a local handle.  A local
+ * handle stays on the CPU that initialized it.  Without
+ * CONFIG_DEBUG_RCU_TXN, do nothing.
  */
 static inline void rcu_txn_adopt(struct rcu_txn *t)
 {
 	/* A handle must not change hands with records in it. */
 	RCU_TXN_WARN_ON(t->nr);
+	/* A local handle belongs to the CPU it disabled preemption on. */
+	RCU_TXN_WARN_ON(t->local);
 	__rcu_txn_excl_claim(t);
 }
 
 /* Free a descriptor that installed no proxy: see lib/rcu_txn.c. */
 void __rcu_txn_free_desc(struct rcu_txn_desc *desc);
+
+/* Put a local descriptor that installed no proxy back in its pool. */
+void __rcu_txn_local_put(struct rcu_txn_desc *desc);
 
 /*
  * Release the handle's descriptor, if it has one.  None of its proxies was
@@ -658,13 +683,17 @@ void __rcu_txn_free_desc(struct rcu_txn_desc *desc);
  */
 static inline void __rcu_txn_release_desc(struct rcu_txn *t)
 {
-	if (t->desc)
+	if (!t->desc)
+		return;
+	if (t->local)
+		__rcu_txn_local_put(t->desc);
+	else
 		__rcu_txn_free_desc(t->desc);
 }
 
 /*
  * Mark the handle consumed by commit() or by cancel().  It no longer owns a
- * descriptor.  It must be initialized again before it is reused.
+ * descriptor.  A local handle enables preemption again.
  */
 static inline void __rcu_txn_done(struct rcu_txn *t)
 {
@@ -672,6 +701,8 @@ static inline void __rcu_txn_done(struct rcu_txn *t)
 	t->records = NULL;
 	t->nr = 0;
 	t->state = RCU_TXN_DONE;
+	if (t->local)
+		preempt_enable();
 }
 
 /*
@@ -960,11 +991,13 @@ static inline void rcu_txn_cancel(struct rcu_txn *t)
 }
 
 /*
- * Install, commit, settle and retire the first @nr records of @desc.  This is
- * the commit of a transaction of two records or more, which installs
- * proxies.
+ * Install, commit and settle the first @nr records of @desc.  Then free
+ * @desc after a grace period.  This is the commit of a transaction of two
+ * records or more, which installs proxies.  If @local, @desc is a local
+ * handle's, and goes back to its pool instead.
  */
-void __rcu_txn_commit_desc(struct rcu_txn_desc *desc, unsigned int nr);
+void __rcu_txn_commit_desc(struct rcu_txn_desc *desc, unsigned int nr,
+			   bool local);
 
 /**
  * rcu_txn_commit() - commit a transaction
@@ -975,15 +1008,18 @@ void __rcu_txn_commit_desc(struct rcu_txn_desc *desc, unsigned int nr);
  * the whole commit.  An empty transaction publishes nothing.  commit()
  * consumes the handle.
  *
- * With two or more records, the descriptor's reclaim is deferred with
- * kfree_rcu(): a reader may still hold a proxy.
+ * The descriptor is freed with kfree_rcu(), with one record as with several.
+ * A local handle's descriptor goes back to its pool instead.  See
+ * rcu_txn_init_local().
  *
  * Context: The caller excludes other writers of the recorded slots.  Does not
  * sleep, and may be called under a raw or a bit spinlock.  Any context but
  * NMI: it may call kfree_rcu().
  * Return: 0 on success.  -ENOMEM if a reserve() or a record() of this
- * transaction failed: nothing is published then.  -EINVAL, with a warning,
- * if the handle was already consumed.
+ * transaction failed: nothing is published then.  For a local handle, that
+ * is a record beyond RCU_TXN_LOCAL_CAP, or an rcu_txn_init_local() that
+ * found no descriptor.  -EINVAL, with a warning, if the handle was already
+ * consumed.
  */
 static inline int rcu_txn_commit(struct rcu_txn *t)
 {
@@ -1007,10 +1043,10 @@ static inline int rcu_txn_commit(struct rcu_txn *t)
 		__rcu_txn_release_desc(t);
 	} else {
 		/*
-		 * The proxies live in the descriptor, which is reclaimed after
-		 * a grace period.
+		 * The proxies live in the descriptor, which is reclaimed once
+		 * no reader can still read them.
 		 */
-		__rcu_txn_commit_desc(t->desc, nr);
+		__rcu_txn_commit_desc(t->desc, nr, t->local);
 	}
 	__rcu_txn_done(t);
 	return 0;
