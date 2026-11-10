@@ -9,6 +9,7 @@
 #include <linux/bug.h>
 #include <linux/rcu_txn.h>
 #include <linux/rcu_txn_hlist.h>
+#include <linux/rcu_txn_list.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/task.h>
 #include <linux/string.h>
@@ -1202,6 +1203,445 @@ static void rcu_txn_test_hlist_debug_ghost_anchor(struct kunit *test)
 	hlist_expect(test, &head, keys, ARRAY_SIZE(keys));
 }
 
+/*
+ * <linux/rcu_txn_list.h>
+ */
+
+struct ln {
+	struct rcu_txn_list_node node;
+	int key;
+};
+
+/* Freed with the test: a removed node stays valid for any reader. */
+static struct rcu_txn_list_node *ln_new(struct kunit *test, int key)
+{
+	struct ln *n = kunit_kzalloc(test, sizeof(*n), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, n);
+	n->key = key;
+	return &n->node;
+}
+
+/* Build the list @keys by appending. */
+static void list_build(struct kunit *test, struct rcu_txn_list_head *head,
+		       const int *keys, int nr)
+{
+	int i;
+
+	for (i = 0; i < nr; i++)
+		KUNIT_ASSERT_EQ(test,
+				rcu_txn_list_add_tail_rcu(ln_new(test, keys[i]),
+							  head, GFP_KERNEL),
+				0);
+}
+
+/* The test is the list's only writer, and owns every node until it ends. */
+static struct rcu_txn_list_node *list_find(struct rcu_txn_list_head *head,
+					   int key)
+{
+	struct ln *n;
+
+	rcu_txn_list_for_each_entry_rcu(n, head, node, true)
+		if (n->key == key)
+			return &n->node;
+	return NULL;
+}
+
+/*
+ * Check that the forward walk gives @want and the backward walk its mirror.
+ * Check that next and prev are mutual inverses at every edge of the ring,
+ * sentinel included.
+ */
+static void list_expect(struct kunit *test, struct rcu_txn_list_head *head,
+			const int *want, int nr)
+{
+	struct rcu_txn_list_node *p, *q;
+	struct ln *n;
+	int i = 0;
+
+	rcu_txn_list_for_each_entry_rcu(n, head, node, true) {
+		if (i < nr)
+			KUNIT_EXPECT_EQ(test, n->key, want[i]);
+		i++;
+	}
+	KUNIT_EXPECT_EQ(test, i, nr);
+	rcu_txn_list_for_each_entry_reverse_rcu(n, head, node, true) {
+		i--;
+		if (i >= 0)
+			KUNIT_EXPECT_EQ(test, n->key, want[i]);
+	}
+	KUNIT_EXPECT_EQ(test, i, 0);
+	p = &head->node;
+	do {
+		q = rcu_txn_list_next_check(p, true);
+		KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(q, true), p);
+		p = q;
+	} while (p != &head->node);
+}
+
+static void rcu_txn_test_list_add(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	RCU_TXN_LIST_HEAD(tail);
+	static const int at_head[] = { 3, 2, 1 };
+	static const int keys[] = { 1, 2, 3 };
+	static const int middle[] = { 1, 8, 2, 9, 3 };
+	int i;
+
+	KUNIT_EXPECT_TRUE(test, rcu_txn_list_empty(&head, true));
+	list_expect(test, &head, NULL, 0);
+	rcu_read_lock();
+	KUNIT_EXPECT_NULL(test, rcu_txn_list_first_or_null_rcu(&head, struct ln,
+								node));
+	KUNIT_EXPECT_NULL(test, rcu_txn_list_last_or_null_rcu(&head, struct ln,
+							       node));
+	rcu_read_unlock();
+
+	for (i = 1; i <= 3; i++)
+		KUNIT_ASSERT_EQ(test,
+				rcu_txn_list_add_rcu(ln_new(test, i), &head,
+						     GFP_KERNEL),
+				0);
+	list_expect(test, &head, at_head, ARRAY_SIZE(at_head));
+
+	list_build(test, &tail, keys, ARRAY_SIZE(keys));
+	list_expect(test, &tail, keys, ARRAY_SIZE(keys));
+	rcu_read_lock();
+	KUNIT_EXPECT_EQ(test, rcu_txn_list_first_or_null_rcu(&tail, struct ln,
+							     node)->key, 1);
+	KUNIT_EXPECT_EQ(test, rcu_txn_list_last_or_null_rcu(&tail, struct ln,
+							    node)->key, 3);
+	/* The load-acquire accessors step as the plain ones do. */
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_acquire_rcu(&tail.node),
+			    rcu_txn_list_next_rcu(&tail.node));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_acquire_rcu(&tail.node),
+			    rcu_txn_list_prev_rcu(&tail.node));
+	rcu_read_unlock();
+
+	KUNIT_EXPECT_EQ(test,
+			rcu_txn_list_add_after_rcu(ln_new(test, 9),
+						   list_find(&tail, 2),
+						   GFP_KERNEL),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			rcu_txn_list_add_before_rcu(ln_new(test, 8),
+						    list_find(&tail, 2),
+						    GFP_KERNEL),
+			0);
+	list_expect(test, &tail, middle, ARRAY_SIZE(middle));
+}
+
+static void rcu_txn_test_list_del(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2, 3, 4, 5 };
+	static const int middle[] = { 1, 2, 4, 5 };
+	static const int ends[] = { 2, 4 };
+	struct rcu_txn_list_node *removed;
+
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	removed = list_find(&head, 3);
+	KUNIT_EXPECT_EQ(test, rcu_txn_list_del_rcu(removed, GFP_KERNEL), 0);
+	list_expect(test, &head, middle, ARRAY_SIZE(middle));
+	/* A reader standing on the removed node leaves in either direction. */
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_check(removed, true),
+			    list_find(&head, 4));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(removed, true),
+			    list_find(&head, 2));
+
+	rcu_txn_list_del_rcu(list_find(&head, 1), GFP_KERNEL);	/* first */
+	rcu_txn_list_del_rcu(list_find(&head, 5), GFP_KERNEL);	/* last */
+	list_expect(test, &head, ends, ARRAY_SIZE(ends));
+
+	rcu_txn_list_del_rcu(list_find(&head, 2), GFP_KERNEL);
+	rcu_txn_list_del_rcu(list_find(&head, 4), GFP_KERNEL);
+	list_expect(test, &head, NULL, 0);
+}
+
+static void rcu_txn_test_list_replace(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2, 3 };
+	static const int want[] = { 1, 22, 3 };
+
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	KUNIT_EXPECT_EQ(test,
+			rcu_txn_list_replace_rcu(list_find(&head, 2),
+						 ln_new(test, 22), GFP_KERNEL),
+			0);
+	list_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/*
+ * Run the install, commit and settle steps of a delete by hand.  Check what a
+ * reader sees of its two edges.  Both directions are old until the single
+ * flip, and new after it.
+ *
+ * Ring: head <-> A <-> B <-> head.  Delete A:
+ *   forward edge:  head->next: A -> B
+ *   backward edge: B->prev:    A -> head
+ */
+static void rcu_txn_test_list_proxy_phases(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2 };
+	static const int want[] = { 2 };
+	struct rcu_txn_list_node *a, *b;
+	struct rcu_txn_record rec[2];
+	struct rcu_txn_group group;
+
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	a = list_find(&head, 1);
+	b = list_find(&head, 2);
+
+	__rcu_txn_group_init(&group);
+	__rcu_txn_record_set(&rec[0], rcu_txn_slot(&head.node.next), a, b,
+			     RCU_TXN_LIST_TAG);
+	__rcu_txn_record_set(&rec[1], rcu_txn_slot(&b->prev), a, &head.node,
+			     RCU_TXN_LIST_TAG);
+	__rcu_txn_record_install(&group, &rec[0]);
+	__rcu_txn_record_install(&group, &rec[1]);
+
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_check(&head.node, true), a);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(b, true), a);
+
+	__rcu_txn_group_commit(&group);	/* one flip switches both edges */
+
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_check(&head.node, true), b);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(b, true), &head.node);
+
+	/* No reader holds a proxy here: the records need no grace period. */
+	__rcu_txn_record_settle(&rec[0]);
+	__rcu_txn_record_settle(&rec[1]);
+	list_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/* Delete the adjacent 2 and 3 from 1..5 in one transaction. */
+static void rcu_txn_test_list_compose_adjacent_del(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2, 3, 4, 5 };
+	static const int want[] = { 1, 4, 5 };
+	struct rcu_txn_list_node *e2, *e3;
+	struct rcu_txn txn;
+
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	e2 = list_find(&head, 2);
+	e3 = list_find(&head, 3);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_list_del_prepare(&txn, e2);
+	rcu_txn_list_del_prepare(&txn, e3);	/* the neighbour of e2 */
+	/* &1->next is chained; &3->prev and &4->prev are one record each. */
+	KUNIT_EXPECT_EQ(test, txn.nr, 3);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	list_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/*
+ * Delete 2 and insert 9 into the same gap in one transaction: both edges of
+ * the gap are written twice.
+ */
+static void rcu_txn_test_list_compose_del_and_add(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2, 3 };
+	static const int want[] = { 1, 9, 3 };
+	struct rcu_txn_list_node *e1, *e2;
+	struct rcu_txn txn;
+
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	e1 = list_find(&head, 1);
+	e2 = list_find(&head, 2);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_list_del_prepare(&txn, e2);
+	rcu_txn_list_add_after_prepare(&txn, ln_new(test, 9), e1);
+	KUNIT_EXPECT_EQ(test, txn.nr, 2);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	list_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/* Three consecutive deletes in one transaction: &1->next is chained twice. */
+static void rcu_txn_test_list_compose_triple_del(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2, 3, 4, 5 };
+	static const int want[] = { 1, 5 };
+	struct rcu_txn_list_node *e[3];
+	struct rcu_txn txn;
+	int i;
+
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	for (i = 0; i < ARRAY_SIZE(e); i++)
+		e[i] = list_find(&head, i + 2);		/* 2, 3, 4 */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	for (i = 0; i < ARRAY_SIZE(e); i++)
+		rcu_txn_list_del_prepare(&txn, e[i]);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	list_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/* The moves of a node, in a transaction of their own. */
+static void rcu_txn_test_list_move(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2, 3, 4, 5 };
+	static const int front[] = { 4, 1, 2, 3, 5 };
+	static const int tail[] = { 1, 2, 3, 5, 4 };
+	static const int past_next[] = { 1, 3, 2, 5, 4 };
+	struct rcu_txn_list_node *e1, *e2, *e3, *e4;
+	struct rcu_txn txn;
+
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	e1 = list_find(&head, 1);
+	e2 = list_find(&head, 2);
+	e3 = list_find(&head, 3);
+	e4 = list_find(&head, 4);
+
+	KUNIT_EXPECT_EQ(test, rcu_txn_list_move_rcu(e4, &head, GFP_KERNEL), 0);
+	list_expect(test, &head, front, ARRAY_SIZE(front));
+	KUNIT_EXPECT_EQ(test,
+			rcu_txn_list_move_tail_rcu(e4, &head, GFP_KERNEL), 0);
+	list_expect(test, &head, tail, ARRAY_SIZE(tail));
+	/* Past its next, then back before it: the neighbourhoods overlap. */
+	KUNIT_EXPECT_EQ(test, rcu_txn_list_move_after_rcu(e2, e3, GFP_KERNEL), 0);
+	list_expect(test, &head, past_next, ARRAY_SIZE(past_next));
+	KUNIT_EXPECT_EQ(test, rcu_txn_list_move_before_rcu(e2, e3, GFP_KERNEL), 0);
+	list_expect(test, &head, tail, ARRAY_SIZE(tail));
+
+	/* Where it already is: nothing is recorded. */
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_list_move_after_prepare(&txn, e2, e1);
+	rcu_txn_list_move_before_prepare(&txn, e1, e2);
+	KUNIT_EXPECT_EQ(test, txn.nr, 0);
+	rcu_txn_cancel(&txn);
+}
+
+/*
+ * Check what a reader sees of the six edges of a move, across install, commit
+ * and settle.  It sees the old list until the single flip, and the new one
+ * after.  This includes the links of the moved node itself.
+ *
+ * Ring: head <-> A <-> B <-> C <-> D <-> head.  Move D after A.
+ */
+static void rcu_txn_test_list_move_phases(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2, 3, 4 };
+	static const int want[] = { 1, 4, 2, 3 };
+	struct rcu_txn_list_node *a, *b, *c, *d, *h = &head.node;
+	struct rcu_txn txn;
+	unsigned int i;
+
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	a = list_find(&head, 1);
+	b = list_find(&head, 2);
+	c = list_find(&head, 3);
+	d = list_find(&head, 4);
+
+	rcu_txn_init(&txn, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txn, 6));
+	rcu_txn_list_move_after_prepare(&txn, d, a);
+	KUNIT_ASSERT_EQ(test, txn.nr, 6);
+	for (i = 0; i < txn.nr; i++)
+		__rcu_txn_record_install(&txn.desc->group, &txn.records[i]);
+
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_check(a, true), b);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(b, true), a);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_check(c, true), d);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(h, true), d);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_check(d, true), h);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(d, true), c);
+
+	__rcu_txn_group_commit(&txn.desc->group);	/* one flip, six edges */
+
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_check(a, true), d);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(b, true), d);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_check(c, true), h);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(h, true), c);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_next_check(d, true), b);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_txn_list_prev_check(d, true), a);
+
+	/* No reader holds a proxy here: the records need no grace period. */
+	for (i = 0; i < txn.nr; i++)
+		__rcu_txn_record_settle(&txn.records[i]);
+	__rcu_txn_free_desc(txn.desc);
+	__rcu_txn_done(&txn);
+	list_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/* Two moves to the front in one transaction: their edges chain. */
+static void rcu_txn_test_list_compose_moves(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2, 3, 4 };
+	static const int want[] = { 4, 3, 1, 2 };
+	struct rcu_txn txn;
+
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_list_move_after_prepare(&txn, list_find(&head, 3), &head.node);
+	rcu_txn_list_move_after_prepare(&txn, list_find(&head, 4), &head.node);
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	list_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
+/*
+ * Declare disjoint a transaction that composes edits.  This turns off what
+ * makes them compose.  Check the warning when the second delete reads a link
+ * that the first one already recorded.
+ */
+static void rcu_txn_test_list_debug_disjoint_compose(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2, 3, 4 };
+	struct rcu_txn_list_node *e2, *e3;
+	struct rcu_txn txn;
+
+	need_debug(test);
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	e2 = list_find(&head, 2);
+	e3 = list_find(&head, 3);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_declare_disjoint(&txn);
+	rcu_txn_list_del_prepare(&txn, e2);
+	kunit_warning_suppress(test) {
+		rcu_txn_list_del_prepare(&txn, e3);	/* loads &3->prev */
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	rcu_txn_cancel(&txn);
+	list_expect(test, &head, keys, ARRAY_SIZE(keys));
+}
+
+/*
+ * Delete a node a second time, after an add re-pointed its old neighbour.
+ * The list keeps no "unlinked" state, so only CONFIG_DEBUG_RCU_TXN can see
+ * it.  Without the cancel, the commit would drop node 9.
+ */
+static void rcu_txn_test_list_debug_unlinked(struct kunit *test)
+{
+	RCU_TXN_LIST_HEAD(head);
+	static const int keys[] = { 1, 2, 3 };
+	static const int want[] = { 1, 9, 3 };
+	struct rcu_txn_list_node *e2;
+	struct rcu_txn txn;
+
+	need_debug(test);
+	list_build(test, &head, keys, ARRAY_SIZE(keys));
+	e2 = list_find(&head, 2);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_list_del_prepare(&txn, e2);
+	rcu_txn_list_add_after_prepare(&txn, ln_new(test, 9),
+				       list_find(&head, 1));
+	KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	kunit_warning_suppress(test) {
+		rcu_txn_list_del_prepare(&txn, e2);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	rcu_txn_cancel(&txn);
+	list_expect(test, &head, want, ARRAY_SIZE(want));
+}
+
 static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_single_record),
 	KUNIT_CASE(rcu_txn_test_multi_record),
@@ -1244,6 +1684,18 @@ static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_hlist_cancel),
 	KUNIT_CASE(rcu_txn_test_hlist_oom),
 	KUNIT_CASE(rcu_txn_test_hlist_debug_ghost_anchor),
+	KUNIT_CASE(rcu_txn_test_list_add),
+	KUNIT_CASE(rcu_txn_test_list_del),
+	KUNIT_CASE(rcu_txn_test_list_replace),
+	KUNIT_CASE(rcu_txn_test_list_proxy_phases),
+	KUNIT_CASE(rcu_txn_test_list_compose_adjacent_del),
+	KUNIT_CASE(rcu_txn_test_list_compose_del_and_add),
+	KUNIT_CASE(rcu_txn_test_list_compose_triple_del),
+	KUNIT_CASE(rcu_txn_test_list_move),
+	KUNIT_CASE(rcu_txn_test_list_move_phases),
+	KUNIT_CASE(rcu_txn_test_list_compose_moves),
+	KUNIT_CASE(rcu_txn_test_list_debug_disjoint_compose),
+	KUNIT_CASE(rcu_txn_test_list_debug_unlinked),
 	{}
 };
 

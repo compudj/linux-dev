@@ -12,7 +12,9 @@
  * It has a single writer: writers are mutually excluded, as with
  * hlist_add_head_rcu().  Its edits are recorded into a transaction of
  * <linux/rcu_txn.h>.  The commit makes all of them visible to readers at
- * once, on one bucket or on many.
+ * once, on one bucket or on many.  It is the counterpart of
+ * <linux/rcu_txn_list.h> for hash buckets.  Its head is one pointer, half
+ * the size of a sentinel-node head.
  *
  * Forward-only readers, and pprev
  * -------------------------------
@@ -25,7 +27,8 @@
  *
  * Readers walk forward only.  They load pprev only to test
  * rcu_txn_hlist_unhashed().  So each operation has exactly one
- * reader-visible edge: the next slot it re-points.
+ * reader-visible edge: the next slot it re-points.  This is where the hlist
+ * differs from <linux/rcu_txn_list.h>, whose prev is reader-visible.
  *
  * A node in no chain has a NULL pprev, as hlist_unhashed() expects.  This
  * holds for a fresh node after rcu_txn_hlist_node_init().  It also holds for
