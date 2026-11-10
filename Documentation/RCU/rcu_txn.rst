@@ -226,12 +226,17 @@ exclusion, such as ``lockdep_is_held()`` of its lock.  This works as with
 
 ``include/linux/rcu_txn_list.h``
 	A circular doubly-linked list.  Its forward and backward chains
-	switch together, so readers can walk it in both directions.  An insertion or a removal switches a forward and a
-	backward edge.  A move switches six edges, including the moved node's
-	own two.  Each of these operations allocates a descriptor.  A reader
-	standing on a moved node goes with it, and may skip or revisit other
-	nodes.  For a walk that must see every node once, delete the node,
-	wait for a grace period, then add it back.
+	switch together, so readers can walk it in both directions.  An
+	insertion or a removal switches a forward and a backward edge.  A
+	move switches six edges, including the moved node's own two.  A
+	reader standing on a moved node goes with it, and may skip or
+	revisit other nodes.  For a walk that must see every node once,
+	delete the node, wait for a grace period, then add it back.
+	A reader that loads both links of one node loads the first one
+	with ``rcu_txn_list_next_acquire_rcu()`` or
+	``rcu_txn_list_prev_acquire_rcu()``.
+	An ``_rcu`` operation runs a local transaction.  It allocates
+	nothing, and cannot fail in any context but NMI.
 
 Debugging
 =========

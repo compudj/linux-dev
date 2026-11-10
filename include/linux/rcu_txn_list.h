@@ -124,10 +124,13 @@
  * Writers must be mutually excluded, as with list_add_rcu().  Each mutator
  * records its edges in a transaction and commits them together.  These are
  * one forward and one backward edge, or six for a move.  The transaction
- * installs proxies, so it allocates a descriptor.  An _rcu mutator takes a
- * gfp_t.  It returns 0, or -ENOMEM if the transaction could not be
- * allocated.  The list is then unchanged.  A writer that must not fail
- * there reserves its transaction first and uses the _prepare forms.
+ * installs proxies, so it needs a descriptor.  An _rcu mutator takes one from
+ * its CPU's pool, with preemption disabled (rcu_txn_init_local()).  It
+ * allocates nothing, so it cannot fail for want of memory, even on a teardown
+ * path.  It runs in any context but NMI, and its caller must hold no other
+ * local handle.  The _prepare forms record into a transaction of the
+ * caller's.  It may compose several operations.  The caller allocates its
+ * descriptor, or takes one from the pool.
  *
  * The list keeps no "unlinked" state, unlike list_del() with its poison.
  * The caller tracks which nodes are in the list.  CONFIG_DEBUG_RCU_TXN warns
@@ -140,8 +143,8 @@
  * _prev_check() and rcu_txn_list_empty() take one too.
  */
 
+#include <linux/build_bug.h>
 #include <linux/container_of.h>
-#include <linux/gfp_types.h>
 #include <linux/rcu_txn.h>
 #include <linux/rcupdate.h>
 
@@ -474,108 +477,114 @@ rcu_txn_list_move_before_prepare(struct rcu_txn *txn,
 }
 
 /*
- * The _rcu forms run one operation each, in a transaction of their own.
- * They return 0, or -ENOMEM if the transaction could not be allocated with
- * @gfp.  The list is then unchanged.  The caller frees a removed or replaced
- * node after a grace period.
+ * The _rcu forms run one operation each, in a local transaction of their own:
+ * see "Write side" at the top of this file.  The caller frees a removed or
+ * replaced node after a grace period.
+ *
+ * Only a bug makes one skip its operation: a call in NMI, or a CPU whose open
+ * local handles hold its whole pool of descriptors.  rcu_txn_init_local()
+ * then warns once.
+ *
+ * Do not call an _rcu form on a list while another transaction holds records
+ * on that list.  The _rcu form does not see these records, and the commit of
+ * that transaction would then overwrite its change.
  */
+
+/* A move, the largest operation, fits a local transaction. */
+static_assert(RCU_TXN_LOCAL_CAP >= 6);
+
+/* Start the transaction of a single operation: its slots are distinct. */
+static inline void __rcu_txn_list_init_one(struct rcu_txn *txn)
+{
+	rcu_txn_init_local(txn);
+	rcu_txn_declare_disjoint(txn);
+}
 
 /*
- * Start the transaction of a single operation, with @nr records.  Its slots
- * are distinct, so declare it disjoint.
+ * Commit the transaction of a single operation.  It records no more than
+ * RCU_TXN_LOCAL_CAP edges, so it cannot fail.  If rcu_txn_init_local() left
+ * the handle OOM, the operation is skipped: see above.
  */
-static inline void __rcu_txn_list_init_one(struct rcu_txn *txn, gfp_t gfp,
-					   unsigned int nr)
+static inline void __rcu_txn_list_commit_one(struct rcu_txn *txn)
 {
-	rcu_txn_init(txn, gfp);
-	rcu_txn_declare_disjoint(txn);
-	/* An OOM is sticky: commit reports it. */
-	rcu_txn_reserve(txn, nr);
+	rcu_txn_commit(txn);
 }
 
-static inline int rcu_txn_list_add_after_rcu(struct rcu_txn_list_node *new,
-					     struct rcu_txn_list_node *pos,
-					     gfp_t gfp)
+static inline void rcu_txn_list_add_after_rcu(struct rcu_txn_list_node *new,
+					      struct rcu_txn_list_node *pos)
 {
 	struct rcu_txn txn;
 
-	__rcu_txn_list_init_one(&txn, gfp, 2);
+	__rcu_txn_list_init_one(&txn);
 	rcu_txn_list_add_after_prepare(&txn, new, pos);
-	return rcu_txn_commit(&txn);
+	__rcu_txn_list_commit_one(&txn);
 }
 
-static inline int rcu_txn_list_add_before_rcu(struct rcu_txn_list_node *new,
-					      struct rcu_txn_list_node *pos,
-					      gfp_t gfp)
+static inline void rcu_txn_list_add_before_rcu(struct rcu_txn_list_node *new,
+					       struct rcu_txn_list_node *pos)
 {
 	struct rcu_txn txn;
 
-	__rcu_txn_list_init_one(&txn, gfp, 2);
+	__rcu_txn_list_init_one(&txn);
 	rcu_txn_list_add_before_prepare(&txn, new, pos);
-	return rcu_txn_commit(&txn);
+	__rcu_txn_list_commit_one(&txn);
 }
 
 /* Add @new at the head of the list (just after @head). */
-static inline int rcu_txn_list_add_rcu(struct rcu_txn_list_node *new,
-				       struct rcu_txn_list_head *head,
-				       gfp_t gfp)
+static inline void rcu_txn_list_add_rcu(struct rcu_txn_list_node *new,
+					struct rcu_txn_list_head *head)
 {
-	return rcu_txn_list_add_after_rcu(new, &head->node, gfp);
+	rcu_txn_list_add_after_rcu(new, &head->node);
 }
 
 /* Add @new at the tail of the list (just before @head). */
-static inline int rcu_txn_list_add_tail_rcu(struct rcu_txn_list_node *new,
-					    struct rcu_txn_list_head *head,
-					    gfp_t gfp)
+static inline void rcu_txn_list_add_tail_rcu(struct rcu_txn_list_node *new,
+					     struct rcu_txn_list_head *head)
 {
-	return rcu_txn_list_add_before_rcu(new, &head->node, gfp);
+	rcu_txn_list_add_before_rcu(new, &head->node);
 }
 
-static inline int rcu_txn_list_del_rcu(struct rcu_txn_list_node *elem,
-				       gfp_t gfp)
+static inline void rcu_txn_list_del_rcu(struct rcu_txn_list_node *elem)
 {
 	struct rcu_txn txn;
 
-	__rcu_txn_list_init_one(&txn, gfp, 2);
+	__rcu_txn_list_init_one(&txn);
 	rcu_txn_list_del_prepare(&txn, elem);
-	return rcu_txn_commit(&txn);
+	__rcu_txn_list_commit_one(&txn);
 }
 
-static inline int rcu_txn_list_replace_rcu(struct rcu_txn_list_node *old,
-					   struct rcu_txn_list_node *new,
-					   gfp_t gfp)
+static inline void rcu_txn_list_replace_rcu(struct rcu_txn_list_node *old,
+					    struct rcu_txn_list_node *new)
 {
 	struct rcu_txn txn;
 
-	__rcu_txn_list_init_one(&txn, gfp, 2);
+	__rcu_txn_list_init_one(&txn);
 	rcu_txn_list_replace_prepare(&txn, old, new);
-	return rcu_txn_commit(&txn);
+	__rcu_txn_list_commit_one(&txn);
 }
 
 /*
  * Move @elem after or before @pos.  @pos must be in the same list as @elem:
  * see rcu_txn_list_move_after_prepare().
  */
-static inline int rcu_txn_list_move_after_rcu(struct rcu_txn_list_node *elem,
-					      struct rcu_txn_list_node *pos,
-					      gfp_t gfp)
+static inline void rcu_txn_list_move_after_rcu(struct rcu_txn_list_node *elem,
+					       struct rcu_txn_list_node *pos)
 {
 	struct rcu_txn txn;
 
-	__rcu_txn_list_init_one(&txn, gfp, 6);
+	__rcu_txn_list_init_one(&txn);
 	rcu_txn_list_move_after_prepare(&txn, elem, pos);
-	return rcu_txn_commit(&txn);
+	__rcu_txn_list_commit_one(&txn);
 }
 
-static inline int rcu_txn_list_move_before_rcu(struct rcu_txn_list_node *elem,
-					       struct rcu_txn_list_node *pos,
-					       gfp_t gfp)
+static inline void rcu_txn_list_move_before_rcu(struct rcu_txn_list_node *elem,
+						struct rcu_txn_list_node *pos)
 {
 	struct rcu_txn txn;
 
-	__rcu_txn_list_init_one(&txn, gfp, 6);
+	__rcu_txn_list_init_one(&txn);
 	rcu_txn_list_move_before_prepare(&txn, elem, pos);
-	return rcu_txn_commit(&txn);
+	__rcu_txn_list_commit_one(&txn);
 }
 
 /*
@@ -583,18 +592,16 @@ static inline int rcu_txn_list_move_before_rcu(struct rcu_txn_list_node *elem,
  * before @head).  Unlike list_move(), @head must be the list @elem is in: see
  * rcu_txn_list_move_after_prepare().
  */
-static inline int rcu_txn_list_move_rcu(struct rcu_txn_list_node *elem,
-					struct rcu_txn_list_head *head,
-					gfp_t gfp)
+static inline void rcu_txn_list_move_rcu(struct rcu_txn_list_node *elem,
+					 struct rcu_txn_list_head *head)
 {
-	return rcu_txn_list_move_after_rcu(elem, &head->node, gfp);
+	rcu_txn_list_move_after_rcu(elem, &head->node);
 }
 
-static inline int rcu_txn_list_move_tail_rcu(struct rcu_txn_list_node *elem,
-					     struct rcu_txn_list_head *head,
-					     gfp_t gfp)
+static inline void rcu_txn_list_move_tail_rcu(struct rcu_txn_list_node *elem,
+					      struct rcu_txn_list_head *head)
 {
-	return rcu_txn_list_move_before_rcu(elem, &head->node, gfp);
+	rcu_txn_list_move_before_rcu(elem, &head->node);
 }
 
 #define rcu_txn_list_entry(ptr, type, member)				\
