@@ -43,9 +43,91 @@ static inline void __rcu_txn_group_commit(struct rcu_txn_group *group)
 static inline void __rcu_txn_record_install(struct rcu_txn_group *group,
 					    struct rcu_txn_record *r)
 {
+	/*
+	 * The tag must be non-zero and within RCU_TXN_TAG_MASK.  Every value
+	 * matches a zero tag: see __rcu_txn_holds_proxy().  Readers would
+	 * then resolve plain values as proxies.
+	 */
+	RCU_TXN_WARN_ON(!r->tag || (r->tag & ~RCU_TXN_TAG_MASK));
+	/*
+	 * No bit of the tag may be set in the record's address.  The OR would
+	 * leave such a bit as it is.  __rcu_txn_untag() would then subtract
+	 * to a wrong address.
+	 */
+	RCU_TXN_WARN_ON((unsigned long)r & r->tag);
 	r->group = group;
 	/* Store-release of slot pairs with rcu_dereference(). */
 	rcu_assign_pointer(*r->slot, (void *)((unsigned long)r | r->tag));
 }
+
+/*
+ * The install and settle checks of CONFIG_DEBUG_RCU_TXN: see
+ * <linux/rcu_txn.h>.
+ */
+#ifdef CONFIG_DEBUG_RCU_TXN
+
+/* At settle, @r's slot must still hold the proxy this writer installed. */
+static inline void __rcu_txn_excl_slot_ours(struct rcu_txn_record *r)
+{
+	void *want = (void *)((unsigned long)r | r->tag);
+	void *v = rcu_access_pointer(*r->slot);
+
+	WARN(v != want,
+	     "rcu_txn: slot %p holds %p at settle, expected our installed proxy %p: a concurrent writer overwrote it\n",
+	     r->slot, v, want);
+}
+
+/*
+ * At the multi-record install, @r's slot must hold no proxy.  It must also
+ * still hold the recorded old.
+ *
+ * The value check catches a lost update.  Another writer committed on the
+ * slot after this transaction's record() and before its install.  It left a
+ * plain value, so the no-proxy check passes.  Installing would make readers
+ * see the recorded old value again.  The settle would then overwrite the
+ * other writer's value.
+ *
+ * A correct single-writer program never trips it.  This transaction has not
+ * written the slot yet.  The writer's earlier transactions settled before
+ * they returned.  Chaining keeps the committed old in ptr[0].
+ */
+static inline void __rcu_txn_excl_slot_installable(struct rcu_txn_record *r)
+{
+	__rcu_txn_excl_slot_free(r->slot, r->tag, "install");
+	__rcu_txn_excl_slot_unchanged(r, "install");
+}
+
+/*
+ * Records must target pairwise-distinct slots: see rcu_txn_record().  They are
+ * in record order, not sorted by slot, so check every pair.
+ */
+static inline void
+__rcu_txn_assert_distinct_slots(const struct rcu_txn_record *records,
+				unsigned int nr)
+{
+	unsigned int i, j;
+
+	for (i = 1; i < nr; i++)
+		for (j = 0; j < i; j++)
+			WARN_ON(records[i].slot == records[j].slot);
+}
+
+#else	/* !CONFIG_DEBUG_RCU_TXN */
+
+static inline void __rcu_txn_excl_slot_ours(struct rcu_txn_record *r)
+{
+}
+
+static inline void __rcu_txn_excl_slot_installable(struct rcu_txn_record *r)
+{
+}
+
+static inline void
+__rcu_txn_assert_distinct_slots(const struct rcu_txn_record *records,
+				unsigned int nr)
+{
+}
+
+#endif	/* CONFIG_DEBUG_RCU_TXN */
 
 #endif /* _LIB_RCU_TXN_INTERNAL_H */

@@ -2892,6 +2892,20 @@ config LIST_PRIVATE_KUNIT_TEST
 
 	  If unsure, say N.
 
+config DEBUG_RCU_TXN
+	bool "Debug checks for single-writer RCU pseudo-transactions"
+	depends on DEBUG_KERNEL && RCU_TXN
+	help
+	  Check at run time that the users of <linux/rcu_txn.h> follow its
+	  contract.  A violation warns.  The main check is that no two
+	  writers write the same slot at once.  See the CONFIG_DEBUG_RCU_TXN
+	  comment in that header.
+
+	  This adds an owner field to every transaction handle and a pairwise
+	  scan of the records to every commit of two records or more.
+
+	  Say N unless you are debugging a user of RCU pseudo-transactions.
+
 config RCU_TXN_KUNIT_TEST
 	tristate "KUnit Test for single-writer RCU pseudo-transactions" if !KUNIT_ALL_TESTS
 	depends on KUNIT

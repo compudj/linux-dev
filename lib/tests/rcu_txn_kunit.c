@@ -9,6 +9,7 @@
 #include <linux/bug.h>
 #include <linux/rcu_txn.h>
 #include <linux/rcupdate.h>
+#include <linux/sched/task.h>
 #include <linux/string.h>
 
 #include "../rcu_txn_internal.h"	/* the steps of a commit */
@@ -470,6 +471,324 @@ static void rcu_txn_test_consumed_handle(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(slot), T(1));
 }
 
+/*
+ * CONFIG_DEBUG_RCU_TXN
+ *
+ * The cases below check that the debug checks report each way to break the
+ * contract.  They also check that a correct transaction and a correct adopt
+ * do not warn.
+ *
+ * The writer/writer races are staged in one task.  The test stores the other
+ * writer's proxy or committed value in the slot by hand, as a real race would
+ * leave it.
+ */
+
+static void need_debug(struct kunit *test)
+{
+	if (!IS_ENABLED(CONFIG_DEBUG_RCU_TXN))
+		kunit_skip(test, "CONFIG_DEBUG_RCU_TXN is off");
+}
+
+#ifdef CONFIG_DEBUG_RCU_TXN
+static void set_owner(struct rcu_txn *t, struct task_struct *task)
+{
+	t->owner = task;
+}
+#else
+static void set_owner(struct rcu_txn *t, struct task_struct *task)
+{
+}
+#endif
+
+/*
+ * Install a proxy into @slot by hand, as a writer stopped between its install
+ * and its flip leaves it.
+ */
+static void install_by_hand(struct rcu_txn_group *group,
+			    struct rcu_txn_record *rec, void __rcu **slot,
+			    void *old_ptr, void *new_ptr)
+{
+	__rcu_txn_group_init(group);
+	__rcu_txn_record_set(rec, slot, old_ptr, new_ptr, TAG);
+	__rcu_txn_record_install(group, rec);
+}
+
+/* A well-formed single-writer transaction trips nothing. */
+static void rcu_txn_test_debug_control(struct kunit *test)
+{
+	void __rcu *a = RCU_INITIALIZER(T(0));
+	void __rcu *b = RCU_INITIALIZER(T(0));
+	struct rcu_txn txn;
+	unsigned int i;
+
+	need_debug(test);
+	kunit_warning_suppress(test) {
+		for (i = 0; i < 100; i++) {
+			void *to = T(1 + i), *from = T(i);
+
+			rcu_txn_init(&txn, GFP_KERNEL);
+			rcu_txn_record(&txn, &a, from, to, TAG);
+			rcu_txn_record_chain(&txn, &b,
+					     rcu_txn_load(&txn, &b, TAG), to,
+					     TAG);
+			KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+		}
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 0);
+	}
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(a), T(100));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(b), T(100));
+}
+
+/* A handle driven by a task other than the one that initialized it. */
+static void rcu_txn_test_debug_owner(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn txn;
+
+	need_debug(test);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	set_owner(&txn, &init_task);	/* as if another task initialized it */
+	kunit_warning_suppress(test) {
+		rcu_txn_record(&txn, &slot, T(0), T(1), TAG);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	set_owner(&txn, current);
+	rcu_txn_cancel(&txn);
+}
+
+/*
+ * adopt() makes the calling task the owner of a handle that another task
+ * initialized.  It warns if the handle already holds records.
+ */
+static void rcu_txn_test_debug_adopt(struct kunit *test)
+{
+	void __rcu *a = RCU_INITIALIZER(T(0));
+	void __rcu *b = RCU_INITIALIZER(T(0));
+	struct rcu_txn txn;
+
+	need_debug(test);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, rcu_txn_reserve(&txn, 2));
+	set_owner(&txn, &init_task);	/* as if another task got it ready */
+	kunit_warning_suppress(test) {
+		rcu_txn_adopt(&txn);
+		rcu_txn_record(&txn, &a, T(0), T(1), TAG);
+		rcu_txn_record(&txn, &b, T(0), T(1), TAG);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 0);
+		rcu_txn_adopt(&txn);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+		KUNIT_EXPECT_EQ(test, rcu_txn_commit(&txn), 0);
+	}
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(a), T(1));
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(b), T(1));
+}
+
+/* A second writer records a slot that holds the first writer's proxy. */
+static void rcu_txn_test_debug_record_over_proxy(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn_group group;
+	struct rcu_txn_record rec;
+	struct rcu_txn txn;
+
+	need_debug(test);
+	install_by_hand(&group, &rec, &slot, T(0), T(1));
+	rcu_txn_init(&txn, GFP_KERNEL);
+	kunit_warning_suppress(test) {
+		rcu_txn_record(&txn, &slot, T(1), T(2), TAG);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	rcu_txn_cancel(&txn);
+}
+
+/*
+ * A second writer installs onto a slot that holds the first writer's proxy.
+ * It recorded the slot before that proxy was installed.  Both install checks
+ * warn: the slot holds a proxy, and not the recorded old value.
+ */
+static void rcu_txn_test_debug_install_over_proxy(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn_record rec, other;
+	struct rcu_txn_group group;
+
+	need_debug(test);
+	__rcu_txn_record_set(&rec, &slot, T(0), T(2), TAG);
+	install_by_hand(&group, &other, &slot, T(0), T(1));
+	kunit_warning_suppress(test) {
+		__rcu_txn_excl_slot_installable(&rec);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 2);
+	}
+}
+
+/*
+ * Another writer committed on the slot between our record() and our install:
+ * see __rcu_txn_excl_slot_installable().
+ */
+static void rcu_txn_test_debug_install_over_settled(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn_record rec;
+
+	need_debug(test);
+	__rcu_txn_record_set(&rec, &slot, T(0), T(1), TAG);
+	rcu_assign_pointer(slot, T(2));		/* a peer committed 0 -> 2 */
+	kunit_warning_suppress(test) {
+		__rcu_txn_excl_slot_installable(&rec);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+}
+
+/* Our proxy is gone by the time we settle: someone overwrote it. */
+static void rcu_txn_test_debug_settle_clobbered(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn_group group;
+	struct rcu_txn_record rec;
+
+	need_debug(test);
+	/* Stands for our install. */
+	install_by_hand(&group, &rec, &slot, T(0), T(1));
+	rcu_assign_pointer(slot, T(2));		/* a peer overwrites it */
+	kunit_warning_suppress(test) {
+		__rcu_txn_excl_slot_ours(&rec);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+}
+
+/*
+ * Another writer changed the slot between our record() and our single-record
+ * commit: see __rcu_txn_excl_slot_unchanged().
+ */
+static void rcu_txn_test_debug_single_record_changed(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn txn;
+
+	need_debug(test);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_record(&txn, &slot, T(0), T(1), TAG);
+	rcu_assign_pointer(slot, T(2));		/* a peer changed it under us */
+	kunit_warning_suppress(test) {
+		rcu_txn_commit(&txn);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+}
+
+/* One slot recorded twice, not adjacently: see rcu_txn_record(). */
+static void rcu_txn_test_debug_duplicate_slot(struct kunit *test)
+{
+	void __rcu *a = RCU_INITIALIZER(T(0));
+	void __rcu *b = RCU_INITIALIZER(T(1));
+	struct rcu_txn_record recs[3];
+
+	need_debug(test);
+	__rcu_txn_record_set(&recs[0], &a, T(0), T(10), TAG);
+	__rcu_txn_record_set(&recs[1], &b, T(1), T(11), TAG);
+	__rcu_txn_record_set(&recs[2], &a, T(10), T(12), TAG);
+	kunit_warning_suppress(test) {
+		__rcu_txn_assert_distinct_slots(recs, ARRAY_SIZE(recs));
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+}
+
+/* record() warns about an old or a new value that carries the slot's tag. */
+static void rcu_txn_test_debug_tagged_value(struct kunit *test)
+{
+	void *tagged = (void *)((unsigned long)T(1) | TAG);
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn txn;
+
+	need_debug(test);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	kunit_warning_suppress(test) {
+		rcu_txn_record(&txn, &slot, T(0), tagged, TAG);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	rcu_txn_cancel(&txn);
+
+	rcu_txn_init(&txn, GFP_KERNEL);
+	kunit_warning_suppress(test) {
+		rcu_txn_record(&txn, &slot, tagged, T(2), TAG);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	rcu_txn_cancel(&txn);
+}
+
+/* A proxy cannot be installed under a zero tag: nothing would mark it. */
+static void rcu_txn_test_debug_install_zero_tag(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn_group group;
+	struct rcu_txn_record rec;
+
+	need_debug(test);
+	__rcu_txn_group_init(&group);
+	__rcu_txn_record_set(&rec, &slot, T(0), T(1), 0);
+	kunit_warning_suppress(test) {
+		__rcu_txn_record_install(&group, &rec);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+}
+
+/*
+ * On a handle declared disjoint, load and record a slot that is already
+ * recorded.  Both warn: see __rcu_txn_disjoint_check().
+ */
+static void rcu_txn_test_debug_disjoint(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn txn;
+
+	need_debug(test);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_declare_disjoint(&txn);
+	rcu_txn_record_chain(&txn, &slot, T(0), T(1), TAG);
+	kunit_warning_suppress(test) {
+		KUNIT_EXPECT_PTR_EQ(test, rcu_txn_load(&txn, &slot, TAG), T(0));
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	kunit_warning_suppress(test) {
+		rcu_txn_record_chain(&txn, &slot, T(0), T(2), TAG);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	rcu_txn_cancel(&txn);
+}
+
+/* record_chain() warns about an old value that is not the pending one. */
+static void rcu_txn_test_debug_stale_chain(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn txn;
+
+	need_debug(test);
+	rcu_txn_init(&txn, GFP_KERNEL);
+	rcu_txn_record_chain(&txn, &slot, T(0), T(1), TAG);
+	kunit_warning_suppress(test) {
+		rcu_txn_record_chain(&txn, &slot, T(0), T(2), TAG);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	rcu_txn_cancel(&txn);
+}
+
+/* load() finds another writer's proxy in a slot it has not recorded. */
+static void rcu_txn_test_debug_load_proxy(struct kunit *test)
+{
+	void __rcu *slot = RCU_INITIALIZER(T(0));
+	struct rcu_txn_group group;
+	struct rcu_txn_record rec;
+	struct rcu_txn txn;
+
+	need_debug(test);
+	install_by_hand(&group, &rec, &slot, T(0), T(1));
+	rcu_txn_init(&txn, GFP_KERNEL);
+	kunit_warning_suppress(test) {
+		rcu_txn_load(&txn, &slot, TAG);
+		KUNIT_EXPECT_SUPPRESSED_WARNING_COUNT(test, 1);
+	}
+	rcu_txn_cancel(&txn);
+}
+
 static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_single_record),
 	KUNIT_CASE(rcu_txn_test_multi_record),
@@ -484,6 +803,20 @@ static struct kunit_case rcu_txn_test_cases[] = {
 	KUNIT_CASE(rcu_txn_test_ryw_chain),
 	KUNIT_CASE(rcu_txn_test_disjoint),
 	KUNIT_CASE(rcu_txn_test_consumed_handle),
+	KUNIT_CASE(rcu_txn_test_debug_control),
+	KUNIT_CASE(rcu_txn_test_debug_owner),
+	KUNIT_CASE(rcu_txn_test_debug_adopt),
+	KUNIT_CASE(rcu_txn_test_debug_record_over_proxy),
+	KUNIT_CASE(rcu_txn_test_debug_install_over_proxy),
+	KUNIT_CASE(rcu_txn_test_debug_install_over_settled),
+	KUNIT_CASE(rcu_txn_test_debug_settle_clobbered),
+	KUNIT_CASE(rcu_txn_test_debug_single_record_changed),
+	KUNIT_CASE(rcu_txn_test_debug_duplicate_slot),
+	KUNIT_CASE(rcu_txn_test_debug_tagged_value),
+	KUNIT_CASE(rcu_txn_test_debug_install_zero_tag),
+	KUNIT_CASE(rcu_txn_test_debug_disjoint),
+	KUNIT_CASE(rcu_txn_test_debug_stale_chain),
+	KUNIT_CASE(rcu_txn_test_debug_load_proxy),
 	{}
 };
 
