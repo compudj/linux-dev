@@ -18,6 +18,7 @@ RCU Handbook
    rcu
    rculist_nulls
    rcuref
+   rcu_txn
    torture
    stallwarn
    listRCU

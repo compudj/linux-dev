@@ -11,8 +11,11 @@
  * Single-writer RCU pseudo-transactions switch a set of RCU-protected
  * pointers from their old to their new targets with a single store.  These
  * pointers are called slots.  Concurrent RCU readers see the switch as
- * atomic.  At any instant, every slot of the set resolves to its old target,
- * or every slot to its new one.
+ * atomic.  Before that store, every slot of the set resolves to its old
+ * target.  After it, every slot resolves to its new one.  "Before" and
+ * "after" hold only for loads that the reader orders: see "Ordering" below.
+ * Documentation/RCU/rcu_txn.rst says when to use them, and describes the
+ * data structures built on them.
  *
  * The slots are the edges of the data structure that an update re-points.
  * The writer records each slot with its old and new targets.
