@@ -2584,6 +2584,33 @@ static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
  *    is done.
  */
 
+#ifdef CONFIG_SCHED_PROXY_EXEC
+/*
+ * @p stops donating on @rq: it is woken, or it leaves the runqueue. The
+ * task that runs can still point at @p with blocked_donor until it
+ * schedules, and __mutex_unlock_slowpath() dereferences that pointer.
+ * Meanwhile @p can run on another CPU and exit. So clear the pointer.
+ * The unlock path reads it under the blocked_lock of the running task.
+ */
+static inline void proxy_clear_curr_donor(struct rq *rq, struct task_struct *p)
+{
+	struct task_struct *curr = rq->curr;
+
+	lockdep_assert_rq_held(rq);
+
+	if (READ_ONCE(curr->blocked_donor) != p)
+		return;
+
+	guard(raw_spinlock)(&curr->blocked_lock);
+	if (curr->blocked_donor == p)
+		curr->blocked_donor = NULL;
+}
+#else /* !CONFIG_SCHED_PROXY_EXEC */
+static inline void proxy_clear_curr_donor(struct rq *rq, struct task_struct *p)
+{
+}
+#endif /* !CONFIG_SCHED_PROXY_EXEC */
+
 /*
  * move_queued_task - move a queued task to new rq.
  *
@@ -2595,6 +2622,7 @@ static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 {
 	lockdep_assert_rq_held(rq);
 
+	proxy_clear_curr_donor(rq, p);
 	deactivate_task(rq, p, DEQUEUE_NOCLOCK);
 	set_task_cpu(p, new_cpu);
 	rq_unlock(rq, rf);
@@ -3934,6 +3962,7 @@ static inline bool proxy_needs_return(struct rq *rq, struct task_struct *p)
 {
 	return false;
 }
+
 #endif /* CONFIG_SCHED_PROXY_EXEC */
 
 static void
@@ -4007,6 +4036,7 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
 
 		if (p->se.sched_delayed)
 			enqueue_task(rq, p, ENQUEUE_NOCLOCK | ENQUEUE_DELAYED);
+		proxy_clear_curr_donor(rq, p);
 		returned = proxy_needs_return(rq, p);
 		/*
 		 * @p was blocked and this CPU runs a proxy. If @p is the donor
@@ -6973,6 +7003,7 @@ void sched_proxy_block_task(struct rq *rq, struct task_struct *p)
 	if (WARN_ON_ONCE(state == TASK_RUNNING))
 		return;
 
+	proxy_clear_curr_donor(rq, p);
 	if (task_current_donor(rq, p))
 		proxy_reset_donor(rq);
 
