@@ -28,12 +28,18 @@ architectures are as follows.
  - alpha, arc, arm, hexagon, mips rely on the full barrier implied by
    spin_unlock() in finish_lock_switch().
 
+ - csky, openrisc, sh, xtensa rely on the generic smp_store_release(),
+   which issues a full barrier before the store.  finish_task() uses it.
+
  - arm64 relies on the full barrier implied by switch_to().
 
- - powerpc, riscv, s390, sparc, x86 rely on the full barrier implied by
-   switch_mm(), if mm is not NULL; they rely on the full barrier implied
-   by mmdrop(), otherwise.  On powerpc and riscv, switch_mm() relies on
-   membarrier_arch_switch_mm().
+ - loongarch, parisc, powerpc, riscv, s390, sparc, x86 rely on the full
+   barrier implied by switch_mm(), if mm is not NULL; they rely on the full
+   barrier implied by mmdrop(), otherwise.  On loongarch, parisc, powerpc and
+   riscv, switch_mm() relies on membarrier_arch_switch_mm().
+
+An architecture which overrides smp_store_release() or spin_unlock() with
+something weaker than a full barrier must provide this barrier another way.
 
 The barrier matches a full barrier in the proximity of the membarrier system call
 entry, cf. membarrier_{private,global}_expedited().

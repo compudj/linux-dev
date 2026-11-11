@@ -7367,10 +7367,12 @@ keep_resched:
 		 * Here are the schemes providing that barrier on the
 		 * various architectures:
 		 * - mm ? switch_mm() : mmdrop() for x86, s390, sparc, PowerPC,
-		 *   RISC-V.  switch_mm() relies on membarrier_arch_switch_mm()
-		 *   on PowerPC and on RISC-V.
-		 * - finish_lock_switch() for weakly-ordered
-		 *   architectures where spin_unlock is a full barrier,
+		 *   RISC-V, LoongArch, PA-RISC.  switch_mm() relies on
+		 *   membarrier_arch_switch_mm() on PowerPC, RISC-V,
+		 *   LoongArch and PA-RISC.
+		 * - finish_task() and finish_lock_switch() for weakly-ordered
+		 *   architectures where smp_store_release() or spin_unlock
+		 *   is a full barrier,
 		 * - switch_to() for arm64 (weakly-ordered, spin_unlock
 		 *   is a RELEASE barrier),
 		 *
