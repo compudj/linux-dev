@@ -626,10 +626,6 @@ SYM_INNER_LABEL(restore_regs_and_return_to_kernel, SYM_L_GLOBAL)
 #endif
 	POP_REGS
 	addq	$8, %rsp	/* skip regs->orig_ax */
-	/*
-	 * ARCH_HAS_MEMBARRIER_SYNC_CORE rely on IRET core serialization
-	 * when returning from IPI handler.
-	 */
 #ifdef CONFIG_XEN_PV
 SYM_INNER_LABEL(early_xen_iret_patch, SYM_L_GLOBAL)
 	ANNOTATE_NOENDBR

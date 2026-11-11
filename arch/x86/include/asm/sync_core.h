@@ -91,7 +91,7 @@ static __always_inline void sync_core(void)
 /*
  * Ensure that a core serializing instruction is issued before returning
  * to user-mode. x86 implements return to user-space through sysexit,
- * sysrel, and sysretq, which are not core serializing.
+ * sysretl, sysretq and eretu, which are not core serializing.
  */
 static inline void sync_core_before_usermode(void)
 {

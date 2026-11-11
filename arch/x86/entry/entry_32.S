@@ -954,11 +954,6 @@ restore_all_switch_stack:
 	RESTORE_REGS pop=4			# skip orig_eax/error_code
 	CLEAR_CPU_BUFFERS
 .Lirq_return:
-	/*
-	 * ARCH_HAS_MEMBARRIER_SYNC_CORE rely on IRET core serialization
-	 * when returning from IPI handler and when returning from
-	 * scheduler to user-space.
-	 */
 	iret
 
 .Lasm_iret_error:
