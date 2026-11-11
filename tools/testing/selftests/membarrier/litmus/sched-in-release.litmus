@@ -1,0 +1,38 @@
+C sched-in-release
+
+(*
+ * Result: Sometimes
+ *
+ * sched-in with smp_store_release() in place of the full barrier after
+ * the store to rq->curr. This is finish_task() on an architecture where
+ * smp_store_release() is weaker than a full barrier. It does not order
+ * the store to rq->curr before the loads of the thread.
+ *)
+
+{
+	int on_cpu = 1;
+}
+
+P0(int *x, int *y, int *curr)
+{
+	int r_curr;
+	int r2;
+
+	WRITE_ONCE(*x, 1);
+	smp_mb();
+	r_curr = READ_ONCE(*curr);
+	smp_mb();
+	r2 = READ_ONCE(*y);
+}
+
+P1(int *x, int *y, int *curr, int *on_cpu)
+{
+	int r1;
+
+	WRITE_ONCE(*curr, 1);
+	smp_store_release(on_cpu, 0);
+	WRITE_ONCE(*y, 1);
+	r1 = READ_ONCE(*x);
+}
+
+exists (0:r_curr=0 /\ 1:r1=0 /\ 0:r2=0)

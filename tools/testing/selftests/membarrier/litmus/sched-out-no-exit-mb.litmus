@@ -1,0 +1,34 @@
+C sched-out-no-exit-mb
+
+(*
+ * Result: Sometimes
+ *
+ * sched-out without the barrier (c) at the end of membarrier(). The
+ * load of x by P0 can then be done before it loads rq->curr.
+ *)
+
+{
+	int curr = 1;
+}
+
+P0(int *x, int *y, int *curr)
+{
+	int r_curr;
+	int r1;
+	int r2;
+
+	r2 = READ_ONCE(*y);
+	smp_mb();
+	r_curr = READ_ONCE(*curr);
+	r1 = READ_ONCE(*x);
+}
+
+P1(int *x, int *y, int *curr)
+{
+	WRITE_ONCE(*x, 1);
+	WRITE_ONCE(*y, 1);
+	smp_mb();
+	WRITE_ONCE(*curr, 0);
+}
+
+exists (0:r2=1 /\ 0:r_curr=0 /\ 0:r1=0)

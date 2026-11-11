@@ -1,0 +1,49 @@
+C sched-out
+
+(*
+ * Result: Never
+ *
+ * Scenarios (B) and (C) of kernel/sched/membarrier.c: a thread of the
+ * target process is scheduled out while P0 calls membarrier().
+ *
+ * curr stands for rq->curr of the CPU of P1: 1 for the thread, 0 for
+ * another task. P0 sends no IPI when it reads 0, which is the case the
+ * "exists" clause keeps.
+ *
+ * P1 is the thread in user-space, which runs "x = 1; y = 1" in program
+ * order. Then the scheduler issues a full barrier before it stores to
+ * rq->curr: smp_mb__after_spinlock() in __schedule().
+ *
+ * When P0 saw y == 1 and sees that the thread is gone, it sees x == 1.
+ * This holds whatever P0 read from y: y is kept to match the scenario.
+ *
+ * The same argument holds with tsk->mm in place of rq->curr. It covers
+ * exit_mm(), scenario (D), and kthread_unuse_mm(), scenario (E).
+ *)
+
+{
+	int curr = 1;
+}
+
+P0(int *x, int *y, int *curr)
+{
+	int r_curr;
+	int r1;
+	int r2;
+
+	r2 = READ_ONCE(*y);
+	smp_mb();
+	r_curr = READ_ONCE(*curr);
+	smp_mb();
+	r1 = READ_ONCE(*x);
+}
+
+P1(int *x, int *y, int *curr)
+{
+	WRITE_ONCE(*x, 1);
+	WRITE_ONCE(*y, 1);
+	smp_mb();
+	WRITE_ONCE(*curr, 0);
+}
+
+exists (0:r2=1 /\ 0:r_curr=0 /\ 0:r1=0)

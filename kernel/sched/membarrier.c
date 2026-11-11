@@ -133,6 +133,9 @@
  * Using the scenario from (A), we can show that (a) needs to be paired
  * with (g). Using the scenario from (B), we can show that (c) needs to
  * be paired with (d).
+ *
+ * The litmus tests in tools/testing/selftests/membarrier/litmus check
+ * these scenarios with the Linux kernel memory model.
  */
 
 /*

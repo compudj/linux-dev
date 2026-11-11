@@ -1,0 +1,36 @@
+C ipi-after-thread-no-handler-mb
+
+(*
+ * Result: Sometimes
+ *
+ * ipi-after-thread without the barrier in the IPI handler. The store to
+ * x by P1 can then be delayed past the acknowledgment.
+ *)
+
+{}
+
+P0(int *x, int *y, int *req, int *ack)
+{
+	int r_ack;
+	int r1;
+	int r2;
+
+	r2 = READ_ONCE(*y);
+	smp_mb();
+	WRITE_ONCE(*req, 1);
+	r_ack = READ_ONCE(*ack);
+	smp_mb();
+	r1 = READ_ONCE(*x);
+}
+
+P1(int *x, int *y, int *req, int *ack)
+{
+	int r_req;
+
+	WRITE_ONCE(*x, 1);
+	WRITE_ONCE(*y, 1);
+	r_req = READ_ONCE(*req);
+	WRITE_ONCE(*ack, 1);
+}
+
+exists (0:r2=1 /\ 1:r_req=1 /\ 0:r_ack=1 /\ 0:r1=0)

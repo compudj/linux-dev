@@ -1,0 +1,34 @@
+C sched-out-no-sched-mb
+
+(*
+ * Result: Sometimes
+ *
+ * sched-out without the full barrier before the store to rq->curr. The
+ * store to x by the thread can then be delayed past it.
+ *)
+
+{
+	int curr = 1;
+}
+
+P0(int *x, int *y, int *curr)
+{
+	int r_curr;
+	int r1;
+	int r2;
+
+	r2 = READ_ONCE(*y);
+	smp_mb();
+	r_curr = READ_ONCE(*curr);
+	smp_mb();
+	r1 = READ_ONCE(*x);
+}
+
+P1(int *x, int *y, int *curr)
+{
+	WRITE_ONCE(*x, 1);
+	WRITE_ONCE(*y, 1);
+	WRITE_ONCE(*curr, 0);
+}
+
+exists (0:r2=1 /\ 0:r_curr=0 /\ 0:r1=0)

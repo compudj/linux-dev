@@ -1,0 +1,37 @@
+C ipi-before-thread-no-entry-mb
+
+(*
+ * Result: Sometimes
+ *
+ * ipi-before-thread without the barrier (a) at the start of
+ * membarrier(). The store to x can be delayed past the IPI. P1 and P0
+ * then both read 0.
+ *)
+
+{}
+
+P0(int *x, int *y, int *req, int *ack)
+{
+	int r_ack;
+	int r2;
+
+	WRITE_ONCE(*x, 1);
+	WRITE_ONCE(*req, 1);
+	r_ack = READ_ONCE(*ack);
+	smp_mb();
+	r2 = READ_ONCE(*y);
+}
+
+P1(int *x, int *y, int *req, int *ack)
+{
+	int r_req;
+	int r1;
+
+	r_req = READ_ONCE(*req);
+	smp_mb();
+	WRITE_ONCE(*ack, 1);
+	WRITE_ONCE(*y, 1);
+	r1 = READ_ONCE(*x);
+}
+
+exists (1:r_req=1 /\ 0:r_ack=1 /\ 1:r1=0 /\ 0:r2=0)

@@ -1,0 +1,51 @@
+C sched-in
+
+(*
+ * Result: Never
+ *
+ * Scenarios (A) and (C) of kernel/sched/membarrier.c: a thread of the
+ * target process is scheduled in while P0 calls membarrier().
+ *
+ * curr stands for rq->curr of the CPU of P1: 0 for another task, 1 for
+ * the thread. P0 loads it between its two barriers. It sends no IPI
+ * when it reads 0, which is the case the "exists" clause keeps.
+ *
+ * P1 is the scheduler, then the thread in user-space. The scheduler
+ * stores to rq->curr, then issues a full barrier before the return to
+ * user-space. Each architecture provides this barrier its own way, see
+ * Documentation/scheduler/membarrier.rst.
+ *
+ * Either P0 sees the thread and sends the IPI, or the thread sees
+ * x == 1. This holds whatever P0 reads from y: y is kept to match the
+ * scenario.
+ *
+ * The same argument holds with tsk->mm in place of rq->curr. It covers
+ * kthread_use_mm(), scenario (E), and the icache_stale_mask of the
+ * RISC-V sync core command.
+ *)
+
+{}
+
+P0(int *x, int *y, int *curr)
+{
+	int r_curr;
+	int r2;
+
+	WRITE_ONCE(*x, 1);
+	smp_mb();
+	r_curr = READ_ONCE(*curr);
+	smp_mb();
+	r2 = READ_ONCE(*y);
+}
+
+P1(int *x, int *y, int *curr)
+{
+	int r1;
+
+	WRITE_ONCE(*curr, 1);
+	smp_mb();
+	WRITE_ONCE(*y, 1);
+	r1 = READ_ONCE(*x);
+}
+
+exists (0:r_curr=0 /\ 1:r1=0 /\ 0:r2=0)

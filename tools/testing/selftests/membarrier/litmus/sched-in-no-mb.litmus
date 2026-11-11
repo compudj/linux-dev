@@ -1,0 +1,33 @@
+C sched-in-no-mb
+
+(*
+ * Result: Sometimes
+ *
+ * sched-in without the full barrier after the store to rq->curr. P0
+ * sees no thread and sends no IPI. The thread reads x == 0.
+ *)
+
+{}
+
+P0(int *x, int *y, int *curr)
+{
+	int r_curr;
+	int r2;
+
+	WRITE_ONCE(*x, 1);
+	smp_mb();
+	r_curr = READ_ONCE(*curr);
+	smp_mb();
+	r2 = READ_ONCE(*y);
+}
+
+P1(int *x, int *y, int *curr)
+{
+	int r1;
+
+	WRITE_ONCE(*curr, 1);
+	WRITE_ONCE(*y, 1);
+	r1 = READ_ONCE(*x);
+}
+
+exists (0:r_curr=0 /\ 1:r1=0 /\ 0:r2=0)

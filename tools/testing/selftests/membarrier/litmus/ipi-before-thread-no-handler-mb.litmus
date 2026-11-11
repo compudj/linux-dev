@@ -1,0 +1,37 @@
+C ipi-before-thread-no-handler-mb
+
+(*
+ * Result: Sometimes
+ *
+ * ipi-before-thread without the barrier in the IPI handler. The load of
+ * x by P1 can then be done before the handler loads req. This is why
+ * ipi_mb() issues smp_mb() rather than rely on the interrupt alone.
+ *)
+
+{}
+
+P0(int *x, int *y, int *req, int *ack)
+{
+	int r_ack;
+	int r2;
+
+	WRITE_ONCE(*x, 1);
+	smp_mb();
+	WRITE_ONCE(*req, 1);
+	r_ack = READ_ONCE(*ack);
+	smp_mb();
+	r2 = READ_ONCE(*y);
+}
+
+P1(int *x, int *y, int *req, int *ack)
+{
+	int r_req;
+	int r1;
+
+	r_req = READ_ONCE(*req);
+	WRITE_ONCE(*ack, 1);
+	WRITE_ONCE(*y, 1);
+	r1 = READ_ONCE(*x);
+}
+
+exists (1:r_req=1 /\ 0:r_ack=1 /\ 1:r1=0 /\ 0:r2=0)

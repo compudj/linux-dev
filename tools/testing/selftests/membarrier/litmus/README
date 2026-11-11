@@ -1,0 +1,52 @@
+Litmus tests of the membarrier system call. They check the memory
+ordering scenarios of kernel/sched/membarrier.c with the Linux kernel
+memory model. Each test with the result "Never" models a case of
+these scenarios. A test with the result "Sometimes" drops one
+barrier, to show that the scenario needs it.
+
+In each test, P0 is the caller of membarrier(). P1 is a CPU which runs
+a thread of the target process.
+
+The user-space accesses of the thread are WRITE_ONCE() and READ_ONCE()
+in program order, without a memory barrier between them. This is what
+barrier() gives in user-space code.
+
+The model has no interrupt. The IPI is modeled as a request and an
+acknowledgment: the caller stores "req", the handler loads it, issues
+its memory barrier and stores "ack", and the caller loads "ack". The
+"exists" clause of each test keeps the executions where this exchange
+took place.
+
+Run them from tools/memory-model, with herd7 installed:
+
+  cd tools/memory-model
+  for f in ../testing/selftests/membarrier/litmus/*.litmus; do
+	herd7 -conf linux-kernel.cfg $f | grep Observation
+  done
+
+Each observation must match the "Result" in the comment of its test.
+
+The thread is interrupted by the IPI:
+
+  ipi-before-thread.litmus, ipi-before-thread-no-entry-mb.litmus,
+  ipi-before-thread-no-handler-mb.litmus
+    Scenario (A). The thread runs after the IPI. It sees the stores
+    which the caller did before membarrier().
+
+  ipi-after-thread.litmus, ipi-after-thread-no-exit-mb.litmus,
+  ipi-after-thread-no-handler-mb.litmus
+    Scenario (B). The thread ran before the IPI. The caller sees its
+    stores after membarrier().
+
+The caller sees another task in rq->curr and sends no IPI:
+
+  sched-in.litmus, sched-in-no-entry-mb.litmus, sched-in-no-mb.litmus,
+  sched-in-release.litmus
+    Scenarios (A) and (C). The thread is scheduled in. The scheduler
+    issues a full barrier after the store to rq->curr. An
+    smp_store_release() which is not a full barrier is not enough.
+
+  sched-out.litmus, sched-out-no-exit-mb.litmus,
+  sched-out-no-sched-mb.litmus
+    Scenarios (B) and (C). The thread is scheduled out. The scheduler
+    issues a full barrier before the store to rq->curr.
