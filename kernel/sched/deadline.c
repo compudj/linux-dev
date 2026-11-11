@@ -4479,7 +4479,7 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 	if (new_bw == p->dl.dl_bw && counted)
 		return 0;
 
-	cpu = counted && p->dl.dl_bw ? p->dl.dl_bw_cpu : task_cpu(p);
+	cpu = counted && p->dl.dl_bw ? p->dl.dl_bw_cpu : task_home_cpu(p);
 	dl_b = dl_bw_of(cpu);
 
 	/*

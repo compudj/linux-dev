@@ -2558,6 +2558,29 @@ static inline int task_on_rq_queued(struct task_struct *p)
 	return READ_ONCE(p->on_rq) == TASK_ON_RQ_QUEUED;
 }
 
+/*
+ * Return the CPU where @p runs, or will run. Proxy execution can queue a
+ * task blocked on a mutex on the CPU of the mutex owner. The task does
+ * not run there. It returns to p->wake_cpu when it is woken. The caller
+ * holds the rq lock of @p.
+ */
+static inline int task_home_cpu(struct task_struct *p)
+{
+	int cpu = p->wake_cpu;
+
+	if (!sched_proxy_exec() || !p->is_blocked || !task_on_rq_queued(p))
+		return task_cpu(p);
+
+	/*
+	 * An affinity change or a CPU hotplug can leave wake_cpu behind
+	 * while the task is queued elsewhere.
+	 */
+	if (cpumask_test_cpu(cpu, p->cpus_ptr) && cpu_active(cpu))
+		return cpu;
+	cpu = cpumask_any_and(p->cpus_ptr, cpu_active_mask);
+	return cpu < nr_cpu_ids ? cpu : task_cpu(p);
+}
+
 static inline int task_on_rq_migrating(struct task_struct *p)
 {
 	return READ_ONCE(p->on_rq) == TASK_ON_RQ_MIGRATING;

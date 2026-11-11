@@ -642,7 +642,12 @@ change:
 #endif /* CONFIG_RT_GROUP_SCHED */
 		if (dl_bandwidth_enabled() && dl_policy(policy) &&
 				!(attr->sched_flags & SCHED_FLAG_SUGOV)) {
-			cpumask_t *span = rq->rd->span;
+			/*
+			 * Use the root domain @p runs in. Proxy execution can
+			 * have queued it in the root domain of a mutex owner.
+			 */
+			struct root_domain *rd = cpu_rq(task_home_cpu(p))->rd;
+			cpumask_t *span = rd->span;
 
 			/*
 			 * Don't allow tasks with an affinity mask smaller than
@@ -650,7 +655,7 @@ change:
 			 * will also fail if there's no bandwidth available.
 			 */
 			if (!cpumask_subset(span, p->cpus_ptr) ||
-			    rq->rd->dl_bw.bw == 0) {
+			    rd->dl_bw.bw == 0) {
 				retval = -EPERM;
 				goto unlock;
 			}
