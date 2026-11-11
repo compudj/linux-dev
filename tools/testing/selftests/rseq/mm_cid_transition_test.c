@@ -27,6 +27,14 @@
  * the other, another process moves every thread from CPU to CPU, so that
  * threads migrate while the mode switches.
  *
+ * In a last case the vfork(2) child keeps running and counts with its own
+ * mm_cid. It is a process that shares the mm, not a thread of it. The
+ * child runs on the TLS of its parent thread, which holds the rseq area.
+ * The parent therefore unregisters the area before the vfork(2) and the
+ * child registers it for itself. This needs a registration owned by the
+ * test, so the case runs again through execve(2) with the rseq support of
+ * glibc turned off.
+ *
  * The test fails when counts are lost, or when an mm_cid is not below the
  * number of possible CPUs. A kernel that loops looking for a free ID
  * shows as a timeout.
@@ -62,7 +70,8 @@
 
 #define CHILD_PASS	0
 #define CHILD_FAIL	1
-#define CHILD_ERROR	2
+#define CHILD_SKIP	2
+#define CHILD_ERROR	3
 
 struct worker {
 	pthread_t	thread;
@@ -70,16 +79,22 @@ struct worker {
 	unsigned int	bad_cid;
 	bool		execs;
 	bool		vforks;
+	bool		shares;
+	bool		share_failed;
 	struct worker	*buddy;
 };
 
 /* run_child_rounds() flags */
 #define NESTED		1
 #define MIGRATED	2
+#define SHARED		4
+
+#define SHARE_COUNTS	20000
 
 static intptr_t counts[MAX_CIDS];
 static struct worker workers[2 * MAX_WORKERS];
 static bool nested;
+static bool shared;
 static int stop;
 static int nr_possible;
 static cpu_set_t all_cpus;
@@ -100,6 +115,39 @@ static void count_one(struct worker *w)
 			return;
 		}
 	}
+}
+
+/* Count in the vfork(2) child, with the mm_cid of the child. */
+static __attribute__((noinline, noreturn)) void count_in_child(struct worker *w)
+{
+	int i;
+
+	if (rseq_register_current_thread())
+		_exit(1);
+	for (i = 0; i < SHARE_COUNTS && !RSEQ_READ_ONCE(stop) && w->bad_cid == UINT_MAX; i++)
+		count_one(w);
+	_exit(0);
+}
+
+/*
+ * Let a vfork(2) child count. Hand the rseq area of this thread over to
+ * the child, and take it back when the child is gone.
+ */
+static void count_in_shared_process(struct worker *w)
+{
+	int status = 0;
+	pid_t pid;
+
+	if (rseq_unregister_current_thread())
+		abort();
+	pid = vfork();
+	if (!pid)
+		count_in_child(w);
+	if (rseq_register_current_thread())
+		abort();
+	if (pid > 0 && (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
+			WEXITSTATUS(status)))
+		w->share_failed = true;
 }
 
 static void *worker_fn(void *arg);
@@ -135,6 +183,8 @@ static void *worker_fn(void *arg)
 			count_one(w);
 		if (w->execs)
 			execve(exec_path, av, NULL);
+		if (w->shares)
+			count_in_shared_process(w);
 		if (w->vforks) {
 			pid_t pid = vfork();
 
@@ -158,7 +208,8 @@ static int run_round(int nr, int widen_us)
 	RSEQ_WRITE_ONCE(stop, 0);
 	for (i = 0; i < nr; i++) {
 		workers[i].execs = i == 0 && exec_path[0];
-		workers[i].vforks = i == 1;
+		workers[i].vforks = i == 1 && !shared;
+		workers[i].shares = i == 1 && shared;
 		/* The two workers above keep to their own loop. */
 		workers[i].buddy = nested && i > 1 ? &workers[MAX_WORKERS + i] : NULL;
 		if (create_worker(&workers[i]))
@@ -185,6 +236,10 @@ static int check_counts(const char *what)
 
 	for (i = 0; i < 2 * MAX_WORKERS; i++) {
 		counted += workers[i].counted;
+		if (workers[i].share_failed) {
+			fprintf(stderr, "%s: a vfork child failed to count\n", what);
+			ret = CHILD_FAIL;
+		}
 		if (workers[i].bad_cid != UINT_MAX) {
 			fprintf(stderr, "%s: mm_cid %u (0x%x), %d possible CPUs\n",
 				what, workers[i].bad_cid, workers[i].bad_cid, nr_possible);
@@ -285,6 +340,7 @@ static int run_child_rounds(int flags)
 
 	init_workers();
 	nested = flags & NESTED;
+	shared = flags & SHARED;
 	if (flags & MIGRATED) {
 		if (sched_getaffinity(0, sizeof(allowed), &allowed))
 			return CHILD_ERROR;
@@ -347,6 +403,39 @@ static int run_child_remote(int delay_us)
 		return CHILD_ERROR;
 	/* The setter keeps running while this process exits. */
 	return check_counts("affinity change by another process");
+}
+
+static int read_nr_possible(void);
+
+/* Run the rounds with SHARED again, without the rseq support of glibc. */
+static int run_child_exec_shared(int unused)
+{
+	char arg0[] = "mm_cid_transition_test", arg1[] = "shared";
+	char *const av[] = { arg0, arg1, NULL };
+	const char *old = getenv("GLIBC_TUNABLES");
+	char tunables[1024];
+
+	snprintf(tunables, sizeof(tunables), "%s:glibc.pthread.rseq=0", old ? old : "");
+	if (setenv("GLIBC_TUNABLES", tunables, 1))
+		return CHILD_ERROR;
+	execv("/proc/self/exe", av);
+	return CHILD_ERROR;
+}
+
+/* The program run by run_child_exec_shared(). Return a CHILD_* status. */
+static int shared_main(void)
+{
+	/* The handover needs a registration that glibc does not own. */
+	if (__rseq_register_current_thread(true, false)) {
+		fprintf(stderr, "glibc owns the rseq registration\n");
+		return CHILD_SKIP;
+	}
+	if (sched_getaffinity(0, sizeof(all_cpus), &all_cpus))
+		return CHILD_ERROR;
+	nr_possible = read_nr_possible();
+	if (nr_possible <= 0)
+		return CHILD_ERROR;
+	return run_child_rounds(SHARED);
 }
 
 static int read_nr_possible(void)
@@ -415,18 +504,21 @@ static int run_under_test(int (*fn)(int), int arg, const cpu_set_t *narrow)
 	if (!WIFEXITED(status))
 		ksft_exit_fail_msg("the process under test was killed by signal %d\n",
 				   WTERMSIG(status));
-	if (WEXITSTATUS(status) > CHILD_FAIL)
+	if (WEXITSTATUS(status) > CHILD_SKIP)
 		ksft_exit_fail_msg("the process under test failed to run\n");
 	return WEXITSTATUS(status);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
 	cpu_set_t narrow;
 	int status, i;
 
+	if (argc == 2 && !strcmp(argv[1], "shared"))
+		return shared_main();
+
 	ksft_print_header();
-	ksft_set_plan(6);
+	ksft_set_plan(7);
 
 	if (!rseq_available())
 		ksft_exit_skip("rseq is unavailable\n");
@@ -468,5 +560,11 @@ int main(void)
 
 	status = run_under_test(run_child_rounds, MIGRATED, &narrow);
 	ksft_test_result(status == CHILD_PASS, "threads migrated by another process\n");
+
+	status = run_under_test(run_child_exec_shared, 0, &narrow);
+	if (status == CHILD_SKIP)
+		ksft_test_result_skip("a process that shares the mm counts\n");
+	else
+		ksft_test_result(status == CHILD_PASS, "a process that shares the mm counts\n");
 	ksft_finished();
 }
