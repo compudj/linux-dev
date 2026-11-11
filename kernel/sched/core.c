@@ -3996,9 +3996,20 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
 
 	update_rq_clock(rq);
 	if (p->is_blocked) {
+		bool returned;
+
 		if (p->se.sched_delayed)
 			enqueue_task(rq, p, ENQUEUE_NOCLOCK | ENQUEUE_DELAYED);
-		if (proxy_needs_return(rq, p))
+		returned = proxy_needs_return(rq, p);
+		/*
+		 * @p was blocked and this CPU runs a proxy. If @p is the donor
+		 * or a task of its chain, the donor no longer waits for the
+		 * task that runs. wakeup_preempt() compares @p with the donor,
+		 * so it does not see this. Pick again.
+		 */
+		if (rq->donor != rq->curr)
+			resched_curr(rq);
+		if (returned)
 			return 0;
 	}
 	if (!task_on_cpu(rq, p)) {
