@@ -5551,7 +5551,11 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		else
 			prev->active_mm = NULL;
 	} else {					// to user
-		membarrier_switch_mm(rq, prev->active_mm, next->mm);
+		/*
+		 * Pass prev->mm, not prev->active_mm: see
+		 * membarrier_switch_mm().
+		 */
+		membarrier_switch_mm(rq, prev->mm, next->mm);
 		/*
 		 * sys_membarrier() requires an smp_mb() between setting
 		 * rq->curr / membarrier_switch_mm() and returning to userspace.

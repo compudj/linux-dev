@@ -3907,6 +3907,21 @@ static inline bool sched_energy_enabled(void) { return false; }
  * - prior user-space memory accesses and store to rq->membarrier_state,
  * - store to rq->membarrier_state and following user-space memory accesses.
  * In the same way it provides those guarantees around store to rq->curr.
+ *
+ * @prev_mm is the mm of the previous task. It is NULL for a kernel
+ * thread and for a task past exit_mm().
+ *
+ * The update is skipped only between two user tasks of the same mm.
+ * rq->membarrier_state is up to date in that case. It was set when
+ * the first of those tasks was scheduled in, or later by the
+ * registration IPI.
+ *
+ * It must not be skipped when the previous task only borrowed the mm
+ * as its active_mm. rq->membarrier_state can be stale then:
+ *
+ * - exit_mm() and kthread_unuse_mm() clear it,
+ * - a registration does not send an IPI to a CPU which runs a lazy
+ *   TLB kernel thread.
  */
 static inline void membarrier_switch_mm(struct rq *rq,
 					struct mm_struct *prev_mm,
