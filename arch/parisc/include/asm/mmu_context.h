@@ -4,6 +4,7 @@
 
 #include <linux/mm.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/atomic.h>
 #include <linux/spinlock.h>
 #include <asm-generic/mm_hooks.h>
@@ -51,6 +52,7 @@ static inline void switch_mm_irqs_off(struct mm_struct *prev,
 		struct mm_struct *next, struct task_struct *tsk)
 {
 	if (prev != next) {
+		membarrier_arch_switch_mm(prev, next, tsk);
 #ifdef CONFIG_TLB_PTLOCK
 		/* put physical address of page_table_lock in cr28 (tr4)
 		   for TLB faults */
