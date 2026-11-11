@@ -6909,6 +6909,19 @@ static inline void proxy_set_task_cpu(struct task_struct *p, int cpu)
 	 * was previously runnable.
 	 */
 	wake_cpu = p->wake_cpu;
+	/*
+	 * Tell the class and the tracers about the migration, as
+	 * set_task_cpu() does. The fair class then attaches the load of @p
+	 * to the new runqueue. Without that, the return migration removes
+	 * load that the runqueue never got.
+	 */
+	trace_sched_migrate_task(p, cpu);
+	if (task_cpu(p) != cpu) {
+		if (p->sched_class->migrate_task_rq)
+			p->sched_class->migrate_task_rq(p, cpu);
+		p->se.nr_migrations++;
+		perf_event_task_migrate(p);
+	}
 	__set_task_cpu(p, cpu);
 	p->wake_cpu = wake_cpu;
 }

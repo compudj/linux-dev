@@ -2974,8 +2974,14 @@ static void migrate_task_rq_dl(struct task_struct *p, int new_cpu)
 	 * the bandwidth. A mask can hold CPUs of two root domains, and
 	 * select_fallback_rq() can widen it. Move the bandwidth there, as
 	 * dl_task_offline_migration() does for a throttled task.
+	 *
+	 * Not for a task that is blocked on a mutex and only queued for
+	 * proxy execution. It does not run on the new CPU, so its bandwidth
+	 * stays in its root domain. If its wake-up then picks a CPU of another
+	 * root domain, the bandwidth moves at that time.
 	 */
-	if (unlikely(dl_task_bw_elsewhere(p, new_cpu)))
+	if (unlikely(dl_task_bw_elsewhere(p, new_cpu)) &&
+	    !(p->is_blocked && task_on_rq_migrating(p)))
 		dl_task_move_bw(p, new_cpu);
 
 	if (READ_ONCE(p->__state) != TASK_WAKING)
