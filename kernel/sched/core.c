@@ -7077,7 +7077,8 @@ static struct task_struct *
 find_proxy_task(struct rq *rq, struct task_struct *donor, struct rq_flags *rf)
 	__must_hold(__rq_lockp(rq))
 {
-	struct task_struct *owner = NULL;
+	struct task_struct *owner = NULL, *mark = NULL;
+	unsigned int steps = 0, mark_at = 1;
 	bool curr_in_chain = false;
 	int this_cpu = cpu_of(rq);
 	struct task_struct *p;
@@ -7087,6 +7088,28 @@ find_proxy_task(struct rq *rq, struct task_struct *donor, struct rq_flags *rf)
 	for (p = donor; p->is_blocked; p = owner) {
 		/* if its PROXY_WAKING, do return migration or run if current */
 		struct mutex *mutex = p->blocked_on;
+
+		/*
+		 * The walk came back to a task it already met: the chain is
+		 * a cycle. Either the tasks deadlock, or a ww_mutex cycle is
+		 * about to be broken. Do not walk it forever with the rq lock
+		 * held. Stop the donation: the donor then sleeps on its
+		 * mutex, as it does without proxy execution.
+		 *
+		 * @mark is the task met at the last step that is a power of
+		 * two. Every cycle ends up holding it.
+		 */
+		if (p == mark) {
+			if (curr_in_chain)
+				goto resched_idle;
+			p = donor;
+			clear_task_blocked_on(p, NULL);
+			goto deactivate;
+		}
+		if (++steps == mark_at) {
+			mark = p;
+			mark_at <<= 1;
+		}
 		if (!mutex) {
 			clear_task_blocked_on(p, mutex);
 			if (task_current(rq, p)) {
