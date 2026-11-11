@@ -9,6 +9,7 @@
 
 #include <linux/errno.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/mm_types.h>
 #include <linux/smp.h>
 #include <linux/slab.h>
@@ -90,6 +91,9 @@ static inline void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *
 {
 	bool need_flush = false;
 	unsigned int cpu = smp_processor_id();
+
+	if (prev != next)
+		membarrier_arch_switch_mm(prev, next, tsk);
 
 	/* Check if our ASID is of an older version and thus invalid */
 	if (!asid_valid(next, cpu))
