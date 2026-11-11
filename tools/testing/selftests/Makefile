@@ -121,6 +121,7 @@ TARGETS += rseq
 TARGETS += rtc
 TARGETS += rust
 TARGETS += sched/deadline
+TARGETS += sched/proxy_exec
 TARGETS += sched_ext
 TARGETS += seccomp
 TARGETS += sgx
