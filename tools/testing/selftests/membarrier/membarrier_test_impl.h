@@ -97,6 +97,13 @@ static int test_membarrier_global_success(void)
 	int cmd = MEMBARRIER_CMD_GLOBAL, flags = 0;
 	const char *test_name = "sys membarrier MEMBARRIER_CMD_GLOBAL";
 
+	/* A nohz_full kernel does not provide MEMBARRIER_CMD_GLOBAL. */
+	if (!(sys_membarrier(MEMBARRIER_CMD_QUERY, 0) & cmd)) {
+		ksft_test_result_skip("%s test: Command not available\n",
+				      test_name);
+		return 0;
+	}
+
 	if (sys_membarrier(cmd, flags) != 0) {
 		ksft_exit_fail_msg(
 			"%s test: flags = %d, errno = %d\n",
@@ -356,9 +363,6 @@ static int test_membarrier_query(void)
 		}
 		ksft_exit_fail_msg("sys_membarrier() failed\n");
 	}
-	if (!(ret & MEMBARRIER_CMD_GLOBAL))
-		ksft_exit_skip(
-			"sys_membarrier unsupported: CMD_GLOBAL not found.\n");
 
 	ksft_test_result_pass("sys_membarrier available\n");
 	return 0;
