@@ -10,6 +10,10 @@
 # Rely on implicit context synchronization as a result of exception return
 # when returning from IPI handler, and when returning to user-space.
 #
+# On arm64 with FEAT_ExS, an exception return is a context synchronization
+# event only when SCTLR_ELx.EOS is set. The kernel sets it, cf.
+# SCTLR_EL1_EOS in INIT_SCTLR_EL1_MMU_ON. It must stay set.
+#
 # * riscv
 #
 # riscv uses xRET as return from interrupt and to return to user-space.
@@ -28,19 +32,28 @@
 #
 # * x86
 #
-# x86-32 uses IRET as return from interrupt, which takes care of the IPI.
-# However, it uses both IRET and SYSEXIT to go back to user-space. The IRET
-# instruction is core serializing, but not SYSEXIT.
+# x86-32 returns to user-space through either IRET or SYSEXIT. x86-64 returns
+# to user-space through either SYSRETL (compat code), SYSRETQ or IRET, or
+# through ERETU when FRED is enabled. It returns from interrupt through IRET,
+# or through ERETS or ERETU when FRED is enabled.
 #
-# x86-64 uses IRET as return from interrupt, which takes care of the IPI.
-# However, it can return to user-space through either SYSRETL (compat code),
-# SYSRETQ, or IRET.
+# The IRET instruction is core serializing. SYSRET{L,Q}, SYSEXIT, ERETS and
+# ERETU are not. Therefore x86 does not rely on the return instruction:
 #
-# Given that neither SYSRET{L,Q}, nor SYSEXIT, are core serializing, we rely
-# instead on write_cr3() performed by switch_mm() to provide core serialization
-# after changing the current mm, and deal with the special case of kthread ->
-# uthread (temporarily keeping current mm into active_mm) by issuing a
-# sync_core_before_usermode() in that specific case.
+#  - the IPI handler calls sync_core_before_usermode(), which issues a core
+#    serializing instruction right away (cf. ipi_sync_core()). The thread may
+#    otherwise be rescheduled before the return from interrupt, and a thread
+#    of the same mm may return to user-space through SYSRET,
+#
+#  - write_cr3() performed by switch_mm() provides core serialization after
+#    changing the current mm,
+#
+#  - the special case of kthread -> uthread (temporarily keeping current mm
+#    into active_mm) issues a sync_core_before_usermode().
+#
+# With page table isolation, sync_core_before_usermode() does nothing: each
+# return to user-space writes to CR3, which is core serializing. Page table
+# isolation and FRED are mutually exclusive.
 #
     -----------------------
     |         arch |status|
