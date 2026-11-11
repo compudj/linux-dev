@@ -3892,8 +3892,15 @@ static inline bool proxy_needs_return(struct rq *rq, struct task_struct *p)
 	 * only set p->wake_cpu when !p->on_rq, and since here p->on_rq, this
 	 * will not apply. But if it did, this check is the safe way around
 	 * and would migrate.
+	 *
+	 * The RT and deadline classes place a task at wake-up:
+	 * select_task_rq(), the pushable list, a push to another CPU. An
+	 * in-place wake-up skips all of that. So their tasks take the full
+	 * wake-up path too.
 	 */
-	if (task_cpu(p) == p->wake_cpu)
+	if (task_cpu(p) == p->wake_cpu &&
+	    p->sched_class != &rt_sched_class &&
+	    p->sched_class != &dl_sched_class)
 		return false;
 
 	scoped_guard(raw_spinlock, &p->blocked_lock) {
