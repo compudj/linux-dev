@@ -13,7 +13,7 @@ static int registrations;
 
 static int sys_membarrier(int cmd, int flags)
 {
-	return syscall(__NR_membarrier, cmd, flags);
+	return syscall(__NR_membarrier, cmd, flags, 0);
 }
 
 static int membarrier_get_registrations(void)
@@ -221,7 +221,7 @@ static int test_membarrier_register_private_expedited_sync_core_success(void)
 
 static int test_membarrier_private_expedited_sync_core_success(void)
 {
-	int cmd = MEMBARRIER_CMD_PRIVATE_EXPEDITED, flags = 0;
+	int cmd = MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, flags = 0;
 	const char *test_name = "sys membarrier MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE";
 
 	if (sys_membarrier(cmd, flags) != 0) {
