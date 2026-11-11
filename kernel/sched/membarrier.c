@@ -566,15 +566,17 @@ static int membarrier_get_registrations(void)
 	struct task_struct *p = current;
 	struct mm_struct *mm = p->mm;
 	int registrations_mask = 0, membarrier_state, i;
-	static const int states[] = {
-		MEMBARRIER_STATE_GLOBAL_EXPEDITED |
-			MEMBARRIER_STATE_GLOBAL_EXPEDITED_READY,
-		MEMBARRIER_STATE_PRIVATE_EXPEDITED |
-			MEMBARRIER_STATE_PRIVATE_EXPEDITED_READY,
-		MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE |
-			MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY,
-		MEMBARRIER_STATE_PRIVATE_EXPEDITED_RSEQ |
-			MEMBARRIER_STATE_PRIVATE_EXPEDITED_RSEQ_READY
+	/*
+	 * Only the "ready" state tells that a registration command
+	 * completed. The other state of each pair is not specific to
+	 * one registration command: the sync core and rseq
+	 * registrations also set MEMBARRIER_STATE_PRIVATE_EXPEDITED.
+	 */
+	static const int ready_states[] = {
+		MEMBARRIER_STATE_GLOBAL_EXPEDITED_READY,
+		MEMBARRIER_STATE_PRIVATE_EXPEDITED_READY,
+		MEMBARRIER_STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY,
+		MEMBARRIER_STATE_PRIVATE_EXPEDITED_RSEQ_READY
 	};
 	static const int registration_cmds[] = {
 		MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED,
@@ -582,16 +584,13 @@ static int membarrier_get_registrations(void)
 		MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE,
 		MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ
 	};
-	BUILD_BUG_ON(ARRAY_SIZE(states) != ARRAY_SIZE(registration_cmds));
+	BUILD_BUG_ON(ARRAY_SIZE(ready_states) != ARRAY_SIZE(registration_cmds));
 
 	membarrier_state = atomic_read(&mm->membarrier_state);
-	for (i = 0; i < ARRAY_SIZE(states); ++i) {
-		if (membarrier_state & states[i]) {
+	for (i = 0; i < ARRAY_SIZE(ready_states); ++i) {
+		if (membarrier_state & ready_states[i])
 			registrations_mask |= registration_cmds[i];
-			membarrier_state &= ~states[i];
-		}
 	}
-	WARN_ON_ONCE(membarrier_state != 0);
 	return registrations_mask;
 }
 
