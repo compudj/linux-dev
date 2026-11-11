@@ -11132,13 +11132,21 @@ void sched_mm_cid_exit(struct task_struct *t)
 			return;
 		}
 		/* Last user */
+		bool flip;
+
 		scoped_guard(raw_spinlock_irq, &mm->mm_cid.lock) {
 			/* Required across execve() */
 			if (t == current)
 				mm_cid_transit_to_task(t, this_cpu_ptr(mm->mm_cid.pcpu));
-			/* Ignore mode change. There is nothing to do. */
-			sched_mm_cid_remove_user(t);
+			flip = sched_mm_cid_remove_user(t);
 		}
+		/*
+		 * The last user can get the mm back: a failed execve()
+		 * rejoins it. Complete the switch to per task mode, so
+		 * that no CPU keeps a CID.
+		 */
+		if (flip)
+			mm_cid_fixup_cpus_to_tasks(mm);
 	}
 
 	/*
