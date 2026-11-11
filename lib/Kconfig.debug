@@ -1361,6 +1361,17 @@ config TEST_CSD_LOCK
 
 	  If unsure, say N.
 
+config TEST_PROXY_EXEC
+	tristate "Test module for proxy execution"
+	depends on DEBUG_FS
+	help
+	  This builds the "test_proxy_exec" module. It creates kernel
+	  mutexes that user space can hold, take and chain through
+	  debugfs. The selftests in tools/testing/selftests/sched/proxy_exec
+	  use it to block tasks on a mutex in a chosen way.
+
+	  If unsure, say N.
+
 config TEST_LOCKUP
 	tristate "Test module to generate lockups"
 	depends on m
