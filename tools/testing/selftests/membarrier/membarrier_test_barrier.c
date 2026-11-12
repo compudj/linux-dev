@@ -36,6 +36,9 @@
  * must then execute a memory barrier after the store to rq->curr,
  * before the target is scheduled out again.
  *
+ * The sync core command is checked in the same way, with the core
+ * serializing instructions.
+ *
  * The instructions are found by their bytes in the kernel text, which
  * is read from /proc/kcore. The list is for x86-64. It depends on what
  * the compiler inlines into the functions it names.
@@ -94,6 +97,10 @@ struct target_stats {
 	atomic_ulong sched_in;
 	/* Scheduled in without a barrier after the store to rq->curr. */
 	atomic_ulong sched_in_missed;
+	/* Checks where the target did not serialize its core. */
+	atomic_ulong sync_core_missed;
+	/* Scheduled in without a core serializing instruction. */
+	atomic_ulong sync_core_in_missed;
 };
 
 struct shared {
@@ -125,6 +132,9 @@ struct target {
 
 static struct shared *shared;
 static int shared_fd;
+
+/* The targets of this process also check the sync core guarantee. */
+static bool check_sync_core;
 
 static int sys_membarrier(int cmd, unsigned int flags, int cpu_id)
 {
@@ -190,6 +200,11 @@ enum match {
 	MATCH_CR3,
 	/* Instruction with a LOCK prefix. */
 	MATCH_LOCK,
+	/*
+	 * SERIALIZE or IRET, as issued by sync_core(). An IRET cannot be
+	 * probed: the instruction before it is probed instead.
+	 */
+	MATCH_SYNC_CORE,
 };
 
 struct site {
@@ -205,15 +220,21 @@ struct site {
 #define IPI		(1U << MBT_IPI)
 #define SYSCALL		(1U << MBT_SYSCALL)
 #define SWITCH_MM	(1U << MBT_SWITCH_MM)
+#define SYNC_CORE	(1U << MBT_SYNC_CORE)
+#define SYNC_CORE_SWITCH (1U << MBT_SYNC_CORE_SWITCH)
 
 static const struct site sites[] = {
 	{ "ipi_mb", MATCH_MB, IPI },
 	{ "ipi_sync_core", MATCH_MB, IPI },
+	{ "ipi_sync_core", MATCH_SYNC_CORE, SYNC_CORE },
 	{ "ipi_rseq", MATCH_MB, IPI },
 	{ "membarrier_global_expedited", MATCH_MB, SYSCALL },
 	{ "membarrier_private_expedited", MATCH_MB, SYSCALL },
-	/* Switch to another mm: write to CR3. It is a full barrier. */
-	{ "switch_mm_irqs_off", MATCH_CR3, SWITCH_MM, true },
+	/*
+	 * Switch to another mm: write to CR3. It is a full barrier and
+	 * it is core serializing.
+	 */
+	{ "switch_mm_irqs_off", MATCH_CR3, SWITCH_MM | SYNC_CORE_SWITCH, true },
 	/* Switch to the mm which the CPU kept in lazy TLB mode: smp_mb(). */
 	{ "switch_mm_irqs_off", MATCH_MB, SWITCH_MM, true },
 	/*
@@ -221,6 +242,8 @@ static const struct site sites[] = {
 	 * locked instruction of this function counts as well.
 	 */
 	{ "finish_task_switch", MATCH_LOCK, SWITCH_MM, true },
+	/* membarrier_mm_sync_core_before_usermode() */
+	{ "finish_task_switch", MATCH_SYNC_CORE, SYNC_CORE_SWITCH, true },
 };
 
 struct probe {
@@ -319,6 +342,7 @@ static void scan_function(const struct site *site, const struct ksym *sym,
 {
 	unsigned char *text;
 	size_t i, left;
+	int32_t imm;
 
 	text = malloc(size);
 	if (!text || !read_kernel(sym->addr, text, size)) {
@@ -348,6 +372,24 @@ static void scan_function(const struct site *site, const struct ksym *sym,
 			break;
 		case MATCH_LOCK:
 			if (insn[0] == 0xf0)
+				probe_insn(site, sym, addr);
+			break;
+		case MATCH_SYNC_CORE:
+			/* SERIALIZE is 0f 01 e8. */
+			if (left >= 3 && insn[0] == 0x0f && insn[1] == 0x01 &&
+			    insn[2] == 0xe8) {
+				probe_insn(site, sym, addr);
+				break;
+			}
+			/*
+			 * iret_to_self() is "pushq $1f; iretq; 1:". Probe the
+			 * push.
+			 */
+			if (left < 7 || insn[0] != 0x68 || insn[5] != 0x48 ||
+			    insn[6] != 0xcf)
+				break;
+			memcpy(&imm, insn + 1, sizeof(imm));
+			if (imm == (int32_t)(addr + 7))
 				probe_insn(site, sym, addr);
 			break;
 		}
@@ -624,8 +666,9 @@ static bool check_call(const uint64_t *counters, struct target_stats *stats)
 	unsigned long done = atomic_load(&shared->done);
 	uint64_t ipi = counter(counters, MBT_IPI);
 	uint64_t sched_out = counter(counters, MBT_SCHED_OUT);
+	uint64_t sync_core = counter(counters, MBT_SYNC_CORE);
 	unsigned long started = atomic_load(&shared->started);
-	bool by_ipi, scheduled;
+	bool by_ipi, scheduled, serialized;
 	int spins = 0;
 
 	/* A call is in flight. */
@@ -637,6 +680,7 @@ static bool check_call(const uint64_t *counters, struct target_stats *stats)
 	}
 	by_ipi = counter(counters, MBT_IPI) != ipi;
 	scheduled = counter(counters, MBT_SCHED_OUT) != sched_out;
+	serialized = counter(counters, MBT_SYNC_CORE) != sync_core;
 	if (scheduled) {
 		atomic_fetch_add(&stats->by_sched, 1);
 		return true;
@@ -648,6 +692,8 @@ static bool check_call(const uint64_t *counters, struct target_stats *stats)
 		atomic_fetch_add(&stats->by_ipi, 1);
 	else
 		atomic_fetch_add(&stats->missed, 1);
+	if (check_sync_core && !serialized)
+		atomic_fetch_add(&stats->sync_core_missed, 1);
 	return true;
 }
 
@@ -658,7 +704,8 @@ static void run_target(const struct target *target)
 	const uint64_t *counters;
 	long deadline = now_ms() + target->ms;
 	unsigned long checks = 0;
-	uint64_t first_ipi, first_sched_in;
+	uint64_t first_ipi, first_sched_in, first_sync_core_missed;
+	uint64_t first_sched_out;
 
 	if (target->cpu >= 0 && pin_to_cpu(target->cpu))
 		setup_error("sched_setaffinity");
@@ -671,6 +718,18 @@ static void run_target(const struct target *target)
 	atomic_fetch_add(&shared->ready, 1);
 	while (!atomic_load(&shared->registered) && !atomic_load(&shared->stop))
 		sched_yield();
+	/*
+	 * The scheduler serializes the core of a registered process
+	 * only. The target may have been scheduled in before the
+	 * registration. So wait until it is scheduled out, and count
+	 * from there.
+	 */
+	first_sched_out = counter(counters, MBT_SCHED_OUT);
+	while (check_sync_core &&
+	       counter(counters, MBT_SCHED_OUT) == first_sched_out &&
+	       !atomic_load(&shared->stop))
+		usleep(1000);
+	first_sync_core_missed = counter(counters, MBT_SYNC_CORE_IN_MISSED);
 	first_ipi = counter(counters, MBT_IPI);
 	first_sched_in = counter(counters, MBT_SCHED_IN);
 	while (!atomic_load(&shared->stop)) {
@@ -690,6 +749,10 @@ static void run_target(const struct target *target)
 			 counter(counters, MBT_SCHED_IN) - first_sched_in);
 	atomic_fetch_add(&stats->sched_in_missed,
 			 counter(counters, MBT_SCHED_IN_MISSED));
+	if (check_sync_core)
+		atomic_fetch_add(&stats->sync_core_in_missed,
+				 counter(counters, MBT_SYNC_CORE_IN_MISSED) -
+				 first_sync_core_missed);
 }
 
 static void *target_thread(void *arg)
@@ -816,6 +879,9 @@ static void sum_stats(int first, int nr, struct target_stats *sum)
 		sum->ipis += atomic_load(&stats->ipis);
 		sum->sched_in += atomic_load(&stats->sched_in);
 		sum->sched_in_missed += atomic_load(&stats->sched_in_missed);
+		sum->sync_core_missed += atomic_load(&stats->sync_core_missed);
+		sum->sync_core_in_missed +=
+			atomic_load(&stats->sync_core_in_missed);
 	}
 }
 
@@ -828,6 +894,8 @@ static void sum_stats(int first, int nr, struct target_stats *sum)
 	       __sum.by_ipi, __sum.by_sched, __sum.ipis);		\
 	EXPECT_EQ(__sum.missed, 0);					\
 	EXPECT_EQ(__sum.sched_in_missed, 0);				\
+	EXPECT_EQ(__sum.sync_core_missed, 0);				\
+	EXPECT_EQ(__sum.sync_core_in_missed, 0);			\
 	EXPECT_GT(__sum.by_ipi + __sum.by_sched + __sum.missed, 0);			\
 } while (0)
 
@@ -902,8 +970,34 @@ TEST(private_expedited)
 		     MEMBARRIER_CMD_PRIVATE_EXPEDITED);
 }
 
+/*
+ * With page table isolation, the kernel serializes the core with the
+ * write to CR3 of each return to user-space. This write is in the entry
+ * code, which cannot be probed.
+ */
+static bool page_table_isolation(void)
+{
+	char *line = NULL;
+	bool pti = false;
+	size_t len = 0;
+	FILE *f;
+
+	f = fopen("/proc/cpuinfo", "r");
+	if (!f)
+		return false;
+	while (!pti && getline(&line, &len, f) >= 0)
+		pti = !strncmp(line, "flags", 5) &&
+		      (strstr(line, " pti ") || strstr(line, " pti\n"));
+	free(line);
+	fclose(f);
+	return pti;
+}
+
 TEST(private_expedited_sync_core)
 {
+	check_sync_core = !page_table_isolation();
+	if (!check_sync_core)
+		TH_LOG("page table isolation: core serialization not checked");
 	test_private(_metadata,
 		     MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE,
 		     MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE);
