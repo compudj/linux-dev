@@ -851,13 +851,19 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 
 	later_rq = find_lock_later_rq(p, rq);
 	if (!later_rq) {
+		const struct cpumask *span = dl_task_bw_span(p);
 		int cpu;
 
 		/*
 		 * If we cannot preempt any rq, fall back to pick any
-		 * online CPU:
+		 * online CPU. Try the root domain that counts @p first.
 		 */
-		cpu = cpumask_any_and(cpu_active_mask, p->cpus_ptr);
+		cpu = nr_cpu_ids;
+		if (span)
+			cpu = cpumask_first_and_and(cpu_active_mask,
+						    p->cpus_ptr, span);
+		if (cpu >= nr_cpu_ids)
+			cpu = cpumask_any_and(cpu_active_mask, p->cpus_ptr);
 		if (cpu >= nr_cpu_ids) {
 			/*
 			 * Failed to find any suitable CPU.
@@ -2846,6 +2852,7 @@ static int
 select_task_rq_dl(struct task_struct *p, int cpu, int flags)
 {
 	struct task_struct *curr, *donor;
+	const struct cpumask *span;
 	bool select_rq;
 	struct rq *rq;
 
@@ -2885,6 +2892,20 @@ select_task_rq_dl(struct task_struct *p, int cpu, int flags)
 		if (target != -1 &&
 		    dl_task_is_earliest_deadline(p, cpu_rq(target)))
 			cpu = target;
+	}
+
+	/*
+	 * Keep @p in the root domain that counts its bandwidth. Its mask
+	 * can hold CPUs of another root domain, with isolcpus="domain",
+	 * and @p can sleep on one of them.
+	 */
+	span = dl_task_bw_span(p);
+	if (span && !cpumask_test_cpu(cpu, span)) {
+		unsigned int in_span;
+
+		in_span = cpumask_first_and_and(span, p->cpus_ptr, cpu_active_mask);
+		if (in_span < nr_cpu_ids)
+			cpu = in_span;
 	}
 	rcu_read_unlock();
 
@@ -3650,6 +3671,29 @@ static unsigned int dl_task_root_domain_cpu(struct task_struct *p)
 	return cpu;
 }
 
+/*
+ * Return the CPUs of the root domain that counts the bandwidth of @p, or
+ * NULL if none does. The mask of @p can hold CPUs of another root domain,
+ * with isolcpus="domain". Where a CPU is picked for @p, a CPU of this
+ * root domain comes first: no other root domain admitted @p.
+ *
+ * The caller holds the pi_lock or the rq lock of @p. With interrupts
+ * off, the root domain is not freed.
+ */
+const struct cpumask *dl_task_bw_span(struct task_struct *p)
+{
+	int cpu;
+
+	if (!task_has_dl_policy(p) || dl_entity_is_special(&p->dl) ||
+	    !p->dl.dl_bw)
+		return NULL;
+	cpu = READ_ONCE(p->dl.dl_bw_cpu);
+	if (cpu < 0 || !cpu_active(cpu) ||
+	    READ_ONCE(p->dl.dl_bw_gen) != READ_ONCE(dl_bw_gen))
+		return NULL;
+	return cpu_rq(cpu)->rd->span;
+}
+
 static void set_cpus_allowed_dl(struct task_struct *p,
 				struct affinity_context *ctx)
 {
@@ -3884,6 +3928,26 @@ static unsigned int dl_task_rebuild_cpu(struct task_struct *p)
 	 */
 	cpumask_and(msk, &p->cpus_mask, cpu_active_mask);
 	cpu = task_cpu(p);
+	/*
+	 * Keep the bandwidth where it was counted: with the housekeeping
+	 * CPUs, or with the CPUs that isolcpus="domain" isolates. The root
+	 * domains are new, and the CPU recorded can be offline. So compare
+	 * the CPUs of the mask with it: housekeeping or not.
+	 */
+	if (recorded >= 0) {
+		const struct cpumask *hk = housekeeping_cpumask(HK_TYPE_DOMAIN_BOOT);
+		bool rec_hk = cpumask_test_cpu(recorded, hk);
+		unsigned int same;
+
+		if (cpumask_test_cpu(cpu, msk) && cpumask_test_cpu(cpu, hk) == rec_hk)
+			return cpu;
+		if (cpumask_test_cpu(recorded, msk))
+			return recorded;
+		for_each_cpu(same, msk) {
+			if (cpumask_test_cpu(same, hk) == rec_hk)
+				return same;
+		}
+	}
 	if (cpumask_test_cpu(cpu, msk))
 		return cpu;
 	if (cpumask_empty(msk)) {

@@ -3262,6 +3262,23 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 			dest_cpu = ctx->dl_bw_cpu;
 		if (!task_on_rq_queued(p))
 			p->wake_cpu = dest_cpu;
+	} else {
+		const struct cpumask *span = dl_task_bw_span(p);
+		unsigned int cpu = nr_cpu_ids;
+
+		/*
+		 * No room was made for @p in another root domain. Keep @p
+		 * in the root domain that counts its bandwidth, if the new
+		 * mask holds one of its CPUs.
+		 */
+		if (span && !cpumask_test_cpu(dest_cpu, span))
+			cpu = cpumask_first_and_and(cpu_valid_mask,
+						    ctx->new_mask, span);
+		if (cpu < nr_cpu_ids) {
+			dest_cpu = cpu;
+			if (!task_on_rq_queued(p))
+				p->wake_cpu = dest_cpu;
+		}
 	}
 
 	do_set_cpus_allowed(p, ctx);
@@ -3666,7 +3683,20 @@ static int select_fallback_rq(int cpu, struct task_struct *p)
 	int nid = cpu_to_node(cpu);
 	const struct cpumask *nodemask = NULL;
 	enum { cpuset, possible, fail } state = cpuset;
+	const struct cpumask *span;
 	int dest_cpu;
+
+	/*
+	 * Keep a deadline task in the root domain that counts its
+	 * bandwidth, if one of its CPUs is allowed and online.
+	 */
+	span = dl_task_bw_span(p);
+	if (span) {
+		for_each_cpu_and(dest_cpu, span, p->cpus_ptr) {
+			if (is_cpu_allowed(p, dest_cpu))
+				return dest_cpu;
+		}
+	}
 
 	/*
 	 * If the node that the CPU is on has been offlined, cpu_to_node()
@@ -3684,6 +3714,14 @@ static int select_fallback_rq(int cpu, struct task_struct *p)
 	}
 
 	for (;;) {
+		/* The mask is wider now: look again in that root domain. */
+		if (span && state != cpuset) {
+			for_each_cpu_and(dest_cpu, span, p->cpus_ptr) {
+				if (is_cpu_allowed(p, dest_cpu))
+					goto out;
+			}
+		}
+
 		/* Any allowed, online CPU? */
 		for_each_cpu(dest_cpu, p->cpus_ptr) {
 			if (!is_cpu_allowed(p, dest_cpu))
