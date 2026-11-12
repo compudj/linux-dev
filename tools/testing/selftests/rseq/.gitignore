@@ -14,3 +14,4 @@ slice_test
 legacy_check
 check_optimized
 rseq_abi_test
+rseq_inherit_test
