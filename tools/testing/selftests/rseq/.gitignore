@@ -13,3 +13,4 @@ syscall_errors_test
 slice_test
 legacy_check
 check_optimized
+rseq_abi_test

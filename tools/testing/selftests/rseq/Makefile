@@ -19,7 +19,8 @@ LDLIBS += -lpthread -ldl
 OVERRIDE_TARGETS = 1
 
 TEST_GEN_PROGS = basic_test basic_percpu_ops_test basic_percpu_ops_mm_cid_test \
-		 param_test_benchmark param_test_mm_cid_benchmark
+		 param_test_benchmark param_test_mm_cid_benchmark \
+		 rseq_abi_test
 
 TEST_GEN_PROGS_EXTENDED = librseq.so \
 	param_test \
