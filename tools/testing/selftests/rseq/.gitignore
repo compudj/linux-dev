@@ -16,3 +16,4 @@ check_optimized
 rseq_abi_test
 rseq_inherit_test
 rseq_cs_test
+slice_abi_test
