@@ -4302,6 +4302,26 @@ void cpuset_cpus_allowed(struct task_struct *tsk, struct cpumask *pmask)
 	spin_unlock_irqrestore(&callback_lock, flags);
 }
 
+/*
+ * Set @pmask to the active CPUs that the cpuset of @tsk gives it once @cpu
+ * is offline: those of the nearest ancestor that keeps one. Leave it empty
+ * if there is none. The caller holds the CPU hotplug lock for writing,
+ * which keeps the cpusets and their tasks as they are.
+ */
+void cpuset_cpus_allowed_without(struct task_struct *tsk, int cpu,
+				 struct cpumask *pmask)
+{
+	struct cpuset *cs;
+
+	guard(rcu)();
+	for (cs = task_cs(tsk); cs; cs = parent_cs(cs)) {
+		cpumask_and(pmask, cs->effective_cpus, cpu_active_mask);
+		cpumask_clear_cpu(cpu, pmask);
+		if (!cpumask_empty(pmask))
+			return;
+	}
+}
+
 /**
  * cpuset_cpus_allowed_fallback - final fallback before complete catastrophe.
  * @tsk: pointer to task_struct with which the scheduler is struggling

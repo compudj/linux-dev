@@ -79,6 +79,8 @@ extern void lockdep_assert_cpuset_lock_held(void);
 extern void cpuset_cpus_allowed_locked(struct task_struct *p, struct cpumask *mask);
 extern void cpuset_cpus_allowed(struct task_struct *p, struct cpumask *mask);
 extern bool cpuset_cpus_allowed_fallback(struct task_struct *p);
+extern void cpuset_cpus_allowed_without(struct task_struct *p, int cpu,
+					struct cpumask *mask);
 extern int cpuset_num_cpus(struct cgroup *cgroup);
 extern nodemask_t cpuset_mems_allowed(struct task_struct *p);
 #define cpuset_current_mems_allowed (current->mems_allowed)
@@ -212,6 +214,13 @@ static inline void cpuset_cpus_allowed(struct task_struct *p,
 static inline bool cpuset_cpus_allowed_fallback(struct task_struct *p)
 {
 	return false;
+}
+
+static inline void cpuset_cpus_allowed_without(struct task_struct *p, int cpu,
+					       struct cpumask *mask)
+{
+	cpumask_and(mask, task_cpu_possible_mask(p), cpu_active_mask);
+	cpumask_clear_cpu(cpu, mask);
 }
 
 static inline int cpuset_num_cpus(struct cgroup *cgroup)
