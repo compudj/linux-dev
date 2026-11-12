@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Count the memory barriers which membarrier relies on, for each
- * registered thread.
+ * Count the memory barriers and the core serializing instructions which
+ * membarrier relies on, for each registered thread.
  *
  * See membarrier_test_barrier.c.
  */
@@ -40,6 +40,7 @@ struct {
 
 /* What the scheduler owes to the thread which it switched to. */
 #define OWES_BARRIER	1
+#define OWES_SYNC_CORE	2
 
 struct cpu_state {
 	/* Slot, plus one, of the thread which this CPU last switched to. */
@@ -111,6 +112,8 @@ int barrier_site(struct pt_regs *ctx)
 		slot = state->slot;
 		if (mask & (1U << MBT_SWITCH_MM))
 			state->owed &= ~OWES_BARRIER;
+		if (mask & (1U << MBT_SYNC_CORE_SWITCH))
+			state->owed &= ~OWES_SYNC_CORE;
 	} else {
 		slot = slot_of(bpf_get_current_task_btf());
 	}
@@ -131,13 +134,15 @@ int BPF_PROG(sched_switch, bool preempt, struct task_struct *prev,
 	/* The CPU leaves the thread which it last switched to. */
 	if (state->owed & OWES_BARRIER)
 		count(state->slot, 1U << MBT_SCHED_IN_MISSED);
+	if (state->owed & OWES_SYNC_CORE)
+		count(state->slot, 1U << MBT_SYNC_CORE_IN_MISSED);
 	count(slot_of(prev), 1U << MBT_SCHED_OUT);
 	slot = slot_of(next);
 	state->slot = slot;
 	state->owed = 0;
 	/* The cases which need a barrier after the store to rq->curr. */
 	if (slot && next->mm && prev->mm != next->mm) {
-		state->owed = OWES_BARRIER;
+		state->owed = OWES_BARRIER | OWES_SYNC_CORE;
 		count(slot, 1U << MBT_SCHED_IN);
 	}
 	return 0;

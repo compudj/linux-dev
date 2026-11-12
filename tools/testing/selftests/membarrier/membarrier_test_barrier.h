@@ -24,6 +24,12 @@ enum {
 	 * the scheduler executed no memory barrier in between.
 	 */
 	MBT_SCHED_IN_MISSED,
+	/* Core serializing instruction of the membarrier IPI handler. */
+	MBT_SYNC_CORE,
+	/* Core serializing instruction of the scheduler. */
+	MBT_SYNC_CORE_SWITCH,
+	/* Like MBT_SCHED_IN_MISSED, for a core serializing instruction. */
+	MBT_SYNC_CORE_IN_MISSED,
 	MBT_NR_COUNTERS,
 };
 
