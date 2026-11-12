@@ -61,6 +61,8 @@ extern int dl_task_bw_reserve_cpu(struct task_struct *p,
 				  const struct cpumask *new_mask);
 extern int dl_task_bw_reserved_cpu(struct task_struct *p);
 extern void dl_task_bw_unreserve(struct task_struct *p);
+extern bool dl_task_keeps_root_domain(struct task_struct *p,
+				      const struct cpumask *new_mask);
 
 static inline bool dl_server(struct sched_dl_entity *dl_se)
 {

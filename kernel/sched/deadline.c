@@ -4936,6 +4936,25 @@ int dl_bw_deactivate(int cpu)
 	return ret;
 }
 
+/*
+ * Return false if @p has CPUs in the root domain that counts its
+ * bandwidth and @new_mask holds none of them. A cpuset refuses such a
+ * mask: only a move to another cpuset makes room in another root domain.
+ */
+bool dl_task_keeps_root_domain(struct task_struct *p,
+			       const struct cpumask *new_mask)
+{
+	const struct cpumask *span;
+
+	if (!dl_bandwidth_enabled() || !task_has_dl_policy(p))
+		return true;
+	guard(raw_spinlock_irqsave)(&p->pi_lock);
+	guard(rcu)();
+	span = dl_task_bw_span(p);
+	return !span || !cpumask_intersects(span, p->cpus_ptr) ||
+	       cpumask_intersects(span, new_mask);
+}
+
 int dl_bw_alloc(int cpu, u64 dl_bw)
 {
 	return dl_bw_manage(dl_bw_req_alloc, cpu, dl_bw);

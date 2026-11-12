@@ -61,6 +61,7 @@ static const char * const perr_strings[] = {
 	[PERR_ACCESS]    = "Enable partition not permitted",
 	[PERR_REMOTE]    = "Have remote partition underneath",
 	[PERR_ISOPARENT] = "Root partition is not allowed with isolated parent",
+	[PERR_DLTASK]    = "Deadline task would leave its root domain",
 };
 
 /*
@@ -1129,6 +1130,92 @@ static void update_partition_sd_lb(struct cpuset *cs, int old_prs)
 /*
  * tasks_nocpu_error - Return true if tasks will have no effective_cpus
  */
+/*
+ * Return false if the CPUs of @new_cpus make a deadline task of @cp leave
+ * the root domain that counts its bandwidth. Called under rcu_read_lock(),
+ * which it drops and takes again.
+ */
+static bool dl_tasks_keep_cpus(struct cpuset *cp, const struct cpumask *new_cpus)
+{
+	struct css_task_iter it;
+	struct task_struct *task;
+	bool keep = true;
+
+	if (!css_tryget_online(&cp->css))
+		return true;
+	rcu_read_unlock();
+
+	css_task_iter_start(&cp->css, 0, &it);
+	while (keep && (task = css_task_iter_next(&it))) {
+		/* The top cpuset leaves the mask of these tasks alone. */
+		if (cp == &top_cpuset &&
+		    (task->flags & (PF_KTHREAD | PF_NO_SETAFFINITY)))
+			continue;
+		keep = dl_task_keeps_root_domain(task, new_cpus);
+	}
+	css_task_iter_end(&it);
+
+	rcu_read_lock();
+	css_put(&cp->css);
+	return keep;
+}
+
+/*
+ * Return false if a partition that takes the CPUs of @xcpus makes a
+ * deadline task leave the root domain that counts its bandwidth. A cpuset
+ * holds CPUs of two root domains only with isolcpus="domain". Such a task
+ * would run in a root domain that did not admit it.
+ *
+ * @root is the partition root that gives the CPUs. Its cpusets lose them,
+ * down to the next partition roots. A cpuset left with no CPU gets those
+ * of its nearest ancestor that keeps one. @part is the cpuset that takes
+ * the CPUs. If @enable, it becomes a partition root: its own cpusets keep
+ * only CPUs of @xcpus. @new_cpus is a temporary mask.
+ */
+static bool dl_tasks_keep_without(struct cpuset *root, struct cpuset *part,
+				  const struct cpumask *xcpus, bool enable,
+				  struct cpumask *new_cpus)
+{
+	struct cgroup_subsys_state *pos_css;
+	struct cpuset *cp, *a;
+	bool keep = true;
+
+	rcu_read_lock();
+	cpuset_for_each_descendant_pre(cp, pos_css, root) {
+		if (cp == part || (cp != root && is_partition_valid(cp))) {
+			pos_css = css_rightmost_descendant(pos_css);
+			continue;
+		}
+		if (!cpumask_intersects(cp->effective_cpus, xcpus))
+			continue;
+		for (a = cp; ; a = parent_cs(a)) {
+			if (cpumask_andnot(new_cpus, a->effective_cpus, xcpus) ||
+			    a == root)
+				break;
+		}
+		keep = dl_tasks_keep_cpus(cp, new_cpus);
+		if (!keep)
+			break;
+	}
+	if (keep && enable) {
+		cpuset_for_each_descendant_pre(cp, pos_css, part) {
+			if (cp != part && is_partition_valid(cp)) {
+				pos_css = css_rightmost_descendant(pos_css);
+				continue;
+			}
+			if (cpumask_subset(cp->effective_cpus, xcpus))
+				continue;
+			if (!cpumask_and(new_cpus, cp->effective_cpus, xcpus))
+				cpumask_copy(new_cpus, xcpus);
+			keep = dl_tasks_keep_cpus(cp, new_cpus);
+			if (!keep)
+				break;
+		}
+	}
+	rcu_read_unlock();
+	return keep;
+}
+
 static bool tasks_nocpu_error(struct cpuset *parent, struct cpuset *cs,
 			      struct cpumask *xcpus)
 {
@@ -1676,6 +1763,8 @@ static int remote_partition_enable(struct cpuset *cs, int new_prs,
 		return PERR_NOCPUS;
 	if (prstate_housekeeping_conflict(new_prs, PRS_ROOT, tmp->new_cpus, NULL))
 		return PERR_HKEEPING;
+	if (!dl_tasks_keep_without(&top_cpuset, cs, tmp->new_cpus, true, tmp->addmask))
+		return PERR_DLTASK;
 
 	spin_lock_irq(&callback_lock);
 	partition_xcpus_add(new_prs, NULL, tmp->new_cpus);
@@ -1779,6 +1868,9 @@ static void remote_cpus_update(struct cpuset *cs, struct cpumask *xcpus,
 		else if (prstate_housekeeping_conflict(prs, PRS_ROOT,
 						       excpus, tmp->delmask))
 			WRITE_ONCE(cs->prs_err, PERR_HKEEPING);
+		else if (!dl_tasks_keep_without(&top_cpuset, cs, tmp->addmask,
+						false, tmp->new_cpus))
+			WRITE_ONCE(cs->prs_err, PERR_DLTASK);
 		if (cs->prs_err)
 			goto invalidate;
 	}
@@ -1926,6 +2018,10 @@ static int update_parent_effective_cpumask(struct cpuset *cs, int cmd,
 		if (nocpu)
 			return PERR_NOCPUS;
 
+		if (!dl_tasks_keep_without(parent, cs, tmp->delmask, true,
+					   tmp->new_cpus))
+			return PERR_DLTASK;
+
 		/*
 		 * This function will only be called when all the preliminary
 		 * checks have passed. At this point, the following condition
@@ -2013,6 +2109,15 @@ static int update_parent_effective_cpumask(struct cpuset *cs, int cmd,
 			deleting = false;
 			adding = cpumask_and(tmp->addmask,
 					     cs->effective_xcpus, parent->effective_xcpus);
+		} else if (deleting &&
+			   !dl_tasks_keep_without(parent, cs, tmp->delmask,
+						  is_partition_invalid(cs),
+						  tmp->new_cpus)) {
+			/* As above: the partition becomes invalid. */
+			part_error = PERR_DLTASK;
+			deleting = false;
+			adding = cpumask_and(tmp->addmask,
+					     cs->effective_xcpus, parent->effective_xcpus);
 		}
 	} else {
 		/*
@@ -2084,10 +2189,13 @@ static int update_parent_effective_cpumask(struct cpuset *cs, int cmd,
 				}
 				rcu_read_unlock();
 			}
-			if (exclusive)
-				deleting = !cpumask_empty(tmp->delmask);
-			else
+			if (!exclusive)
 				part_error = PERR_NOTEXCL;
+			else if (!dl_tasks_keep_without(parent, cs, tmp->delmask,
+							true, tmp->new_cpus))
+				part_error = PERR_DLTASK;
+			else
+				deleting = !cpumask_empty(tmp->delmask);
 		}
 		/*
 		 * When both cs and parent remain valid, parent's
@@ -2496,6 +2604,66 @@ static void partition_cpus_change(struct cpuset *cs, struct cpuset *trialcs,
 	}
 }
 
+/*
+ * Set @new_cpus to the effective CPUs that @cp gets if @cs takes the CPUs
+ * of @trialcs. @cp is @cs or one of its descendants.
+ */
+static void trial_effective_cpus(struct cpuset *cp, struct cpuset *cs,
+				 struct cpuset *trialcs, struct cpumask *new_cpus)
+{
+	struct cpuset *parent = parent_cs(cs), *a;
+	int depth = 0, i;
+
+	if (!cpumask_and(new_cpus, trialcs->cpus_allowed, parent->effective_cpus) &&
+	    is_in_v2_mode())
+		cpumask_copy(new_cpus, parent->effective_cpus);
+	for (a = cp; a != cs; a = parent_cs(a))
+		depth++;
+	/* From the child of @cs down to @cp, as compute_effective_cpumask(). */
+	while (depth--) {
+		for (a = cp, i = 0; i < depth; i++)
+			a = parent_cs(a);
+		if (cpumask_intersects(new_cpus, a->cpus_allowed) || !is_in_v2_mode())
+			cpumask_and(new_cpus, new_cpus, a->cpus_allowed);
+	}
+}
+
+/*
+ * Return false if the CPUs of @trialcs make a deadline task of @cs, or of
+ * a descendant, leave the root domain that counts its bandwidth. A cpuset
+ * holds CPUs of two root domains only with isolcpus="domain". The task
+ * would run in a root domain that did not admit it. A move of the task to
+ * another cpuset is the way there: it asks the other root domain for room.
+ *
+ * A partition root takes its CPUs from its parent, which checks the same
+ * for its own tasks: see dl_tasks_keep_without().
+ */
+static bool dl_tasks_keep_root_domain(struct cpuset *cs, struct cpuset *trialcs,
+				      struct cpumask *new_cpus)
+{
+	struct cgroup_subsys_state *pos_css;
+	struct cpuset *cp;
+	bool keep = true;
+
+	if (is_partition_valid(cs))
+		return true;
+	rcu_read_lock();
+	cpuset_for_each_descendant_pre(cp, pos_css, cs) {
+		if (is_partition_valid(cp)) {
+			pos_css = css_rightmost_descendant(pos_css);
+			continue;
+		}
+		trial_effective_cpus(cp, cs, trialcs, new_cpus);
+		if (cpumask_subset(cp->effective_cpus, new_cpus))
+			continue;
+		keep = dl_tasks_keep_cpus(cp, new_cpus);
+		if (!keep)
+			break;
+	}
+	rcu_read_unlock();
+	return keep;
+}
+
 /**
  * update_cpumask - update the cpus_allowed mask of a cpuset and all tasks in it
  * @cs: the cpuset to consider
@@ -2527,6 +2695,11 @@ static int update_cpumask(struct cpuset *cs, struct cpuset *trialcs,
 
 	if (alloc_tmpmasks(&tmp))
 		return -ENOMEM;
+
+	if (!dl_tasks_keep_root_domain(cs, trialcs, tmp.new_cpus)) {
+		free_tmpmasks(&tmp);
+		return -EBUSY;
+	}
 
 	/*
 	 * Check all the descendants in update_cpumasks_hier() if
