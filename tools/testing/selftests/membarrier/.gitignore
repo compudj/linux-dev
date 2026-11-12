@@ -4,3 +4,6 @@ membarrier_test_single_thread
 membarrier_rseq_stress
 membarrier_test_ipi
 membarrier_test_cmd
+membarrier_test_barrier
+/tools
+*.bpf.o
