@@ -797,6 +797,14 @@ struct cgroup_subsys {
 	void (*css_free)(struct cgroup_subsys_state *css);
 	void (*css_reset)(struct cgroup_subsys_state *css);
 	void (*css_killed)(struct cgroup_subsys_state *css);
+	/*
+	 * Return false to refuse the removal of @css: the rmdir of its
+	 * cgroup, or the write to "cgroup.subtree_control" of the parent
+	 * which disables the controller. Both then fail with -EBUSY. Called
+	 * with cgroup_mutex held. A controller which refuses must show the
+	 * reason in a file of the cgroup.
+	 */
+	bool (*css_removable)(struct cgroup_subsys_state *css);
 	void (*css_rstat_flush)(struct cgroup_subsys_state *css, int cpu);
 	int (*css_extra_stat_show)(struct seq_file *seq,
 				   struct cgroup_subsys_state *css);

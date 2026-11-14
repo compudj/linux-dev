@@ -3706,9 +3706,15 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 				continue;
 			}
 
-			/* a child has it enabled? */
+			/*
+			 * A child has it enabled, or the controller refuses
+			 * the removal of the css of a child?
+			 */
 			cgroup_for_each_live_child(child, cgrp) {
-				if (child->subtree_control & (1 << ssid)) {
+				struct cgroup_subsys_state *css = cgroup_css(child, ss);
+
+				if (child->subtree_control & (1 << ssid) ||
+				    (css && ss->css_removable && !ss->css_removable(css))) {
 					ret = -EBUSY;
 					goto out_unlock;
 				}
@@ -6398,6 +6404,12 @@ static int cgroup_destroy_locked(struct cgroup *cgrp)
 	 */
 	if (css_has_online_children(&cgrp->self))
 		return -EBUSY;
+
+	/* A controller can refuse the removal, see css_removable(). */
+	for_each_css(css, ssid, cgrp) {
+		if (css->ss->css_removable && !css->ss->css_removable(css))
+			return -EBUSY;
+	}
 
 	/*
 	 * Mark @cgrp and the associated csets dead.  The former prevents
