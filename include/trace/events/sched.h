@@ -951,6 +951,37 @@ TRACE_EVENT(sched_conc_refuse,
 	TP_printk("comm=%s pid=%d op=%s why=%s err=%d",
 		  __entry->comm, __entry->pid, __get_str(op), __get_str(why), __entry->err)
 );
+
+/*
+ * A held task was given the slot of running tasks (a rotation). @mask is the
+ * mask of the held task, @cpu the CPU whose slot was taken, @cgroup the id
+ * of the cgroup at its limit.
+ */
+TRACE_EVENT(sched_conc_rotate,
+
+	TP_PROTO(struct task_struct *p, const struct cpumask *mask, int cpu, u64 cgroup),
+
+	TP_ARGS(p, mask, cpu, cgroup),
+
+	TP_STRUCT__entry(
+		__array(	char,	comm,	TASK_COMM_LEN	)
+		__field(	pid_t,	pid			)
+		__cpumask(	mask				)
+		__field(	int,	cpu			)
+		__field(	u64,	cgroup			)
+	),
+
+	TP_fast_assign(
+		memcpy(__entry->comm, p->comm, TASK_COMM_LEN);
+		__entry->pid	= p->pid;
+		__assign_cpumask(mask, cpumask_bits(mask));
+		__entry->cpu	= cpu;
+		__entry->cgroup	= cgroup;
+	),
+
+	TP_printk("comm=%s pid=%d mask=%s cpu=%d cgroup=%llu",
+		  __entry->comm, __entry->pid, __get_cpumask(mask), __entry->cpu, __entry->cgroup)
+);
 #endif /* _TRACE_SCHED_H */
 
 /* This part must be outside protection */

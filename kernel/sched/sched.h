@@ -518,6 +518,7 @@ enum conc_claim_result {
 struct tg_concurrency {
 	raw_spinlock_t		lock;
 	atomic_t __percpu	*present;
+	u64 __percpu		*since;		/* when each used CPU joined @used */
 	cpumask_var_t		used;
 	cpumask_var_t		unused_cores;	/* CPUs of the SMT cores no used CPU is on */
 	unsigned int		nr_used;
@@ -549,6 +550,14 @@ struct tg_concurrency {
 	/* On conc_pass_retries, retried at the end of a cpuset pass. */
 	struct list_head	pass_node;
 	struct cgroup_file	effective_file;
+	struct cgroup_file	events_file;
+
+	/* Statistics of the subtree, see cpu.concurrency.stat */
+	atomic64_t		st_held_ns;	/* time its tasks were held */
+	atomic64_t		st_rotated_ns;	/* of it, in waits which a rotation ended */
+	atomic_long_t		st_nr_holds;
+	atomic_long_t		st_nr_rotations;
+	atomic_t		st_nr_held;	/* tasks held now */
 };
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 struct task_group {

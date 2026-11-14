@@ -262,6 +262,18 @@ static LIST_HEAD(conc_held_list);
 static DEFINE_RAW_SPINLOCK(conc_hold_lock);
 atomic_t conc_nr_held;
 
+/*
+ * The rotation period, in milliseconds. A task which stays held for one
+ * period is given a slot which runs tasks of its own scheduling class, see
+ * conc_rotate_for(). The file sched/conc_rotation_ms of debugfs sets it.
+ */
+unsigned int conc_rotation_ms __read_mostly = 100;
+
+static u64 conc_rotation_ns(void)
+{
+	return (u64)max(READ_ONCE(conc_rotation_ms), 1U) * NSEC_PER_MSEC;
+}
+
 static void conc_hold_work_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(conc_hold_work, conc_hold_work_fn);
 
@@ -418,6 +430,7 @@ void free_conc_sched_group(struct task_group *tg)
 	if (!tg->conc.present)
 		return;
 	free_percpu(tg->conc.present);
+	free_percpu(tg->conc.since);
 	free_cpumask_var(tg->conc.used);
 	free_cpumask_var(tg->conc.unused_cores);
 }
@@ -527,10 +540,12 @@ static inline void conc_want_headroom(struct tg_concurrency *conc)
 }
 
 /*
- * Add @cpu to the used set. The SMT core of @cpu is no longer unused.
+ * Add @cpu to the used set. Record the time: the rotation takes the oldest
+ * slot first. The SMT core of @cpu is no longer unused.
  */
 static void conc_used_add(struct tg_concurrency *conc, int cpu)
 {
+	WRITE_ONCE(*per_cpu_ptr(conc->since, cpu), ktime_get_ns());
 	cpumask_set_cpu(cpu, conc->used);
 	cpumask_andnot(conc->unused_cores, conc->unused_cores, cpu_smt_mask(cpu));
 	WRITE_ONCE(conc->nr_used, conc->nr_used + 1);
@@ -3157,6 +3172,43 @@ static inline void conc_debug_hold_end(struct task_struct *p, const char *how) {
 #endif /* !CONFIG_SCHED_MAX_CONCURRENCY_DEBUG */
 
 /*
+ * Count the start of a hold of @p, see cpu.concurrency.stat. Each group
+ * counts its subtree. Call under the runqueue lock of @p.
+ */
+static void conc_stat_hold_start(struct task_struct *p)
+{
+	struct task_group *tg;
+
+	p->conc_hold_at = ktime_get_ns();
+	/* A move ends a hold and asks for a new one. The wait goes on. */
+	if (!p->conc_wait_at)
+		WRITE_ONCE(p->conc_wait_at, p->conc_hold_at);
+	for (tg = task_group(p); tg; tg = tg->parent) {
+		atomic_inc(&tg->conc.st_nr_held);
+		atomic_long_inc(&tg->conc.st_nr_holds);
+	}
+}
+
+/* The hold of @p ends. With @last, its wait ends too. */
+static void conc_stat_hold_stop(struct task_struct *p, bool last)
+{
+	u64 delta = ktime_get_ns() - p->conc_hold_at;
+	bool rotated = READ_ONCE(p->conc_rotated);
+	struct task_group *tg;
+
+	for (tg = task_group(p); tg; tg = tg->parent) {
+		atomic_dec(&tg->conc.st_nr_held);
+		atomic64_add(delta, &tg->conc.st_held_ns);
+		if (rotated)
+			atomic64_add(delta, &tg->conc.st_rotated_ns);
+	}
+	if (last) {
+		WRITE_ONCE(p->conc_rotated, 0);
+		WRITE_ONCE(p->conc_wait_at, 0);
+	}
+}
+
+/*
  * Ask for @p to be held at its next return to user space, for @why. Return
  * false if @p cannot be held. The caller holds p->pi_lock.
  *
@@ -3243,6 +3295,7 @@ static void conc_hold(struct rq *rq, struct task_struct *p)
 	conc_task_release(p, cpu_of(rq));
 	p->conc_held = 1;
 	conc_debug_hold_start(p);
+	conc_stat_hold_start(p);
 	get_task_struct(p);
 	atomic_inc(&conc_nr_held);
 	/*
@@ -3269,6 +3322,7 @@ void conc_held_blocks(struct rq *rq, struct task_struct *p)
 	p->conc_held = 0;
 	conc_debug_hold_stop(p);
 	conc_debug_hold_end(p, "blocked");
+	conc_stat_hold_stop(p, true);
 	scoped_guard(raw_spinlock, &conc_hold_lock)
 		list_del_init(&p->conc_hold_node);
 	if (atomic_dec_and_test(&conc_nr_held))
@@ -3306,6 +3360,7 @@ void conc_unhold(struct rq *rq, struct task_struct *p, bool rehold)
 	WARN_ON_ONCE(on_rq != TASK_ON_RQ_QUEUED);
 	p->conc_held = 0;
 	conc_debug_hold_stop(p);
+	conc_stat_hold_stop(p, !rehold);
 	p->sched_class->enqueue_task(rq, p, ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK);
 	/*
 	 * A wakeup or a migration reschedules the target CPU. A change made
@@ -3610,9 +3665,150 @@ out:
 	return ret;
 }
 
+/* The lowest scheduling class which a task of a cgroup can have. */
+#ifdef CONFIG_SCHED_CLASS_EXT
+#define CONC_LOWEST_CLASS	(&ext_sched_class)
+#else
+#define CONC_LOWEST_CLASS	(&fair_sched_class)
+#endif
+
+/*
+ * Return the highest scheduling class among the tasks of the subtree of
+ * @lvl which hold its slot on @cpu. Return NULL if no task holds it. Set
+ * @fixed if one of these tasks cannot be held, see conc_hold_request().
+ * The slot cannot be emptied then.
+ *
+ * The tasks are read without their locks. A task which claims or releases
+ * the slot meanwhile can be missed. The rotation then takes a slot one
+ * look early or late.
+ *
+ * This walks the tasks of every group of the subtree which uses @cpu. The
+ * rotation calls it for a slot which it may take, at most once per look.
+ */
+static const struct sched_class *conc_slot_class(struct task_group *lvl, int cpu, bool *fixed)
+{
+	const struct sched_class *class = NULL;
+	struct cgroup_subsys_state *css;
+
+	guard(rcu)();
+	css_for_each_descendant_pre(css, &lvl->css) {
+		struct css_task_iter it;
+		struct task_struct *t;
+
+		if (!cpumask_test_cpu(cpu, css_tg(css)->conc.used))
+			continue;
+		css_task_iter_start(css, 0, &it);
+		while ((t = css_task_iter_next(&it))) {
+			const struct sched_class *c = READ_ONCE(t->sched_class);
+
+			if (task_cpu(t) != cpu || !READ_ONCE(t->conc_accounted))
+				continue;
+			if (READ_ONCE(t->flags) & (PF_KTHREAD | PF_IO_WORKER | PF_EXITING))
+				*fixed = true;
+			if (!class || sched_class_above(c, class))
+				class = c;
+		}
+		css_task_iter_end(&it);
+	}
+	return class;
+}
+
+/*
+ * Rotation: take a slot from running tasks for held task @p.
+ *
+ * Every affinity mask is accepted under a limit. So the used CPUs of a
+ * group at its limit can all be outside the mask of one of its tasks. That
+ * task is held. It must not wait for as long as the other tasks run.
+ *
+ * @p is in @tg and its mask is @mask. Nothing within the limit fits it.
+ * Choose a used CPU outside @mask, at the level which is at its limit.
+ * Empty it: its tasks join other used CPUs, or are held (conc_evict_cpu()).
+ *
+ * The class of a slot is the highest class among the tasks which hold it,
+ * see conc_slot_class(). A slot can be taken in two cases:
+ *  - its class is below the class of @p;
+ *  - its class is the class of @p, @expired is set (the hold of @p lasted
+ *    a rotation period) and the slot is at least one period old.
+ * A slot of a class above the class of @p is never taken. Among the slots
+ * which can be taken, the victim is the one used for the longest time.
+ *
+ * Return 0 if a slot was emptied, -EBUSY otherwise.
+ */
+static int conc_rotate_for(struct task_struct *p, struct task_group *tg,
+			 const struct cpumask *mask, bool expired)
+{
+	u64 now = ktime_get_ns(), period = conc_rotation_ns();
+	const struct sched_class *pc = READ_ONCE(p->sched_class);
+	struct task_group *lvl, *g;
+
+	lockdep_assert_held(&conc_mutex);
+
+	for (lvl = tg; lvl; lvl = lvl->conc.propagate ? lvl->parent : NULL) {
+		u64 oldest = U64_MAX;
+		int cpu, victim = -1;
+
+		if (lvl != tg && cpumask_intersects(lvl->conc.used, mask))
+			break;
+		for_each_cpu(cpu, lvl->conc.used) {
+			u64 since = READ_ONCE(*per_cpu_ptr(lvl->conc.since, cpu));
+			const struct sched_class *vc;
+			bool due, fixed = false;
+
+			if (cpumask_test_cpu(cpu, mask) ||
+			    atomic_read(per_cpu_ptr(lvl->conc.present, cpu)) < 0)
+				continue;
+			/*
+			 * A slot which is not due can only be taken from a
+			 * lower class. Skip the walk of the tasks if no
+			 * task can be in a class below the one of @p.
+			 */
+			due = expired && now - since >= period;
+			if (!due && !sched_class_above(pc, CONC_LOWEST_CLASS))
+				continue;
+			vc = conc_slot_class(lvl, cpu, &fixed);
+			/* Its eviction would fail at every look. Try another slot. */
+			if (fixed)
+				continue;
+			/*
+			 * A slot without a task tells nothing: its tasks may
+			 * be about to claim it. Treat it as the class of @p.
+			 */
+			if (!vc)
+				vc = pc;
+			if (sched_class_above(vc, pc))
+				continue;
+			if (!sched_class_above(pc, vc) && !due)
+				continue;
+			if (since < oldest) {
+				oldest = since;
+				victim = cpu;
+			}
+		}
+		if (victim < 0)
+			continue;
+		if (conc_evict_cpu(lvl, victim, false, true, NULL, NULL, NULL))
+			continue;
+		trace_sched_conc_rotate(p, mask, victim, cgroup_id(lvl->css.cgroup));
+		for (g = lvl; g; g = g->parent) {
+			atomic_long_inc(&g->conc.st_nr_rotations);
+			if (g->parent)
+				cgroup_file_notify(&g->conc.events_file);
+		}
+		return 0;
+	}
+	return -EBUSY;
+}
+
+static void conc_rotate_work_fn(struct work_struct *work)
+{
+	mod_delayed_work(system_dfl_wq, &conc_hold_work, 0);
+}
+static DECLARE_DELAYED_WORK(conc_rotate_work, conc_rotate_work_fn);
+
 static void conc_hold_work_fn(struct work_struct *work)
 {
 	bool again = false;
+	LIST_HEAD(still);
 	int todo;
 
 	for (todo = atomic_read(&conc_nr_held); todo > 0; todo--) {
@@ -3645,6 +3841,47 @@ static void conc_hold_work_fn(struct work_struct *work)
 				conc_make_reachable(tg, mask);
 				mutex_unlock(&conc_mutex);
 				ret = conc_try_place(p);
+				/* Still held. Take a slot for it. */
+				if (!ret) {
+					u64 since = READ_ONCE(p->conc_wait_at);
+					bool expired = since && ktime_get_ns() - since >=
+						       conc_rotation_ns();
+					struct conc_resv *resv = NULL;
+					int r;
+
+					/*
+					 * Reserve the freed room for @p. Otherwise
+					 * the tasks just evicted, or a wakeup, can
+					 * take it first.
+					 */
+					mutex_lock(&conc_mutex);
+					r = conc_rotate_for(p, tg, mask, expired);
+					if (!r)
+						resv = conc_resv_make(tg, mask);
+					if (resv) {
+						scoped_guard(raw_spinlock_irq, &p->pi_lock)
+							p->conc_resv_cpu = conc_resv_cpu(resv);
+					}
+					mutex_unlock(&conc_mutex);
+					if (!r) {
+						struct rq_flags rf;
+						struct rq *rq;
+
+						/* The hold can end meanwhile. */
+						rq = task_rq_lock(p, &rf);
+						if (p->conc_held)
+							WRITE_ONCE(p->conc_rotated, 1);
+						task_rq_unlock(rq, p, &rf);
+						ret = conc_try_place(p);
+					}
+					if (resv) {
+						scoped_guard(raw_spinlock_irq, &p->pi_lock)
+							p->conc_resv_cpu = -1;
+						mutex_lock(&conc_mutex);
+						conc_resv_finish(resv);
+						mutex_unlock(&conc_mutex);
+					}
+				}
 				css_put(&tg->css);
 			}
 			free_cpumask_var(mask);
@@ -3656,30 +3893,53 @@ static void conc_hold_work_fn(struct work_struct *work)
 			 * return to user space. In the second case conc_hold()
 			 * may have put it on the list already. Add it only if
 			 * it is not on the list.
+			 *
+			 * Keep the tasks in the order of their holds. The task
+			 * held first is served first when a slot comes of age.
 			 */
 			scoped_guard(raw_spinlock_irq, &conc_hold_lock) {
 				if (READ_ONCE(p->conc_held) && list_empty(&p->conc_hold_node))
-					list_add_tail(&p->conc_hold_node, &conc_held_list);
+					list_add_tail(&p->conc_hold_node, &still);
 			}
 			if (ret < 0)
 				again = true;
 		}
 		put_task_struct(p);
 	}
+	scoped_guard(raw_spinlock_irq, &conc_hold_lock)
+		list_splice_init(&still, &conc_held_list);
 	if (again)
 		mod_delayed_work(system_dfl_wq, &conc_hold_work, 1);
+	/* Look again while tasks are held: a rotation period may expire. */
+	if (atomic_read(&conc_nr_held))
+		mod_delayed_work(system_dfl_wq, &conc_rotate_work,
+				 max(1UL, nsecs_to_jiffies(conc_rotation_ns()) / 4));
 }
 
 /*
  * Request a hold for @t if it holds a slot of @tg on @cpu. Return false if
  * @t is there and cannot be held.
+ *
+ * If @t is not on a CPU, release its slot now. @t is then queued without a
+ * slot, with the hold pending. It runs no user space code before it is
+ * held: the hold is done at its return to user space. Otherwise a task
+ * which a higher class keeps off the CPU would keep its slot until it runs.
  */
 static bool conc_hold_task_on(struct task_struct *t, struct task_group *tg, int cpu)
 {
+	struct rq_flags rf;
+	struct rq *rq;
+
 	guard(raw_spinlock_irq)(&t->pi_lock);
 	if (task_cpu(t) != cpu || !READ_ONCE(t->conc_accounted) || task_group(t) != tg)
 		return true;
-	return conc_hold_request(t, CONC_HOLD_EVICT);
+	if (!conc_hold_request(t, CONC_HOLD_EVICT))
+		return false;
+	rq = __task_rq_lock(t, &rf);
+	if (!task_on_cpu(rq, t))
+		conc_task_release(t, cpu);
+	__task_rq_unlock(rq, t, &rf);
+	return true;
 }
 
 /*
@@ -3745,6 +4005,7 @@ static int conc_hold_cpu(struct task_group *tg, int cpu)
 				}
 				css_task_iter_end(&it);
 			}
+			/* Shorter than a jiffy: a rotation hands a slot over. */
 			if (ok)
 				usleep_range(50, 100);
 		}

@@ -1018,9 +1018,18 @@ struct task_struct {
 	 * (conc_pass_end()).
 	 */
 	u8				conc_in_pass;
+	/* A rotation made room during the current wait for a slot. */
+	u8				conc_rotated;
 	/* The CPU of a slot reserved for this task's arrival, -1 when none. */
 	int				conc_resv_cpu;
 	struct list_head		conc_hold_node;
+	/* The start of the current hold, see conc_stat_hold_start(). */
+	u64				conc_hold_at;
+	/*
+	 * The start of the current wait for a slot, 0 when the task does not
+	 * wait. A wait covers the holds which a move of the task splits.
+	 */
+	u64				conc_wait_at;
 #endif /* CONFIG_SCHED_MAX_CONCURRENCY */
 
 #ifdef CONFIG_PREEMPT_RCU

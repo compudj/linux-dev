@@ -282,6 +282,9 @@ extern int conc_pick_dest(struct task_struct *p, const struct cpumask *valid,
 extern void conc_task_affinity_changed(struct task_struct *p, struct affinity_context *ctx);
 extern void conc_prepare_affinity(struct task_struct *p, struct affinity_context *ctx);
 
+/* The rotation period, see conc_rotate_for(). Set from debugfs. */
+extern unsigned int conc_rotation_ms;
+
 /* Called from outside concurrency.c. */
 int alloc_conc_sched_group(struct task_group *tg);
 

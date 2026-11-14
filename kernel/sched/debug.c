@@ -731,6 +731,9 @@ static __init int sched_init_debug(void)
 	debugfs_create_file("tunable_scaling", 0644, debugfs_sched, NULL, &sched_scaling_fops);
 	debugfs_create_u32("migration_cost_ns", 0644, debugfs_sched, &sysctl_sched_migration_cost);
 	debugfs_create_u32("nr_migrate", 0644, debugfs_sched, &sysctl_sched_nr_migrate);
+#ifdef CONFIG_SCHED_MAX_CONCURRENCY
+	debugfs_create_u32("conc_rotation_ms", 0644, debugfs_sched, &conc_rotation_ms);
+#endif
 
 	sched_domains_mutex_lock();
 	update_sched_domain_debugfs();

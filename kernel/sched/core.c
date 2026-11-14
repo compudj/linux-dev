@@ -4829,6 +4829,8 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->conc_hold_pending		= 0;
 	p->cid_wait			= 0;
 	p->conc_held			= 0;
+	p->conc_rotated			= 0;
+	p->conc_wait_at			= 0;
 	p->conc_resv_cpu			= -1;
 	INIT_LIST_HEAD(&p->conc_hold_node);
 #endif
