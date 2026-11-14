@@ -487,6 +487,20 @@ int conc_stat_read(const char *cg, struct conc_stat *st)
 }
 
 /*
+ * Return the count of the key "rotation" of cpu.concurrency.events of
+ * @cg, or -1 if it cannot be read.
+ */
+long long conc_events_rotation(const char *cg)
+{
+	char buf[128];
+
+	if (cg_read(cg, "cpu.concurrency.events", buf, sizeof(buf)) ||
+	    strncmp(buf, "rotation ", 9))
+		return -1;
+	return atoll(buf + 9);
+}
+
+/*
  * The directory of tracefs while the events of the limit are enabled, or
  * an empty string. See conc_trace_start().
  */

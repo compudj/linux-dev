@@ -276,6 +276,26 @@ static void rot_go(struct rot *r, int ms)
 	__atomic_store_n(&r->go, 1, __ATOMIC_RELEASE);
 }
 
+/*
+ * Wait until tasks @first to @first + @n - 1 of @r ended. Return -1. Return
+ * the index of a task which has not ended 3 s after the measured time. A
+ * task ends as soon as it runs after that time. So it only takes 3 s when
+ * the task does not run.
+ */
+static int rot_wait_done(struct rot *r, int first, int n)
+{
+	int i;
+
+	for (i = first; i < first + n; i++) {
+		while (!__atomic_load_n(&r->t[i].done, __ATOMIC_ACQUIRE)) {
+			if (mono_ns() > r->end_ns + 3000000000LL)
+				return i;
+			usleep(1000);
+		}
+	}
+	return -1;
+}
+
 /* Stop the tasks of @r, then kill and reap its @n processes of @pid. */
 static void rot_end(struct rot *r, pid_t *pid, int n)
 {
@@ -295,6 +315,49 @@ static void rot_end(struct rot *r, pid_t *pid, int n)
 static long rot_run_ms(struct rot *r, int i)
 {
 	return __atomic_load_n(&r->t[i].run_ns, __ATOMIC_RELAXED) / 1000000;
+}
+
+/* Return the share of the measured time which task @i of @r ran, in percent. */
+static int rot_share(struct rot *r, int i)
+{
+	return r->t[i].run_ns * 100 / (r->end_ns - r->t0_ns);
+}
+
+/*
+ * Return 0 if no task from @first to @first + @n - 1 of @r read an mm_cid
+ * at or above @limit. Else print the task, with @what, and return -1.
+ */
+static int rot_check_ids(struct rot *r, int first, int n, unsigned int limit, const char *what)
+{
+	int i;
+
+	for (i = first; i < first + n; i++) {
+		if (rseq_has_mm_cid() && r->t[i].max_cid >= limit) {
+			fprintf(stderr, "%s: task %d read mm_cid %u, limit %u\n", what, i,
+				r->t[i].max_cid, limit);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* Return the median of the wakeup latencies of periodic task @i of @r, in us. */
+static int rot_lat_median_us(struct rot *r, int i)
+{
+	struct rot_task *t = &r->t[i];
+	int sorted[ROT_LATS], n = t->nlat, a, b;
+
+	if (!n)
+		return -1;
+	memcpy(sorted, t->lat_us, n * sizeof(int));
+	for (a = 1; a < n; a++) {
+		int v = sorted[a];
+
+		for (b = a; b > 0 && sorted[b - 1] > v; b--)
+			sorted[b] = sorted[b - 1];
+		sorted[b] = v;
+	}
+	return sorted[n / 2];
 }
 
 /*
@@ -340,6 +403,46 @@ static int rot_window(struct rot *r, int first, int n, int ms, int min_pct, int 
 		fprintf(stderr, ", all %d%% at most", max_sum_pct);
 	fprintf(stderr, "\n");
 	return -1;
+}
+
+#define ROT_PERIOD_FILE	"/sys/kernel/debug/sched/conc_rotation_ms"
+
+/*
+ * Return the rotation period in ms. Without the debugfs file, return the
+ * default of the kernel, 100.
+ */
+static int rot_period_ms(void)
+{
+	char buf[32];
+	int fd, ms = 100;
+	ssize_t n;
+
+	fd = open(ROT_PERIOD_FILE, O_RDONLY);
+	if (fd < 0)
+		return ms;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n > 0) {
+		buf[n] = 0;
+		ms = atoi(buf);
+	}
+	return ms > 0 ? ms : 100;
+}
+
+/*
+ * Wait until cpu.concurrency.effective of @cg reads @want. Return 0, or -1
+ * after @ms.
+ */
+static int wait_effective(const char *cg, const char *want, int ms)
+{
+	int t;
+
+	for (t = 0; t < ms; t += 5) {
+		if (!cg_read_strcmp(cg, "cpu.concurrency.effective", want))
+			return 0;
+		usleep(5000);
+	}
+	return cg_read_strcmp(cg, "cpu.concurrency.effective", want) ? -1 : 0;
 }
 
 /* The files parse, round trip and report "max" when unlimited. */
@@ -1118,6 +1221,17 @@ cleanup:
 	free(two);
 	free(parent);
 	return ret;
+}
+
+/*
+ * Return the ID of the cgroup @cg, or 0. It is the inode number of the
+ * directory.
+ */
+static unsigned long long ns_cid_cgroup_id(const char *cg)
+{
+	struct stat st;
+
+	return stat(cg, &st) ? 0 : st.st_ino;
 }
 
 /*
@@ -4927,9 +5041,1913 @@ cleanup:
 	return ret;
 }
 
+/*
+ * Run one shape of test_concurrency_rotation_share(): @n spinners under
+ * the limit @limit. Return 0 if the checks listed there hold.
+ */
+static int rotation_share_shape(const char *root, int limit, int n)
+{
+	int ret = -1, i, stuck, fair = 100 * limit / n, lo = 100, hi = 0, ms;
+	struct conc_stat before, after;
+	long long sum = 0, dur;
+	struct rot *r = NULL;
+	char *g, buf[32];
+	pid_t pid = -1;
+
+	g = cg_name(root, "cc_test_rot_share");
+	snprintf(buf, sizeof(buf), "%d", limit);
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", buf))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	for (i = 0; i < n; i++)
+		rot_pinned(r, i, i, i);
+	pid = rot_start(r, g, 0, n);
+	if (pid < 0 || rot_wait_ready(r, 0, n) || conc_stat_read(g, &before))
+		goto cleanup;
+	/* Eight turns for each spinner, 3 s at least. */
+	ms = MAX(3000, 8 * (n / limit) * rot_period_ms() * 5 / 4);
+	rot_go(r, ms);
+	stuck = rot_wait_done(r, 0, n);
+	if (stuck >= 0) {
+		fprintf(stderr, "%d over %d: spinner %d did not run for 3 s at the end\n", n, limit,
+			stuck);
+		goto cleanup;
+	}
+	if (conc_stat_read(g, &after) || rot_check_ids(r, 0, n, limit, "rotation_share"))
+		goto cleanup;
+	dur = r->end_ns - r->t0_ns;
+	for (i = 0; i < n; i++) {
+		lo = MIN(lo, rot_share(r, i));
+		hi = MAX(hi, rot_share(r, i));
+		sum += r->t[i].run_ns;
+	}
+	ksft_print_msg("%d spinners over the limit %d: shares from %d%% to %d%%, fair share %d%%, %lld rotations\n",
+		       n, limit, lo, hi, fair, after.nr_rotations - before.nr_rotations);
+	if (lo < fair / 2 || hi > fair * 3 / 2) {
+		fprintf(stderr, "%d over %d: a share is not within half of the fair share\n", n,
+			limit);
+		goto cleanup;
+	}
+	if (sum > dur * limit * 102 / 100) {
+		fprintf(stderr, "%d over %d: the spinners ran %lld ms in %lld ms\n", n, limit,
+			sum / 1000000, dur / 1000000);
+		goto cleanup;
+	}
+	if (after.nr_rotations == before.nr_rotations) {
+		fprintf(stderr, "%d over %d: nr_rotations did not grow\n", n, limit);
+		goto cleanup;
+	}
+	if (cg_read_strcmp(g, "cpu.concurrency.effective", limit == 1 ? "1 max\n" : "2 max\n")) {
+		fprintf(stderr, "%d over %d: the effective value is not the limit\n", n, limit);
+		goto cleanup;
+	}
+	ret = 0;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+/*
+ * Spinners pinned to more CPUs than the limit share the slots fairly.
+ *
+ * Cgroup: g, with cpu.concurrency.max L. One process in g has N threads.
+ * Thread i pins itself to CPU i and spins. The threads start to spin at
+ * the same time and spin for 3 s or more: long enough for eight turns
+ * each. Three shapes are run, each in a new g:
+ *  - N = 2, L = 1;
+ *  - N = 6, L = 2;
+ *  - N = the number of CPUs, 16 at most, L = 2.
+ *
+ * Each thread adds up the time it spends on the CPU: the steps between
+ * two clock reads which are shorter than 200 us. Checked for each shape:
+ *  - every pin is accepted;
+ *  - the share of each thread is between 0.5 and 1.5 times L / N of the
+ *    measured time. A thread which never gets a slot has a share of 0.
+ *    A thread which keeps its slot has a share of 100%;
+ *  - the shares add up to L CPUs at most, with 2% for the hand-overs;
+ *  - no thread reads an mm_cid at or above L;
+ *  - nr_rotations of cpu.concurrency.stat grows;
+ *  - cpu.concurrency.effective reads L.
+ * Skipped with fewer than 6 CPUs.
+ */
+static int test_concurrency_rotation_share(const char *root)
+{
+	int n = MIN(get_nprocs(), 16);
+
+	if (need_cpus(6))
+		return KSFT_SKIP;
+	if (rotation_share_shape(root, 1, 2) || rotation_share_shape(root, 2, 6))
+		return KSFT_FAIL;
+	if (n > 6 && rotation_share_shape(root, 2, n))
+		return KSFT_FAIL;
+	return KSFT_PASS;
+}
+
+/*
+ * No task waits for a slot longer than its turn.
+ *
+ * Cgroup: g, with cpu.concurrency.max L. L is 2 with 8 CPUs or more, else
+ * 1. One process in g has 4 * L threads. Thread i pins itself to CPU i and
+ * spins. So three threads wait for each slot. They all start at the same
+ * time and spin for 4 s.
+ *
+ * The kernel serves the waiting threads in the order of their holds. A
+ * thread keeps a slot for one rotation period, and the kernel looks for
+ * an expired period four times in a period. So a thread waits for three
+ * turns of 1.25 periods at most.
+ *
+ * Each thread records its longest time off the CPU, from the common start
+ * to the end. Checked: it is below 5 periods for every thread. That is
+ * 4 * L threads / L slots + 1. A thread which is skipped once waits for 7
+ * turns.
+ * Skipped with fewer than 4 CPUs.
+ */
+static int test_concurrency_rotation_order(const char *root)
+{
+	int ret = KSFT_FAIL, limit = get_nprocs() >= 8 ? 2 : 1, n = 4 * limit, i, stuck;
+	long long bound = 5LL * rot_period_ms() * 1000000, max = 0;
+	struct rot *r = NULL;
+	pid_t pid = -1;
+	char *g;
+
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_rot_order");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", limit == 2 ? "2" : "1"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	for (i = 0; i < n; i++)
+		rot_pinned(r, i, i, i);
+	pid = rot_start(r, g, 0, n);
+	if (pid < 0 || rot_wait_ready(r, 0, n))
+		goto cleanup;
+	rot_go(r, 4000);
+	stuck = rot_wait_done(r, 0, n);
+	if (stuck >= 0) {
+		fprintf(stderr, "thread %d did not run for 3 s at the end\n", stuck);
+		goto cleanup;
+	}
+	for (i = 0; i < n; i++)
+		max = MAX(max, r->t[i].max_gap_ns);
+	ksft_print_msg("%d spinners over the limit %d: the longest wait is %lld ms, the bound %lld ms\n",
+		       n, limit, max / 1000000, bound / 1000000);
+	for (i = 0; i < n; i++) {
+		if (r->t[i].max_gap_ns >= bound) {
+			fprintf(stderr, "thread %d was off the CPU for %lld ms\n", i,
+				r->t[i].max_gap_ns / 1000000);
+			goto cleanup;
+		}
+	}
+	if (rot_check_ids(r, 0, n, limit, "rotation_order"))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+/*
+ * A configuration which fits the limit is served without a rotation.
+ *
+ * Cgroup: g, with cpu.concurrency.max 2. One process in g has three
+ * threads:
+ *  - two spin and can run on every CPU;
+ *  - w is pinned to the last CPU. It wakes up every 20 ms and spins for
+ *    1 ms.
+ * They run for 2 s. Two slots serve them all: one on the last CPU and one
+ * anywhere. The kernel must move a spinner and its slot to the last CPU
+ * when w first finds no slot there. From then on w finds a slot at each
+ * wakeup.
+ *
+ * Checked:
+ *  - nr_rotations of cpu.concurrency.stat and the count of
+ *    cpu.concurrency.events do not change during the 2 s;
+ *  - the median of the wakeup latencies of w is below a quarter of the
+ *    rotation period. w measures a latency from the time it asked to wake
+ *    up to its first clock read after it. A task which waits for a
+ *    rotation is one period late;
+ *  - w woke up 50 times or more, of the 99 it asks for;
+ *  - no thread reads an mm_cid of 2 or more.
+ * Skipped with fewer than 4 CPUs.
+ */
+static int test_concurrency_rotation_fits(const char *root)
+{
+	int ret = KSFT_FAIL, stuck, median, quarter_us = rot_period_ms() * 1000 / 4;
+	struct conc_stat before, after;
+	long long ev0, ev1;
+	struct rot *r = NULL;
+	pid_t pid = -1;
+	char *g;
+
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_rot_fits");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	r->t[2].kind = ROT_PERIODIC;
+	r->t[2].cpu_lo = r->t[2].cpu_hi = get_nprocs() - 1;
+	r->t[2].period_us = 20000;
+	r->t[2].work_us = 1000;
+	pid = rot_start(r, g, 0, 3);
+	if (pid < 0 || rot_wait_ready(r, 0, 3))
+		goto cleanup;
+	ev0 = conc_events_rotation(g);
+	if (conc_stat_read(g, &before) || ev0 < 0) {
+		fprintf(stderr, "cpu.concurrency.stat or cpu.concurrency.events cannot be read\n");
+		goto cleanup;
+	}
+	rot_go(r, 2000);
+	stuck = rot_wait_done(r, 0, 3);
+	if (stuck >= 0) {
+		fprintf(stderr, "thread %d did not run for 3 s at the end\n", stuck);
+		goto cleanup;
+	}
+	ev1 = conc_events_rotation(g);
+	if (conc_stat_read(g, &after))
+		goto cleanup;
+	median = rot_lat_median_us(r, 2);
+	ksft_print_msg("%d wakeups, median latency %d us, %lld holds, %lld rotations\n",
+		       r->t[2].nlat, median, after.nr_holds - before.nr_holds,
+		       after.nr_rotations - before.nr_rotations);
+	if (after.nr_rotations != before.nr_rotations || ev1 != ev0) {
+		fprintf(stderr, "nr_rotations went from %lld to %lld, the event count from %lld to %lld\n",
+			before.nr_rotations, after.nr_rotations, ev0, ev1);
+		goto cleanup;
+	}
+	if (r->t[2].nlat < 50 || median >= quarter_us) {
+		fprintf(stderr, "the pinned thread woke up %d times, median latency %d us\n",
+			r->t[2].nlat, median);
+		goto cleanup;
+	}
+	if (rot_check_ids(r, 0, 3, 2, "rotation_fits"))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
 struct rot_mask {
 	int lo, hi;
 };
+
+/*
+ * Run @n spinners for @ms in a new cgroup @name with the limit @limit, 1
+ * or 2. They are the threads of one process. Spinner i pins itself to
+ * CPUs m[i].lo to m[i].hi. With @fifo, each then becomes SCHED_FIFO with
+ * that priority. Return 0 if all this holds:
+ *  - every pin is accepted;
+ *  - each spinner runs for @min_share percent of the time or more;
+ *  - the spinners run for @limit CPUs at most in all, with 2% for the
+ *    hand-overs;
+ *  - no spinner reads an mm_cid at or above @limit;
+ *  - cpu.concurrency.effective reads @limit.
+ */
+static int rot_pinned_run(const char *root, const char *name, int limit, const struct rot_mask *m,
+			  int n, int ms, int min_share, int fifo)
+{
+	struct rot *r = NULL;
+	int ret = -1, i, stuck;
+	long long sum = 0, max_sum;
+	pid_t pid = -1;
+	char *g;
+
+	g = cg_name(root, name);
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", limit == 1 ? "1" : "2"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	for (i = 0; i < n; i++) {
+		rot_pinned(r, i, m[i].lo, m[i].hi);
+		r->t[i].fifo = fifo;
+	}
+	pid = rot_start(r, g, 0, n);
+	if (pid < 0 || rot_wait_ready(r, 0, n))
+		goto cleanup;
+	rot_go(r, ms);
+	stuck = rot_wait_done(r, 0, n);
+	if (stuck >= 0) {
+		fprintf(stderr, "%s: spinner %d did not run for 3 s at the end\n", name, stuck);
+		goto cleanup;
+	}
+	for (i = 0; i < n; i++)
+		sum += r->t[i].run_ns;
+	max_sum = (r->end_ns - r->t0_ns) * limit * 102 / 100;
+	for (i = 0; i < n; i++) {
+		if (rot_share(r, i) >= min_share && sum <= max_sum)
+			continue;
+		fprintf(stderr, "%s: the spinners ran", name);
+		for (i = 0; i < n; i++)
+			fprintf(stderr, " %d%%", rot_share(r, i));
+		fprintf(stderr, " of the time; each must run %d%% or more, all %d%% at most\n",
+			min_share, limit * 102);
+		goto cleanup;
+	}
+	if (rot_check_ids(r, 0, n, limit, name))
+		goto cleanup;
+	if (cg_read_strcmp(g, "cpu.concurrency.effective", limit == 1 ? "1 max\n" : "2 max\n")) {
+		fprintf(stderr, "%s: the effective value is not the limit %d\n", name, limit);
+		goto cleanup;
+	}
+	ret = 0;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+/* Return true if a task without a limit can become SCHED_FIFO. */
+static bool can_sched_fifo(void)
+{
+	struct sched_param prio = { .sched_priority = 1 };
+	int st = 1;
+	pid_t c;
+
+	c = fork();
+	if (!c)
+		_exit(sched_setscheduler(0, SCHED_FIFO, &prio) ? 1 : 0);
+	if (c > 0)
+		waitpid(c, &st, 0);
+	return c > 0 && WIFEXITED(st) && !WEXITSTATUS(st);
+}
+
+/*
+ * A real-time task takes the slot of fair tasks at once. Fair tasks never
+ * take the slot of a real-time task.
+ *
+ * First part. Cgroup: g, with cpu.concurrency.max 2. One process in g has
+ * three threads:
+ *  - two fair threads spin, pinned to CPU 1 and to CPU 2. They use both
+ *    slots;
+ *  - w is SCHED_FIFO and pinned to CPU 3, which g does not use. It wakes
+ *    up every 20 ms and spins for 1 ms.
+ * They run for 2 s. Checked:
+ *  - the median of the wakeup latencies of w is below a quarter of the
+ *    rotation period, see test_concurrency_rotation_fits(). A fair task
+ *    in the place of w is one period late at each wakeup;
+ *  - w woke up 50 times or more, of the 99 it asks for;
+ *  - each fair thread runs for half of the 2 s or more. w needs a slot
+ *    for 1 ms in 20;
+ *  - no thread reads an mm_cid of 2 or more.
+ *
+ * Second part. Cgroup: h, with cpu.concurrency.max 1. One process in h
+ * has two threads, which spin for 1.5 s from the same time:
+ *  - s is SCHED_FIFO and pinned to CPU 1;
+ *  - f is fair and pinned to CPU 2.
+ * Checked:
+ *  - s is never off the CPU for three quarters of a rotation period. A
+ *    rotation would take its slot for a period. The fair server may take
+ *    its CPU for 50 ms in a second;
+ *  - s runs for 80% of the time or more, and f for 15% at most;
+ *  - nr_rotations of h grows by 1 at most: s may take the slot from f
+ *    once, at the start;
+ *  - f ends within 3 s of the end of s: it gets the slot which s leaves;
+ *  - no thread reads an mm_cid of 1 or more.
+ *
+ * Third part. Cgroup: k, with cpu.concurrency.max 1. One process in k has
+ * two SCHED_FIFO threads of the same priority, pinned to CPU 1 and to
+ * CPU 2. They spin for 2 s from the same time, see rot_pinned_run().
+ * Checked: each runs for a quarter of the time or more. Two tasks of one
+ * class share a slot by rotation, whatever the class. The fair share is
+ * half of the time.
+ *
+ * Skipped with fewer than 4 CPUs, or when a task without a limit cannot
+ * become SCHED_FIFO.
+ */
+static int test_concurrency_rotation_rt(const char *root)
+{
+	static const struct rot_mask two[] = { { 1, 1 }, { 2, 2 } };
+	int ret = KSFT_FAIL, stuck, median, period = rot_period_ms(), i;
+	struct conc_stat before, after;
+	struct rot *r = NULL, *r2 = NULL;
+	pid_t pid = -1, pid2 = -1;
+	char *g = NULL, *h = NULL;
+
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	if (!can_sched_fifo())
+		return skip("no SCHED_FIFO task without a limit");
+	g = cg_name(root, "cc_test_rot_rt");
+	h = cg_name(root, "cc_test_rot_rt2");
+	if (!g || !h || cg_create(g) || cg_create(h) || cg_write(g, "cpu.concurrency.max", "2") ||
+	    cg_write(h, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	r = rot_alloc();
+	r2 = rot_alloc();
+	if (!r || !r2)
+		goto cleanup;
+
+	rot_pinned(r, 0, 1, 1);
+	rot_pinned(r, 1, 2, 2);
+	rot_pinned(r, 2, 3, 3);
+	r->t[2].kind = ROT_PERIODIC;
+	r->t[2].fifo = 1;
+	r->t[2].period_us = 20000;
+	r->t[2].work_us = 1000;
+	pid = rot_start(r, g, 0, 3);
+	if (pid < 0 || rot_wait_ready(r, 0, 3))
+		goto cleanup;
+	rot_go(r, 2000);
+	stuck = rot_wait_done(r, 0, 3);
+	if (stuck >= 0) {
+		fprintf(stderr, "first part: thread %d did not run for 3 s at the end\n", stuck);
+		goto cleanup;
+	}
+	median = rot_lat_median_us(r, 2);
+	ksft_print_msg("SCHED_FIFO waiter: %d wakeups, median latency %d us; the fair spinners ran %d%% and %d%%\n",
+		       r->t[2].nlat, median, rot_share(r, 0), rot_share(r, 1));
+	if (r->t[2].nlat < 50 || median >= period * 1000 / 4) {
+		fprintf(stderr, "the SCHED_FIFO thread woke up %d times, median latency %d us\n",
+			r->t[2].nlat, median);
+		goto cleanup;
+	}
+	if (rot_share(r, 0) < 50 || rot_share(r, 1) < 50) {
+		fprintf(stderr, "the fair spinners ran %d%% and %d%% of the time\n",
+			rot_share(r, 0), rot_share(r, 1));
+		goto cleanup;
+	}
+	if (rot_check_ids(r, 0, 3, 2, "rotation_rt, first part"))
+		goto cleanup;
+	rot_end(r, &pid, 1);
+
+	rot_pinned(r2, 0, 1, 1);
+	r2->t[0].fifo = 1;
+	rot_pinned(r2, 1, 2, 2);
+	pid2 = rot_start(r2, h, 0, 2);
+	if (pid2 < 0 || rot_wait_ready(r2, 0, 2) || conc_stat_read(h, &before))
+		goto cleanup;
+	rot_go(r2, 1500);
+	stuck = rot_wait_done(r2, 0, 2);
+	if (stuck >= 0) {
+		fprintf(stderr, "second part: thread %d did not run for 3 s at the end\n", stuck);
+		goto cleanup;
+	}
+	if (conc_stat_read(h, &after))
+		goto cleanup;
+	ksft_print_msg("SCHED_FIFO spinner: ran %d%%, longest time off the CPU %lld ms; the fair waiter ran %d%%; %lld rotations\n",
+		       rot_share(r2, 0), r2->t[0].max_gap_ns / 1000000, rot_share(r2, 1),
+		       after.nr_rotations - before.nr_rotations);
+	if (r2->t[0].max_gap_ns >= period * 750000LL || rot_share(r2, 0) < 80 ||
+	    rot_share(r2, 1) > 15 || after.nr_rotations - before.nr_rotations > 1) {
+		fprintf(stderr, "a fair waiter took the slot of a SCHED_FIFO spinner\n");
+		goto cleanup;
+	}
+	if (rot_check_ids(r2, 0, 2, 1, "rotation_rt, second part"))
+		goto cleanup;
+	rot_end(r2, &pid2, 1);
+
+	if (rot_pinned_run(root, "cc_test_rot_rt3", 1, two, 2, 2000, 25, 1))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (r2) {
+		rot_end(r2, &pid2, 1);
+		munmap(r2, sizeof(*r2));
+	}
+	for (i = 0; i < 2; i++) {
+		char *cg = i ? h : g;
+
+		if (cg)
+			cg_destroy(cg);
+		free(cg);
+	}
+	return ret;
+}
+
+/*
+ * A real-time task of another cgroup does not keep a slot from rotating.
+ *
+ * Cgroups: g and "out". g has cpu.concurrency.max 1. out has no limit.
+ * Tasks, which all spin for 3 s from the same time:
+ *  - a and b, two fair threads of one process in g. a is pinned to CPU 1
+ *    and b to CPU 2;
+ *  - h, a SCHED_FIFO process in out, pinned to CPU 1.
+ * h does not belong to g and holds none of its slots. It keeps a off
+ * CPU 1 but for the time of the fair server. Nothing else runs on CPU 2.
+ *
+ * a and b share the one slot of g: each may keep it for a rotation
+ * period. So b must run on CPU 2 for about half of the time, whatever a
+ * gets on CPU 1 during its turns.
+ *
+ * Checked:
+ *  - b runs for 25% of the time or more;
+ *  - b is never off the CPU for 5 rotation periods;
+ *  - a and b run for one CPU at most together, with 2% for the
+ *    hand-overs;
+ *  - neither reads an mm_cid of 1 or more.
+ * Skipped with fewer than 3 CPUs, or when a task without a limit cannot
+ * become SCHED_FIFO.
+ */
+static int test_concurrency_rotation_foreign_rt(const char *root)
+{
+	int ret = KSFT_FAIL, stuck, period = rot_period_ms();
+	pid_t pid[2] = { -1, -1 };
+	char *g = NULL, *out = NULL;
+	struct rot *r = NULL;
+	long long dur;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	if (!can_sched_fifo())
+		return skip("no SCHED_FIFO task without a limit");
+	g = cg_name(root, "cc_test_rot_foreign");
+	out = cg_name(root, "cc_test_rot_foreign_out");
+	if (!g || !out || cg_create(g) || cg_create(out) || cg_write(g, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	rot_pinned(r, 0, 1, 1);
+	rot_pinned(r, 1, 2, 2);
+	rot_pinned(r, 2, 1, 1);
+	r->t[2].fifo = 1;
+	pid[0] = rot_start(r, g, 0, 2);
+	pid[1] = rot_start(r, out, 2, 1);
+	if (pid[0] < 0 || pid[1] < 0 || rot_wait_ready(r, 0, 3))
+		goto cleanup;
+	rot_go(r, 3000);
+	stuck = rot_wait_done(r, 0, 3);
+	if (stuck >= 0) {
+		fprintf(stderr, "task %d did not run for 3 s at the end\n", stuck);
+		goto cleanup;
+	}
+	dur = r->end_ns - r->t0_ns;
+	ksft_print_msg("a ran %d%% under the SCHED_FIFO task, b ran %d%%, longest time off the CPU %lld ms\n",
+		       rot_share(r, 0), rot_share(r, 1), r->t[1].max_gap_ns / 1000000);
+	if (rot_share(r, 1) < 25 || r->t[1].max_gap_ns >= period * 5000000LL) {
+		fprintf(stderr, "b did not get the slot of g while a SCHED_FIFO task of another cgroup ran on the CPU of a\n");
+		goto cleanup;
+	}
+	if (r->t[0].run_ns + r->t[1].run_ns > dur * 102 / 100) {
+		fprintf(stderr, "a and b ran %lld ms in %lld ms\n",
+			(r->t[0].run_ns + r->t[1].run_ns) / 1000000, dur / 1000000);
+		goto cleanup;
+	}
+	if (rot_check_ids(r, 0, 2, 1, "rotation_foreign_rt"))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, pid, 2);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	if (out)
+		cg_destroy(out);
+	free(g);
+	free(out);
+	return ret;
+}
+
+/*
+ * Return 1 if the file of @fd raises a notification within @ms, 0 if not,
+ * and -1 on an error. The file is read first: only a change after this
+ * read counts.
+ */
+static int file_notified(int fd, int ms)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLPRI };
+	char buf[64];
+	int n;
+
+	if (lseek(fd, 0, SEEK_SET) || read(fd, buf, sizeof(buf)) < 0)
+		return -1;
+	n = poll(&pfd, 1, ms);
+	if (n < 0)
+		return -1;
+	return n && (pfd.revents & POLLPRI);
+}
+
+/*
+ * Return 0 if no counter of @b is below its value in @a, and nr_held of
+ * @b is from 0 to @tasks. Else print both and return -1.
+ */
+static int stat_grew(const struct conc_stat *a, const struct conc_stat *b, int tasks)
+{
+	if (b->nr_holds >= a->nr_holds && b->held_usec >= a->held_usec &&
+	    b->nr_rotations >= a->nr_rotations && b->rotated_usec >= a->rotated_usec &&
+	    b->nr_held >= 0 && b->nr_held <= tasks)
+		return 0;
+	fprintf(stderr, "cpu.concurrency.stat went from nr_holds %lld held_usec %lld nr_rotations %lld rotated_usec %lld\n"
+		"to nr_held %lld nr_holds %lld held_usec %lld nr_rotations %lld rotated_usec %lld\n",
+		a->nr_holds, a->held_usec, a->nr_rotations, a->rotated_usec,
+		b->nr_held, b->nr_holds, b->held_usec, b->nr_rotations, b->rotated_usec);
+	return -1;
+}
+
+/*
+ * The counters of cpu.concurrency.stat and cpu.concurrency.events.
+ *
+ * Cgroups: p, and its child c with cpu.concurrency.max 1. Both are new, so
+ * their counters start at 0. The test holds cpu.concurrency.events of c
+ * open and uses poll() with POLLPRI on it, as for memory.events. The
+ * steps:
+ *  1. One process with one thread spins in c for 500 ms. It can run on
+ *     every CPU. poll() must report nothing during these 500 ms, and
+ *     nr_rotations of c must still be 0.
+ *  2. One process with two threads runs in c. The threads pin themselves
+ *     to CPU 1 and to CPU 2, and spin for 3 s from the same time. One of
+ *     them is held at any time. poll() must report a change within 1 s of
+ *     their start. The test then reads the file of c every 100 ms. No
+ *     counter but nr_held may go down, and nr_held must be 0, 1 or 2.
+ *  3. The process is killed and reaped. nr_held of c must be 0 within
+ *     2 s. poll() must report nothing for 300 ms.
+ *
+ * Checked at the end, on the counts of step 2:
+ *  - nr_rotations is from 15 to 32 with the default period of 100 ms. A
+ *    slot is taken when it is one period old, and the kernel looks four
+ *    times in a period. That is one rotation every 100 to 125 ms: 24 to
+ *    30 in 3 s. The test accepts half of that, for a busy machine, and
+ *    two more;
+ *  - nr_holds grew by the number of rotations or more: each rotation
+ *    holds the task which loses the slot;
+ *  - held_usec grew by 1.5 s or more: one of the two threads is held at
+ *    any time;
+ *  - rotated_usec is above 0, and not above held_usec;
+ *  - "rotation" of cpu.concurrency.events of c equals nr_rotations of c;
+ *  - the four counters of p equal those of c, and so does its "rotation"
+ *    count: p counts its child;
+ *  - the sched_conc_rotate event was recorded with the cgroup ID of c.
+ *    This is checked when tracefs can be used.
+ * Skipped with fewer than 3 CPUs.
+ */
+static int test_concurrency_rotation_stat(const char *root)
+{
+	int ret = KSFT_FAIL, fd = -1, stuck, i, period = rot_period_ms(), expect;
+	struct conc_stat st, prev, start, end, top;
+	char *p = NULL, *c = NULL, path[PATH_MAX], text[64];
+	struct rot *r = NULL, *r2 = NULL;
+	pid_t pid = -1, pid2 = -1;
+	long long rotations;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	p = cg_name(root, "cc_test_rot_stat");
+	c = p ? cg_name(p, "c") : NULL;
+	if (!c || cg_create(p) || cg_write(p, "cgroup.subtree_control", "+cpu") || cg_create(c) ||
+	    cg_write(c, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	snprintf(path, sizeof(path), "%s/cpu.concurrency.events", c);
+	fd = open(path, O_RDONLY);
+	r = rot_alloc();
+	r2 = rot_alloc();
+	if (fd < 0 || !r || !r2)
+		goto cleanup;
+	if (conc_stat_read(c, &st) || st.nr_held || st.nr_holds || st.held_usec ||
+	    st.nr_rotations || st.rotated_usec || conc_events_rotation(c)) {
+		fprintf(stderr, "the counters of a new cgroup are not 0\n");
+		goto cleanup;
+	}
+	conc_trace_start();
+	conc_trace_clear();
+
+	/* Step 1: nothing to rotate. */
+	pid = rot_start(r, c, 0, 1);
+	if (pid < 0 || rot_wait_ready(r, 0, 1))
+		goto cleanup;
+	rot_go(r, 500);
+	if (file_notified(fd, 500)) {
+		fprintf(stderr, "cpu.concurrency.events notified with one spinner under the limit 1\n");
+		goto cleanup;
+	}
+	stuck = rot_wait_done(r, 0, 1);
+	if (stuck >= 0 || conc_stat_read(c, &st) || st.nr_rotations) {
+		fprintf(stderr, "one spinner under the limit 1: it did not end, or nr_rotations is not 0\n");
+		goto cleanup;
+	}
+	rot_end(r, &pid, 1);
+
+	/* Step 2: two pinned spinners, one slot. */
+	rot_pinned(r2, 0, 1, 1);
+	rot_pinned(r2, 1, 2, 2);
+	pid2 = rot_start(r2, c, 0, 2);
+	if (pid2 < 0 || rot_wait_ready(r2, 0, 2) || conc_stat_read(c, &start))
+		goto cleanup;
+	rot_go(r2, 3000);
+	if (file_notified(fd, 1050) != 1) {
+		fprintf(stderr, "cpu.concurrency.events did not notify within 1 s of the start\n");
+		goto cleanup;
+	}
+	prev = start;
+	while (mono_ns() < r2->end_ns) {
+		usleep(100000);
+		if (conc_stat_read(c, &st) || stat_grew(&prev, &st, 2))
+			goto cleanup;
+		prev = st;
+	}
+	stuck = rot_wait_done(r2, 0, 2);
+	if (stuck >= 0) {
+		fprintf(stderr, "thread %d did not run for 3 s at the end\n", stuck);
+		goto cleanup;
+	}
+	if (conc_stat_read(c, &end))
+		goto cleanup;
+
+	/* Step 3: nothing runs. */
+	rot_end(r2, &pid2, 1);
+	for (i = 0; i < 200; i++) {
+		if (conc_stat_read(c, &st))
+			goto cleanup;
+		if (!st.nr_held)
+			break;
+		usleep(10000);
+	}
+	if (st.nr_held) {
+		fprintf(stderr, "nr_held is %lld 2 s after the tasks were killed\n", st.nr_held);
+		goto cleanup;
+	}
+	if (file_notified(fd, 300)) {
+		fprintf(stderr, "cpu.concurrency.events notified while nothing runs\n");
+		goto cleanup;
+	}
+
+	rotations = end.nr_rotations - start.nr_rotations;
+	expect = 3000 / period;
+	ksft_print_msg("3 s of 2 spinners over 1 slot: %lld rotations, %lld holds, held %lld ms, of which %lld ms ended by a rotation\n",
+		       rotations, end.nr_holds - start.nr_holds,
+		       (end.held_usec - start.held_usec) / 1000,
+		       (end.rotated_usec - start.rotated_usec) / 1000);
+	if (rotations < expect / 2 || rotations > expect + 2) {
+		fprintf(stderr, "%lld rotations in 3 s, from %d to %d expected\n", rotations,
+			expect / 2, expect + 2);
+		goto cleanup;
+	}
+	if (end.nr_holds - start.nr_holds < rotations ||
+	    end.held_usec - start.held_usec < 1500000 || !st.rotated_usec ||
+	    st.rotated_usec > st.held_usec) {
+		fprintf(stderr, "nr_holds, held_usec or rotated_usec does not match the run\n");
+		goto cleanup;
+	}
+	if (conc_events_rotation(c) != st.nr_rotations) {
+		fprintf(stderr, "cpu.concurrency.events of c reads %lld, nr_rotations %lld\n",
+			conc_events_rotation(c), st.nr_rotations);
+		goto cleanup;
+	}
+	if (conc_stat_read(p, &top) || top.nr_held || top.nr_holds != st.nr_holds ||
+	    top.held_usec != st.held_usec || top.nr_rotations != st.nr_rotations ||
+	    top.rotated_usec != st.rotated_usec || conc_events_rotation(p) != st.nr_rotations) {
+		fprintf(stderr, "the counters of p differ from those of its only child\n");
+		stat_grew(&st, &top, 0);
+		goto cleanup;
+	}
+	snprintf(text, sizeof(text), "cgroup=%llu", ns_cid_cgroup_id(c));
+	if (conc_trace_find("sched_conc_rotate:", text))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	conc_trace_stop();
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (r2) {
+		rot_end(r2, &pid2, 1);
+		munmap(r2, sizeof(*r2));
+	}
+	if (fd >= 0)
+		close(fd);
+	if (c)
+		cg_destroy(c);
+	if (p)
+		cg_destroy(p);
+	free(c);
+	free(p);
+	return ret;
+}
+
+/*
+ * Run two pinned spinners over one slot for 2 s with the rotation period
+ * @ms. Store the mean wait of a spinner in @wait_ms and the rotations in
+ * @rotations. Return 0, or -1 on a failure.
+ */
+static int rotation_period_run(const char *root, int ms, long *wait_ms, long long *rotations)
+{
+	struct conc_stat before, after;
+	struct rot *r = NULL;
+	int ret = -1, stuck;
+	pid_t pid = -1;
+	char *g, buf[16];
+
+	g = cg_name(root, "cc_test_rot_period");
+	snprintf(buf, sizeof(buf), "%d\n", ms);
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "1") ||
+	    file_write(ROT_PERIOD_FILE, buf))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	rot_pinned(r, 0, 1, 1);
+	rot_pinned(r, 1, 2, 2);
+	r->t[0].wait_min_ns = r->t[1].wait_min_ns = ms * 500000LL;
+	pid = rot_start(r, g, 0, 2);
+	if (pid < 0 || rot_wait_ready(r, 0, 2) || conc_stat_read(g, &before))
+		goto cleanup;
+	rot_go(r, 2000);
+	stuck = rot_wait_done(r, 0, 2);
+	if (stuck >= 0 || conc_stat_read(g, &after)) {
+		fprintf(stderr, "period %d ms: a spinner did not run for 3 s at the end\n", ms);
+		goto cleanup;
+	}
+	if (!r->t[0].nwaits || !r->t[1].nwaits) {
+		fprintf(stderr, "period %d ms: a spinner never waited\n", ms);
+		goto cleanup;
+	}
+	*wait_ms = (r->t[0].wait_ns + r->t[1].wait_ns) / (r->t[0].nwaits + r->t[1].nwaits) /
+		   1000000;
+	*rotations = after.nr_rotations - before.nr_rotations;
+	ret = 0;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+/*
+ * The rotation period of debugfs sets how long a held fair task waits.
+ *
+ * Cgroup: g, with cpu.concurrency.max 1. One process in g has two threads,
+ * pinned to CPU 1 and to CPU 2. They spin for 2 s from the same time, so
+ * one runs while the other waits for the slot. This is run twice, in a
+ * new g: with 100 written to sched/conc_rotation_ms, then with 20.
+ *
+ * A thread counts a time off the CPU as a wait when it lasts half a
+ * period or more. Checked:
+ *  - with 100 ms, the mean wait is 80 ms or more. A waiter gets a slot
+ *    which ran its own class after one period at the earliest;
+ *  - with 20 ms, the mean wait is below 60 ms. A kernel which ignores the
+ *    file makes the waiter wait 100 ms;
+ *  - nr_rotations grows at least twice as much with 20 ms as with 100 ms.
+ * The value read from the file at the start is written back at the end.
+ * Skipped with fewer than 3 CPUs, or without the debugfs file.
+ */
+static int test_concurrency_rotation_period(const char *root)
+{
+	long long rot_long = 0, rot_short = 0;
+	long wait_long = 0, wait_short = 0;
+	int ret = KSFT_FAIL;
+	char saved[32];
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	if (file_read(ROT_PERIOD_FILE, saved, sizeof(saved)))
+		return skip("no %s", ROT_PERIOD_FILE);
+	if (rotation_period_run(root, 100, &wait_long, &rot_long) ||
+	    rotation_period_run(root, 20, &wait_short, &rot_short))
+		goto cleanup;
+	ksft_print_msg("period 100 ms: mean wait %ld ms, %lld rotations; period 20 ms: mean wait %ld ms, %lld rotations\n",
+		       wait_long, rot_long, wait_short, rot_short);
+	if (wait_long < 80 || wait_short >= 60 || rot_short < 2 * rot_long) {
+		fprintf(stderr, "the waits do not follow the rotation period\n");
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (file_write(ROT_PERIOD_FILE, saved)) {
+		fprintf(stderr, "%s not restored to %s", ROT_PERIOD_FILE, saved);
+		ret = KSFT_FAIL;
+	}
+	return ret;
+}
+
+/*
+ * Masks which overlap without nesting are accepted under a limit.
+ *
+ * Two shapes are run, each for 2 s in a new cgroup, see rot_pinned_run():
+ *  - limit 1: two spinners pinned to {1,2} and to {2,3};
+ *  - limit 2: four spinners pinned to {1,2}, {2,3}, {3,4} and {1,2}.
+ * The fair share of a spinner is half a CPU in both shapes. Checked: each
+ * runs for a quarter of the time or more. The other checks are those of
+ * rot_pinned_run().
+ * Skipped with fewer than 5 CPUs.
+ */
+static int test_concurrency_rotation_overlap(const char *root)
+{
+	static const struct rot_mask two[] = { { 1, 2 }, { 2, 3 } };
+	static const struct rot_mask four[] = { { 1, 2 }, { 2, 3 }, { 3, 4 }, { 1, 2 } };
+
+	if (need_cpus(5))
+		return KSFT_SKIP;
+	if (rot_pinned_run(root, "cc_test_rot_overlap1", 1, two, 2, 2000, 25, 0) ||
+	    rot_pinned_run(root, "cc_test_rot_overlap2", 2, four, 4, 2000, 25, 0))
+		return KSFT_FAIL;
+	return KSFT_PASS;
+}
+
+/*
+ * A limited cgroup below a limited cgroup, both with too many pinned
+ * tasks.
+ *
+ * Cgroups: p, and its threaded children c and d. The test writes 1 to
+ * cpu.concurrency.max of c, then 2 to that of p. d has no limit of its
+ * own.
+ *
+ * One process has four threads, which spin for 4 s from the same time:
+ *  - c1 and c2 stay in c, pinned to CPU 1 and to CPU 2;
+ *  - d1 and d2 move to d, pinned to CPU 3 and to CPU 4.
+ * c may use one CPU at a time and p two. So the four threads ask for
+ * three CPUs under p, and c1 and c2 ask for two under c.
+ *
+ * Checked:
+ *  - every move and every pin is accepted;
+ *  - cpu.concurrency.effective reads 2 for p and d, and 1 for c, within
+ *    2 s of the moves. A larger value shows while the kernel still holds
+ *    the threads which arrived over a limit;
+ *  - c1 and c2 run for one CPU at most together, and the four threads for
+ *    two CPUs at most, each with 2% for the hand-overs;
+ *  - each thread runs for 10% of the time or more, and is never off the
+ *    CPU for 10 rotation periods. With two slots for four threads the
+ *    fair share is 50%;
+ *  - no thread reads an mm_cid of 2 or more.
+ * Skipped with fewer than 5 CPUs, or without threaded cgroups.
+ */
+static int test_concurrency_rotation_nested(const char *root)
+{
+	char *p = NULL, *c = NULL, *d = NULL;
+	int ret = KSFT_FAIL, i, stuck;
+	long long dur, sum = 0;
+	struct rot *r = NULL;
+	pid_t pid = -1;
+
+	if (need_cpus(5))
+		return KSFT_SKIP;
+	p = cg_name(root, "cc_test_rot_nested");
+	c = p ? cg_name(p, "c") : NULL;
+	d = p ? cg_name(p, "d") : NULL;
+	if (!c || !d || cg_create(p) || cg_write(p, "cgroup.subtree_control", "+cpu") ||
+	    cg_create(c) || cg_create(d))
+		goto cleanup;
+	if (cg_write(c, "cgroup.type", "threaded") || cg_write(d, "cgroup.type", "threaded")) {
+		ret = skip("no threaded cgroups");
+		goto cleanup;
+	}
+	if (cg_write(c, "cpu.concurrency.max", "1") || cg_write(p, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	for (i = 0; i < 4; i++)
+		rot_pinned(r, i, i + 1, i + 1);
+	r->t[2].cg = d;
+	r->t[3].cg = d;
+	pid = rot_start(r, c, 0, 4);
+	if (pid < 0 || rot_wait_ready(r, 0, 4))
+		goto cleanup;
+	if (wait_effective(p, "2 max\n", 2000) || wait_effective(d, "2 max\n", 2000) ||
+	    wait_effective(c, "1 max\n", 2000)) {
+		char val[3][32] = { "?", "?", "?" };
+
+		cg_read(p, "cpu.concurrency.effective", val[0], sizeof(val[0]));
+		cg_read(d, "cpu.concurrency.effective", val[1], sizeof(val[1]));
+		cg_read(c, "cpu.concurrency.effective", val[2], sizeof(val[2]));
+		fprintf(stderr, "the effective values of p, d and c are \"%.*s\", \"%.*s\" and \"%.*s\"\n",
+			(int)strcspn(val[0], "\n"), val[0], (int)strcspn(val[1], "\n"), val[1],
+			(int)strcspn(val[2], "\n"), val[2]);
+		goto cleanup;
+	}
+	rot_go(r, 4000);
+	stuck = rot_wait_done(r, 0, 4);
+	if (stuck >= 0) {
+		fprintf(stderr, "thread %d did not run for 3 s at the end\n", stuck);
+		goto cleanup;
+	}
+	dur = r->end_ns - r->t0_ns;
+	ksft_print_msg("shares: c1 %d%%, c2 %d%%, d1 %d%%, d2 %d%%; longest times off the CPU: %lld, %lld, %lld, %lld ms\n",
+		       rot_share(r, 0), rot_share(r, 1), rot_share(r, 2), rot_share(r, 3),
+		       r->t[0].max_gap_ns / 1000000, r->t[1].max_gap_ns / 1000000,
+		       r->t[2].max_gap_ns / 1000000, r->t[3].max_gap_ns / 1000000);
+	for (i = 0; i < 4; i++) {
+		sum += r->t[i].run_ns;
+		if (rot_share(r, i) < 10 || r->t[i].max_gap_ns >= 10000000LL * rot_period_ms()) {
+			fprintf(stderr, "thread %d ran %d%% of the time, and was off the CPU for %lld ms\n",
+				i, rot_share(r, i), r->t[i].max_gap_ns / 1000000);
+			goto cleanup;
+		}
+	}
+	if (r->t[0].run_ns + r->t[1].run_ns > dur * 102 / 100 || sum > dur * 204 / 100) {
+		fprintf(stderr, "the threads of c ran %lld ms, all four %lld ms, in %lld ms\n",
+			(r->t[0].run_ns + r->t[1].run_ns) / 1000000, sum / 1000000, dur / 1000000);
+		goto cleanup;
+	}
+	if (rot_check_ids(r, 0, 4, 2, "rotation_nested"))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (c)
+		cg_destroy(c);
+	if (d)
+		cg_destroy(d);
+	if (p)
+		cg_destroy(p);
+	free(c);
+	free(d);
+	free(p);
+	return ret;
+}
+
+/*
+ * A cpuset write may leave a cgroup fewer CPUs than its limit.
+ *
+ * Cgroup: g, with cpu.concurrency.max 2 and cpuset.cpus 1-3. One process
+ * in g has three threads, pinned to CPU 1, to CPU 2 and to CPU 3. They
+ * spin until the end of the test. The steps, each followed by 1.5 s of
+ * measurement:
+ *  1. Nothing: three pinned threads share two slots.
+ *  2. "1" is written to cpuset.cpus of g. The three threads share CPU 1.
+ *  3. "1-3" is written to cpuset.cpus of g.
+ *
+ * Checked:
+ *  - both writes are accepted;
+ *  - cpu.concurrency.effective reads 2 within 2 s of each write;
+ *  - in each measurement, each thread runs for 10% of the time or more.
+ *    The fair share is 66% in steps 1 and 3, and 33% in step 2;
+ *  - together the threads run for two CPUs at most in steps 1 and 3.
+ *    They run for one CPU at most in step 2. rot_window() allows 4%
+ *    more;
+ *  - no thread reads an mm_cid of 2 or more.
+ * Skipped with fewer than 4 CPUs.
+ */
+static int test_concurrency_rotation_cpuset_narrow(const char *root)
+{
+	struct rot *r = NULL;
+	int ret = KSFT_FAIL, i;
+	pid_t pid = -1;
+	char *g;
+
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_rot_cpuset");
+	if (!g || cg_create(g) || cg_write(g, "cpuset.cpus", "1-3") ||
+	    cg_write(g, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	for (i = 0; i < 3; i++)
+		rot_pinned(r, i, i + 1, i + 1);
+	pid = rot_start(r, g, 0, 3);
+	if (pid < 0 || rot_wait_ready(r, 0, 3))
+		goto cleanup;
+	rot_go(r, 60000);
+	usleep(100000);
+	if (rot_window(r, 0, 3, 1500, 10, 0, 208, "three pinned threads, cpuset 1-3"))
+		goto cleanup;
+	if (cg_write(g, "cpuset.cpus", "1")) {
+		fprintf(stderr, "the cpuset of g narrowed to CPU 1: refused\n");
+		goto cleanup;
+	}
+	if (wait_effective(g, "2 max\n", 2000)) {
+		fprintf(stderr, "the effective value is not 2 with the cpuset 1\n");
+		goto cleanup;
+	}
+	usleep(100000);
+	if (rot_window(r, 0, 3, 1500, 10, 0, 104, "cpuset narrowed to CPU 1"))
+		goto cleanup;
+	if (cg_write(g, "cpuset.cpus", "1-3")) {
+		fprintf(stderr, "the cpuset of g widened to 1-3: refused\n");
+		goto cleanup;
+	}
+	if (wait_effective(g, "2 max\n", 2000)) {
+		fprintf(stderr, "the effective value is not 2 with the cpuset 1-3 again\n");
+		goto cleanup;
+	}
+	usleep(100000);
+	if (rot_window(r, 0, 3, 1500, 10, 0, 208, "cpuset widened to 1-3 again"))
+		goto cleanup;
+	if (rot_check_ids(r, 0, 3, 2, "rotation_cpuset_narrow"))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+/*
+ * A pinned task may move into a cgroup whose slots are all in use.
+ *
+ * Cgroups: g and "out". g has cpu.concurrency.max 1. out has no limit.
+ * Two processes of one thread each spin until the end of the test:
+ *  - a in g, pinned to CPU 1;
+ *  - b in out, pinned to CPU 2.
+ * The steps, each followed by a measurement:
+ *  1. Nothing, 500 ms: each runs on its own CPU.
+ *  2. The test moves b into g, 2 s: a and b share one slot.
+ *  3. The test moves b back to out, 500 ms.
+ *
+ * Checked:
+ *  - both moves are accepted;
+ *  - in steps 1 and 3 each task runs for 60% of the time or more;
+ *  - in step 2 each task runs for 20% of the time or more. The fair
+ *    share is 50%;
+ *  - in step 2 both tasks together run for one CPU at most. rot_window()
+ *    allows 4% more;
+ *  - nr_rotations of g grows during step 2;
+ *  - nr_held of g is 0 within 2 s of step 3.
+ * Skipped with fewer than 3 CPUs.
+ */
+static int test_concurrency_rotation_migrate(const char *root)
+{
+	pid_t pid[2] = { -1, -1 };
+	struct conc_stat before, after;
+	char *g = NULL, *out = NULL;
+	struct rot *r = NULL;
+	int ret = KSFT_FAIL, i;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_rot_migrate");
+	out = cg_name(root, "cc_test_rot_migrate_out");
+	if (!g || !out || cg_create(g) || cg_create(out) || cg_write(g, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	rot_pinned(r, 0, 1, 1);
+	rot_pinned(r, 1, 2, 2);
+	pid[0] = rot_start(r, g, 0, 1);
+	pid[1] = rot_start(r, out, 1, 1);
+	if (pid[0] < 0 || pid[1] < 0 || rot_wait_ready(r, 0, 2))
+		goto cleanup;
+	rot_go(r, 60000);
+	usleep(100000);
+	if (rot_window(r, 0, 2, 500, 60, 0, 0, "b outside g"))
+		goto cleanup;
+	if (conc_stat_read(g, &before))
+		goto cleanup;
+	if (cg_enter(g, pid[1])) {
+		fprintf(stderr, "b, pinned to CPU 2, cannot move into g, which runs a on CPU 1\n");
+		goto cleanup;
+	}
+	if (rot_window(r, 0, 2, 2000, 20, 0, 104, "b inside g"))
+		goto cleanup;
+	if (conc_stat_read(g, &after) || after.nr_rotations == before.nr_rotations) {
+		fprintf(stderr, "nr_rotations of g did not grow while a and b shared its slot\n");
+		goto cleanup;
+	}
+	if (cg_enter(out, pid[1])) {
+		fprintf(stderr, "b cannot move back out of g\n");
+		goto cleanup;
+	}
+	usleep(100000);
+	if (rot_window(r, 0, 2, 500, 60, 0, 0, "b outside g again"))
+		goto cleanup;
+	for (i = 0; i < 200; i++) {
+		if (conc_stat_read(g, &after))
+			goto cleanup;
+		if (!after.nr_held)
+			break;
+		usleep(10000);
+	}
+	if (after.nr_held) {
+		fprintf(stderr, "nr_held of g is %lld 2 s after b left\n", after.nr_held);
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, pid, 2);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	if (out)
+		cg_destroy(out);
+	free(g);
+	free(out);
+	return ret;
+}
+
+/* Return true if task @i of @r runs for half of the next 20 ms or more. */
+static bool rot_runs(struct rot *r, int i)
+{
+	long before = rot_run_ms(r, i);
+
+	usleep(20000);
+	return rot_run_ms(r, i) - before >= 10;
+}
+
+/*
+ * A CPU goes offline while its slot is in rotation.
+ *
+ * Cgroup: g, with cpu.concurrency.max 1. One process in g has three
+ * threads. They pin themselves to CPU 1, to CPU 2 and to the last CPU,
+ * c. They spin until the end of the test and share the one slot. The
+ * steps:
+ *  1. The test measures for 1.5 s.
+ *  2. The test waits until the thread pinned to c runs, and takes c
+ *     offline at once. That thread has no CPU left in its mask. The
+ *     kernel must give it a wider mask, as it does without a limit. The
+ *     test measures for 2 s.
+ *  3. The test brings c back online, and measures for 2 s.
+ *
+ * Checked in each measurement:
+ *  - each thread runs for 10% of the time or more. The fair share is
+ *    33%;
+ *  - together the threads run for one CPU at most. rot_window() allows
+ *    4% more.
+ * Checked at the end: no thread read an mm_cid of 1 or more, and
+ * cpu.concurrency.effective reads 1.
+ * Skipped with fewer than 4 CPUs, or when c cannot go offline.
+ */
+static int test_concurrency_rotation_hotplug(const char *root)
+{
+	int ret = KSFT_FAIL, c = get_nprocs() - 1, offline = 0, i;
+	struct rot *r = NULL;
+	pid_t pid = -1;
+	char *g;
+
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_rot_hotplug");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	rot_pinned(r, 0, 1, 1);
+	rot_pinned(r, 1, 2, 2);
+	rot_pinned(r, 2, c, c);
+	pid = rot_start(r, g, 0, 3);
+	if (pid < 0 || rot_wait_ready(r, 0, 3))
+		goto cleanup;
+	rot_go(r, 60000);
+	usleep(100000);
+	if (rot_window(r, 0, 3, 1500, 10, 0, 104, "before the unplug"))
+		goto cleanup;
+	/* Its turn comes every three rotation periods. */
+	for (i = 0; i < 100 && !rot_runs(r, 2); i++)
+		;
+	if (i == 100) {
+		fprintf(stderr, "the thread pinned to CPU %d did not run within 2 s\n", c);
+		goto cleanup;
+	}
+	if (write_cpu_online(c, 0)) {
+		ret = skip("CPU %d cannot go offline", c);
+		goto cleanup;
+	}
+	offline = 1;
+	if (rot_window(r, 0, 3, 2000, 10, 0, 104, "after the unplug"))
+		goto cleanup;
+	if (write_cpu_online(c, 1)) {
+		fprintf(stderr, "CPU %d does not come back online\n", c);
+		goto cleanup;
+	}
+	offline = 0;
+	if (rot_window(r, 0, 3, 2000, 10, 0, 104, "after the replug"))
+		goto cleanup;
+	if (rot_check_ids(r, 0, 3, 1, "rotation_hotplug"))
+		goto cleanup;
+	if (cg_read_strcmp(g, "cpu.concurrency.effective", "1 max\n")) {
+		fprintf(stderr, "the effective value is not 1 after the hotplug\n");
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (offline)
+		write_cpu_online(c, 1);
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+/*
+ * A limit goes up and down while its slots are in rotation.
+ *
+ * Cgroup: g, with cpu.concurrency.max 1. One process in g has four
+ * threads, pinned to CPUs 1 to 4. They spin until the end of the test.
+ * The steps, each followed by 1.5 s of measurement:
+ *  1. Nothing: four threads share one slot.
+ *  2. The test writes 2 to cpu.concurrency.max.
+ *     cpu.concurrency.effective must read 2 when the write returns.
+ *  3. The test writes 1. cpu.concurrency.effective must read 1 within
+ *     2 s: a decrease shows once the tasks over the limit are held. The
+ *     test then waits 100 ms and forgets the IDs read so far.
+ *
+ * Checked in each measurement, with the limit L of the step:
+ *  - each thread runs for 5% of the time or more. The fair share is 25%
+ *    with one slot and 50% with two;
+ *  - together the threads run for L CPUs at most. rot_window() allows
+ *    4% more;
+ *  - in step 2 they run for 1.3 CPUs or more together: the second slot
+ *    is used.
+ * Checked on the IDs: no mm_cid of 2 or more until step 3, and none of 1
+ * or more after it.
+ * Skipped with fewer than 5 CPUs.
+ */
+static int test_concurrency_rotation_limit_change(const char *root)
+{
+	struct rot *r = NULL;
+	int ret = KSFT_FAIL, i;
+	pid_t pid = -1;
+	char *g;
+
+	if (need_cpus(5))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_rot_limit");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	for (i = 0; i < 4; i++)
+		rot_pinned(r, i, i + 1, i + 1);
+	pid = rot_start(r, g, 0, 4);
+	if (pid < 0 || rot_wait_ready(r, 0, 4))
+		goto cleanup;
+	rot_go(r, 60000);
+	usleep(100000);
+	if (rot_window(r, 0, 4, 1500, 5, 0, 104, "under the limit 1"))
+		goto cleanup;
+	if (cg_write(g, "cpu.concurrency.max", "2") ||
+	    cg_read_strcmp(g, "cpu.concurrency.effective", "2 max\n")) {
+		fprintf(stderr, "the limit raised to 2: refused, or not effective at once\n");
+		goto cleanup;
+	}
+	if (rot_window(r, 0, 4, 1500, 5, 130, 208, "under the limit 2"))
+		goto cleanup;
+	if (rot_check_ids(r, 0, 4, 2, "rotation_limit_change, limit 2"))
+		goto cleanup;
+	if (cg_write(g, "cpu.concurrency.max", "1") || wait_effective(g, "1 max\n", 2000)) {
+		fprintf(stderr, "the limit lowered to 1: refused, or not effective within 2 s\n");
+		goto cleanup;
+	}
+	usleep(100000);
+	for (i = 0; i < 4; i++)
+		__atomic_store_n(&r->t[i].max_cid, 0, __ATOMIC_RELAXED);
+	if (rot_window(r, 0, 4, 1500, 5, 0, 104, "under the limit 1 again"))
+		goto cleanup;
+	if (rot_check_ids(r, 0, 4, 1, "rotation_limit_change, limit 1 again"))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+#define ROT_LOWER_ROUNDS	20
+
+/*
+ * Forget the IDs which tasks 0 to @n - 1 of @r read so far and sleep for
+ * 10 ms. Return true if a task read an mm_cid at or above @limit meanwhile.
+ */
+static bool rot_reads_over(struct rot *r, int n, unsigned int limit)
+{
+	bool over = false;
+	int i;
+
+	if (!rseq_has_mm_cid())
+		return false;
+	for (i = 0; i < n; i++)
+		__atomic_store_n(&r->t[i].max_cid, 0, __ATOMIC_RELAXED);
+	usleep(10000);
+	for (i = 0; i < n; i++)
+		over |= __atomic_load_n(&r->t[i].max_cid, __ATOMIC_RELAXED) >= limit;
+	return over;
+}
+
+/*
+ * A limit goes down under tasks which keep running in user space.
+ *
+ * Cgroup: g, with cpu.concurrency.max 2. One process in g has two
+ * threads, pinned to CPU 1 and to CPU 2. They spin in user space until
+ * the end of the test and never block.
+ *
+ * ROT_LOWER_ROUNDS rounds. In each one the test:
+ *  - writes 2 and sleeps for 100 ms or more: both threads run;
+ *  - writes 1 and waits until cpu.concurrency.effective reads 1;
+ *  - forgets the IDs read so far and sleeps for 10 ms, twice.
+ *
+ * Checked in each round:
+ *  - cpu.concurrency.effective reads 1 within 2 s. One thread has to be
+ *    held, and it must not take its slot back while the kernel empties
+ *    it;
+ *  - no thread reads an mm_cid of 1 or more in both 10 ms sleeps. The
+ *    thread which keeps its slot does not schedule: the kernel has to
+ *    make it take a new ID. A thread can store once an ID which it read
+ *    before the decrease. So one sleep with such an ID is accepted.
+ *
+ * The sleeps are shorter than a rotation period. A rotation would make
+ * the running thread schedule and take a new ID.
+ * Skipped with fewer than 3 CPUs.
+ */
+static int test_concurrency_rotation_lower_running(const char *root)
+{
+	struct rot *r = NULL;
+	int ret = KSFT_FAIL, round, i;
+	pid_t pid = -1;
+	char *g;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_rot_lower");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	for (i = 0; i < 2; i++)
+		rot_pinned(r, i, i + 1, i + 1);
+	pid = rot_start(r, g, 0, 2);
+	if (pid < 0 || rot_wait_ready(r, 0, 2))
+		goto cleanup;
+	rot_go(r, 60000);
+	for (round = 0; round < ROT_LOWER_ROUNDS; round++) {
+		if (cg_write(g, "cpu.concurrency.max", "2"))
+			goto cleanup;
+		usleep(100000 + round * 3000);
+		if (cg_write(g, "cpu.concurrency.max", "1") || wait_effective(g, "1 max\n", 2000)) {
+			fprintf(stderr, "round %d: the limit lowered to 1: refused, or not effective within 2 s\n",
+				round);
+			goto cleanup;
+		}
+		if (rot_reads_over(r, 2, 1) && rot_reads_over(r, 2, 1)) {
+			fprintf(stderr, "round %d: a thread reads an mm_cid of 1 or more under the limit 1: %u and %u\n",
+				round, r->t[0].max_cid, r->t[1].max_cid);
+			goto cleanup;
+		}
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+#define ROT_KILL_ROUNDS	10
+
+/*
+ * SIGKILL ends a task which waits for a slot, and a task which runs in
+ * one, also near the time its slot is taken.
+ *
+ * Cgroup: g, with cpu.concurrency.max 1. Three processes of one thread
+ * each run in g, pinned to CPU 1, to CPU 2 and to CPU 3. They spin until
+ * they are killed, and share the one slot. The test holds
+ * cpu.concurrency.events of g open.
+ *
+ * First part. The test picks a process which did not run for 20 ms: it
+ * waits for the slot. It sends it SIGKILL.
+ *
+ * Second part, ROT_KILL_ROUNDS rounds. In each one the test:
+ *  - starts a new process in the place of the one killed before;
+ *  - waits for a notification of cpu.concurrency.events: a rotation has
+ *    just happened;
+ *  - picks the process which runs now;
+ *  - sends it SIGKILL one rotation period and round * 2.5 ms after the
+ *    notification. The next rotation comes 1 to 1.25 periods after the
+ *    last one.
+ *
+ * Checked after each SIGKILL:
+ *  - the process is reaped within 1 s. The kernel lets a held task go as
+ *    soon as its placement work runs, and nothing keeps it from running
+ *    here;
+ *  - during the next 300 ms, each of the two other processes runs for
+ *    10% of the time or more;
+ *  - together they run for one CPU at most during that time, with 4%
+ *    more allowed as in rot_window().
+ * Checked at the end: nr_held of g is 0 within 2 s of the last kill, and
+ * main() finds no warning of the kernel.
+ * Skipped with fewer than 4 CPUs.
+ *
+ * Delay injection: conc_hold_cpu() asks for the hold of the task which
+ * runs in the slot. It then waits until that task is held at its return
+ * to user space. SIGKILL has to arrive between the two. The window lasts
+ * well under a millisecond, so a round reaches it only by chance. A delay
+ * in conc_hold_cpu() after conc_hold_task_on() would open it.
+ */
+static int test_concurrency_rotation_kill(const char *root)
+{
+	int ret = KSFT_FAIL, fd = -1, i, round, victim, period = rot_period_ms(), next = 3;
+	int live[3] = { 0, 1, 2 }, slot;
+	pid_t pid[ROT_TASKS];
+	struct conc_stat st;
+	struct rot *r = NULL;
+	char *g, path[PATH_MAX];
+
+	for (i = 0; i < ROT_TASKS; i++)
+		pid[i] = -1;
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_rot_kill");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	snprintf(path, sizeof(path), "%s/cpu.concurrency.events", g);
+	fd = open(path, O_RDONLY);
+	r = rot_alloc();
+	if (fd < 0 || !r)
+		goto cleanup;
+	for (i = 0; i < 3; i++) {
+		rot_pinned(r, i, i + 1, i + 1);
+		pid[i] = rot_start(r, g, i, 1);
+		if (pid[i] < 0)
+			goto cleanup;
+	}
+	if (rot_wait_ready(r, 0, 3))
+		goto cleanup;
+	rot_go(r, 120000);
+	usleep(300000);
+
+	for (round = -1; round < ROT_KILL_ROUNDS; round++) {
+		long before[3], elapsed;
+		int other[2], n = 0;
+		long long t0;
+
+		if (round >= 0 && file_notified(fd, 2000) != 1) {
+			fprintf(stderr, "round %d: no rotation within 2 s\n", round);
+			goto cleanup;
+		}
+		t0 = mono_ns();
+		for (i = 0; i < 3; i++)
+			before[i] = rot_run_ms(r, live[i]);
+		usleep(20000);
+		slot = -1;
+		for (i = 0; i < 3; i++) {
+			bool ran = rot_run_ms(r, live[i]) - before[i] >= 10;
+
+			/* The first part kills a waiter, the rounds the runner. */
+			if (ran == (round >= 0))
+				slot = i;
+		}
+		if (slot < 0) {
+			fprintf(stderr, "round %d: no task %s\n", round,
+				round < 0 ? "waits" : "runs");
+			goto cleanup;
+		}
+		victim = live[slot];
+		if (round >= 0)
+			sleep_until_ns(t0 + period * 1000000LL + round * 2500000LL);
+		if (kill_within(pid[victim], 1000)) {
+			fprintf(stderr, "round %d: a task which %s is not dead 1 s after SIGKILL\n",
+				round, round < 0 ? "waited for the slot" : "ran in the slot");
+			goto cleanup;
+		}
+		pid[victim] = -1;
+		for (i = 0; i < 3; i++) {
+			if (i != slot)
+				other[n++] = live[i];
+		}
+		/* The two tasks left are not a range, as rot_window() wants. */
+		t0 = mono_ns();
+		for (i = 0; i < 2; i++)
+			before[i] = rot_run_ms(r, other[i]);
+		usleep(300000);
+		elapsed = (mono_ns() - t0) / 1000000;
+		for (i = 0; i < 2; i++)
+			before[i] = rot_run_ms(r, other[i]) - before[i];
+		if (before[0] * 10 < elapsed || before[1] * 10 < elapsed ||
+		    (before[0] + before[1]) * 100 > elapsed * 104) {
+			fprintf(stderr, "round %d: in %ld ms after the kill the two other tasks ran %ld and %ld ms\n",
+				round, elapsed, before[0], before[1]);
+			goto cleanup;
+		}
+		if (round == ROT_KILL_ROUNDS - 1)
+			break;
+		/* A new process on the CPU of the one just killed. */
+		rot_pinned(r, next, slot + 1, slot + 1);
+		pid[next] = rot_start(r, g, next, 1);
+		if (pid[next] < 0 || rot_wait_ready(r, next, 1))
+			goto cleanup;
+		live[slot] = next++;
+	}
+	rot_end(r, pid, ROT_TASKS);
+	for (i = 0; i < 200; i++) {
+		if (conc_stat_read(g, &st))
+			goto cleanup;
+		if (!st.nr_held)
+			break;
+		usleep(10000);
+	}
+	if (st.nr_held) {
+		fprintf(stderr, "nr_held of g is %lld 2 s after the last kill\n", st.nr_held);
+		goto cleanup;
+	}
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, pid, ROT_TASKS);
+		munmap(r, sizeof(*r));
+	}
+	if (fd >= 0)
+		close(fd);
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+/*
+ * A task which gets a slot by rotation and then blocks gives the slot
+ * back at once.
+ *
+ * Cgroup: g, with cpu.concurrency.max 1. One process in g has two threads,
+ * which run for 3 s:
+ *  - s spins, pinned to CPU 1;
+ *  - w is pinned to CPU 2. It wakes up every 30 ms, spins for 5 ms and
+ *    sleeps again.
+ * w finds no slot at its wakeup and waits for a rotation. It then runs
+ * for 5 ms and blocks. Its slot is idle from then on, and s is held.
+ *
+ * Checked:
+ *  - s is never off the CPU for three quarters of a rotation period. A
+ *    kernel which keeps the idle slot of w makes s wait for a period;
+ *  - s runs for 70% of the time or more;
+ *  - w wakes up 5 times or more, and never runs more than 2.5 periods
+ *    late. It waits for one period, and the kernel looks for an expired
+ *    period four times in a period;
+ *  - nr_rotations of g grows;
+ *  - no thread reads an mm_cid of 1 or more.
+ * Skipped with fewer than 3 CPUs.
+ */
+static int test_concurrency_rotation_block(const char *root)
+{
+	int ret = KSFT_FAIL, stuck, i, late = 0, period = rot_period_ms();
+	struct conc_stat before, after;
+	struct rot *r = NULL;
+	pid_t pid = -1;
+	char *g;
+
+	if (need_cpus(3))
+		return KSFT_SKIP;
+	g = cg_name(root, "cc_test_rot_block");
+	if (!g || cg_create(g) || cg_write(g, "cpu.concurrency.max", "1"))
+		goto cleanup;
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	rot_pinned(r, 0, 1, 1);
+	rot_pinned(r, 1, 2, 2);
+	r->t[1].kind = ROT_PERIODIC;
+	r->t[1].period_us = 30000;
+	r->t[1].work_us = 5000;
+	pid = rot_start(r, g, 0, 2);
+	if (pid < 0 || rot_wait_ready(r, 0, 2) || conc_stat_read(g, &before))
+		goto cleanup;
+	rot_go(r, 3000);
+	stuck = rot_wait_done(r, 0, 2);
+	if (stuck >= 0) {
+		fprintf(stderr, "thread %d did not run for 3 s at the end\n", stuck);
+		goto cleanup;
+	}
+	if (conc_stat_read(g, &after))
+		goto cleanup;
+	for (i = 0; i < r->t[1].nlat; i++)
+		late = MAX(late, r->t[1].lat_us[i]);
+	ksft_print_msg("the spinner ran %d%%, longest time off the CPU %lld ms; the waiter woke up %d times, %d ms late at most; %lld rotations\n",
+		       rot_share(r, 0), r->t[0].max_gap_ns / 1000000, r->t[1].nlat, late / 1000,
+		       after.nr_rotations - before.nr_rotations);
+	if (r->t[0].max_gap_ns >= period * 750000LL || rot_share(r, 0) < 70) {
+		fprintf(stderr, "the spinner did not get the slot back when the waiter blocked\n");
+		goto cleanup;
+	}
+	if (r->t[1].nlat < 5 || late >= period * 2500) {
+		fprintf(stderr, "the waiter woke up %d times, %d ms late at most\n", r->t[1].nlat,
+			late / 1000);
+		goto cleanup;
+	}
+	if (after.nr_rotations == before.nr_rotations) {
+		fprintf(stderr, "nr_rotations did not grow\n");
+		goto cleanup;
+	}
+	if (rot_check_ids(r, 0, 2, 1, "rotation_block"))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (g)
+		cg_destroy(g);
+	free(g);
+	return ret;
+}
+
+#define DL_JOBS		20
+
+/* The deadline task of test_concurrency_rotation_deadline(). */
+struct dl_job {
+	int go;		/* the test: start the jobs */
+	int jobs;	/* jobs ended */
+	int late;	/* jobs which took more than a period */
+};
+
+static long long thread_cpu_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+	return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/*
+ * Wait until told. Then run DL_JOBS jobs, one in each period of the
+ * SCHED_DEADLINE policy which the test gave this task. A job uses 15 ms
+ * of CPU time. sched_yield() then sleeps until the next period. Count a
+ * job which took more than 100 ms.
+ */
+static int dl_job_fn(const char *cgroup, void *arg)
+{
+	struct dl_job *j = arg;
+	long long start, cpu;
+	int k;
+
+	while (!__atomic_load_n(&j->go, __ATOMIC_ACQUIRE))
+		usleep(1000);
+	for (k = 0; k < DL_JOBS; k++) {
+		start = mono_ns();
+		cpu = thread_cpu_ns();
+		while (thread_cpu_ns() - cpu < 15000000LL)
+			;
+		if (mono_ns() - start > 100000000LL)
+			j->late++;
+		__atomic_store_n(&j->jobs, k + 1, __ATOMIC_RELEASE);
+		sched_yield();
+	}
+	for (;;)
+		pause();
+	return 0;
+}
+
+/*
+ * A deadline task keeps its runtime beside pinned fair tasks which ask
+ * for more CPUs than the limit.
+ *
+ * Cgroup: P, a partition root on the last three CPUs, with
+ * cpu.concurrency.max 2. Tasks in P:
+ *  - d, one process. The test makes it SCHED_DEADLINE with a runtime of
+ *    20 ms in a period of 100 ms. It can run on the three CPUs;
+ *  - one process with three fair threads, each pinned to one CPU of P.
+ *    They spin for 3 s and share the two slots.
+ * When the fair threads start to spin, d starts DL_JOBS jobs, see
+ * dl_job_fn(). A job needs 15 ms of CPU time in its period.
+ *
+ * Checked:
+ *  - d is admitted, and the three pins are accepted;
+ *  - d ends its DL_JOBS jobs within 5 s, and 2 at most take more than a
+ *    period of 100 ms. A deadline task which waits for the slot of a
+ *    fair task for a rotation period ends each job late;
+ *  - each fair thread runs for 10% of the time or more. The fair share
+ *    is about 60%;
+ *  - no fair thread reads an mm_cid of 2 or more.
+ * Skipped:
+ *  - with fewer than 4 CPUs;
+ *  - with deadline admission off;
+ *  - without a partition root;
+ *  - when P takes no deadline task before it has a limit.
+ */
+static int test_concurrency_rotation_deadline(const char *root)
+{
+	struct sched_param other = { .sched_priority = 0 };
+	int ret = KSFT_FAIL, L = get_nprocs() - 1, i, err, stuck;
+	char *P = NULL, rt[32], cpus[32];
+	struct rot *r = NULL;
+	struct dl_job *j;
+	pid_t d = -1, pid = -1;
+
+	if (need_cpus(4))
+		return KSFT_SKIP;
+	if (rt_runtime_read(rt, sizeof(rt)) || atol(rt) < 0)
+		return skip("deadline admission control is off");
+	j = mmap(NULL, sizeof(*j), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (j == MAP_FAILED)
+		return KSFT_FAIL;
+	P = cg_name(root, "cc_test_rot_dl");
+	if (!P || cg_create(P))
+		goto cleanup;
+	snprintf(cpus, sizeof(cpus), "%d-%d", L - 2, L);
+	if (cg_write(P, "cpuset.cpus", cpus) || cg_write(P, "cpuset.cpus.partition", "root") ||
+	    cg_read_strcmp(P, "cpuset.cpus.partition", "root\n")) {
+		ret = skip("no partition root on CPUs %s", cpus);
+		goto cleanup;
+	}
+	err = dl_admitted_in(P);
+	if (err) {
+		ret = skip("no SCHED_DEADLINE task in a partition root without a limit: %s",
+			   strerror(-err));
+		goto cleanup;
+	}
+	if (cg_write(P, "cpu.concurrency.max", "2"))
+		goto cleanup;
+	d = cg_run_nowait(P, dl_job_fn, j);
+	if (d < 0 || wait_in_cgroup(P, d))
+		goto cleanup;
+	err = set_deadline(d, 20000, 100000);
+	if (err) {
+		fprintf(stderr, "a deadline task of 0.2 CPU refused in a deadline domain: %s\n",
+			strerror(-err));
+		goto cleanup;
+	}
+	r = rot_alloc();
+	if (!r)
+		goto cleanup;
+	for (i = 0; i < 3; i++)
+		rot_pinned(r, i, L - 2 + i, L - 2 + i);
+	pid = rot_start(r, P, 0, 3);
+	if (pid < 0 || rot_wait_ready(r, 0, 3))
+		goto cleanup;
+	rot_go(r, 3000);
+	usleep(50000);
+	__atomic_store_n(&j->go, 1, __ATOMIC_RELEASE);
+	for (i = 0; i < 500 && __atomic_load_n(&j->jobs, __ATOMIC_ACQUIRE) < DL_JOBS; i++)
+		usleep(10000);
+	stuck = rot_wait_done(r, 0, 3);
+	ksft_print_msg("the deadline task ended %d jobs, %d late; the fair threads ran %d%%, %d%% and %d%%\n",
+		       j->jobs, j->late, rot_share(r, 0), rot_share(r, 1), rot_share(r, 2));
+	if (j->jobs < DL_JOBS || j->late > 2) {
+		fprintf(stderr, "the deadline task did not get its runtime in each period\n");
+		goto cleanup;
+	}
+	if (stuck >= 0 || rot_share(r, 0) < 10 || rot_share(r, 1) < 10 || rot_share(r, 2) < 10) {
+		fprintf(stderr, "a fair thread got less than 10%% of the time, or did not end\n");
+		goto cleanup;
+	}
+	if (rot_check_ids(r, 0, 3, 2, "rotation_deadline"))
+		goto cleanup;
+	ret = KSFT_PASS;
+cleanup:
+	if (r) {
+		rot_end(r, &pid, 1);
+		munmap(r, sizeof(*r));
+	}
+	if (d > 0) {
+		kill(d, SIGKILL);
+		sched_setscheduler(d, SCHED_OTHER, &other);
+		waitpid(d, NULL, 0);
+	}
+	if (P) {
+		cg_write(P, "cpu.concurrency.max", "max");
+		cg_write(P, "cpuset.cpus.partition", "member");
+		cg_destroy(P);
+	}
+	free(P);
+	munmap(j, sizeof(*j));
+	return ret;
+}
 
 /*
  * Fork a process which enters @out and pins itself to CPUs @lo to @hi, or
@@ -5119,6 +7137,23 @@ struct cc_test {
 	T(test_concurrency_rt_setmove),
 	T(test_concurrency_held_kill),
 	T(test_concurrency_held_offline),
+	T(test_concurrency_rotation_share),
+	T(test_concurrency_rotation_order),
+	T(test_concurrency_rotation_fits),
+	T(test_concurrency_rotation_rt),
+	T(test_concurrency_rotation_foreign_rt),
+	T(test_concurrency_rotation_stat),
+	T(test_concurrency_rotation_period),
+	T(test_concurrency_rotation_overlap),
+	T(test_concurrency_rotation_nested),
+	T(test_concurrency_rotation_cpuset_narrow),
+	T(test_concurrency_rotation_migrate),
+	T(test_concurrency_rotation_hotplug),
+	T(test_concurrency_rotation_limit_change),
+	T(test_concurrency_rotation_lower_running),
+	T(test_concurrency_rotation_kill),
+	T(test_concurrency_rotation_block),
+	T(test_concurrency_rotation_deadline),
 };
 
 #undef T

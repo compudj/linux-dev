@@ -18,6 +18,7 @@
 #include <sys/param.h>
 #include <sys/prctl.h>
 #include <sys/rseq.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/wait.h>
@@ -102,6 +103,7 @@ void cpus_record_online(void);
 int cpus_restore(void);
 void kernel_state_record(struct kernel_state *ks);
 int conc_stat_read(const char *cg, struct conc_stat *st);
+long long conc_events_rotation(const char *cg);
 void conc_trace_start(void);
 void conc_trace_stop(void);
 void conc_trace_clear(void);
