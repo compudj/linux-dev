@@ -29,6 +29,23 @@ bool rseq_use_cpu_index(void)
 {
 	return false;	/* Use mm_cid */
 }
+#elif defined(BUILDOPT_RSEQ_PERCPU_NS_CID)
+# define RSEQ_PERCPU	RSEQ_PERCPU_NS_CID
+static
+int get_current_cpu_id(void)
+{
+	return rseq_current_ns_cid();
+}
+static
+bool rseq_validate_cpu_id(void)
+{
+	return rseq_ns_cid_available();
+}
+static
+bool rseq_use_cpu_index(void)
+{
+	return false;	/* Use ns_cid */
+}
 #else
 # define RSEQ_PERCPU	RSEQ_PERCPU_CPU_ID
 static
@@ -334,8 +351,17 @@ int main(int argc, char **argv)
 		goto error;
 	}
 	if (!rseq_validate_cpu_id()) {
+#ifdef BUILDOPT_RSEQ_PERCPU_NS_CID
+		/*
+		 * The registered rseq area has no ns_cid field. The kernel
+		 * has none, or glibc registered an area of 32 bytes.
+		 */
+		printf("ns_cid is not available: skipped\n");
+		return KSFT_SKIP;
+#else
 		fprintf(stderr, "Error: cpu id getter unavailable\n");
 		goto error;
+#endif
 	}
 	printf("spinlock\n");
 	test_percpu_spinlock();

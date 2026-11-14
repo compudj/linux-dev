@@ -332,6 +332,35 @@ int rseq_membarrier_expedited(int cpu)
 			      0, 0);
 }
 # endif /* TEST_MEMBARRIER */
+#elif defined(BUILDOPT_RSEQ_PERCPU_NS_CID)
+# define RSEQ_PERCPU	RSEQ_PERCPU_NS_CID
+static
+int get_current_cpu_id(void)
+{
+	return rseq_current_ns_cid();
+}
+static
+bool rseq_validate_cpu_id(void)
+{
+	return rseq_ns_cid_available();
+}
+static
+bool rseq_use_cpu_index(void)
+{
+	return false;	/* Use ns_cid */
+}
+# ifdef TEST_MEMBARRIER
+/*
+ * Membarrier does not currently support targeting a ns_cid, so
+ * issue the barrier on all cpus.
+ */
+static
+int rseq_membarrier_expedited(int cpu)
+{
+	return sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ,
+			      0, 0);
+}
+# endif /* TEST_MEMBARRIER */
 #else
 # define RSEQ_PERCPU	RSEQ_PERCPU_CPU_ID
 static
@@ -1628,8 +1657,18 @@ int main(int argc, char **argv)
 	if (!opt_disable_rseq && __rseq_register_current_thread(rseq_no_glibc, opt_rseq_legacy))
 		goto error;
 	if (!opt_disable_rseq && !rseq_validate_cpu_id()) {
+#ifdef BUILDOPT_RSEQ_PERCPU_NS_CID
+		/*
+		 * The registered rseq area has no ns_cid field. The kernel
+		 * has none, or glibc registered an area of 32 bytes. Return
+		 * the skip code of kselftest.
+		 */
+		printf("ns_cid is not available: skipped\n");
+		return 4;
+#else
 		fprintf(stderr, "Error: cpu id getter unavailable\n");
 		goto error;
+#endif
 	}
 	switch (opt_test) {
 	case 's':

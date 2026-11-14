@@ -25,6 +25,16 @@
 # else
 #  error "Never use <rseq-bits-template.h> directly; include <rseq.h> instead."
 # endif
+#elif defined(RSEQ_TEMPLATE_NS_CID)
+# define RSEQ_TEMPLATE_CPU_ID_OFFSET	RSEQ_NS_CID_OFFSET
+# define RSEQ_TEMPLATE_CPU_ID_FIELD	ns_cid
+# ifdef RSEQ_TEMPLATE_MO_RELEASE
+#  define RSEQ_TEMPLATE_SUFFIX		_release_ns_cid
+# elif defined (RSEQ_TEMPLATE_MO_RELAXED)
+#  define RSEQ_TEMPLATE_SUFFIX		_relaxed_ns_cid
+# else
+#  error "Never use <rseq-bits-template.h> directly; include <rseq.h> instead."
+# endif
 #elif defined (RSEQ_TEMPLATE_CPU_ID_NONE)
 # ifdef RSEQ_TEMPLATE_MO_RELEASE
 #  define RSEQ_TEMPLATE_SUFFIX		_release

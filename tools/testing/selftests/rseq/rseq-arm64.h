@@ -221,6 +221,18 @@ do {										\
 #undef RSEQ_TEMPLATE_MO_RELEASE
 #undef RSEQ_TEMPLATE_MM_CID
 
+/* Per-ns-cid indexing. */
+
+#define RSEQ_TEMPLATE_NS_CID
+#define RSEQ_TEMPLATE_MO_RELAXED
+#include "rseq-arm64-bits.h"
+#undef RSEQ_TEMPLATE_MO_RELAXED
+
+#define RSEQ_TEMPLATE_MO_RELEASE
+#include "rseq-arm64-bits.h"
+#undef RSEQ_TEMPLATE_MO_RELEASE
+#undef RSEQ_TEMPLATE_NS_CID
+
 /* APIs which are not based on cpu ids. */
 
 #define RSEQ_TEMPLATE_CPU_ID_NONE

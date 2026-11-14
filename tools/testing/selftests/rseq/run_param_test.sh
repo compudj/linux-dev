@@ -52,6 +52,14 @@ function do_tests()
 		./param_test_mm_cid ${TEST_LIST[$i]} -r ${REPS} -t ${NR_THREADS} ${@} ${EXTRA_ARGS} || exit 1
 		echo "Running mm_cid compare-twice test ${TEST_NAME[$i]}"
 		./param_test_mm_cid_compare_twice ${TEST_LIST[$i]} -r ${REPS} -t ${NR_THREADS} ${@} ${EXTRA_ARGS} || exit 1
+
+		echo "Running ns_cid test ${TEST_NAME[$i]}"
+		./param_test_ns_cid ${TEST_LIST[$i]} -r ${REPS} -t ${NR_THREADS} ${@} ${EXTRA_ARGS}
+		# 4 is the skip code: the rseq area has no ns_cid field.
+		ret=$?; [ $ret -eq 0 ] || [ $ret -eq 4 ] || exit 1
+		echo "Running ns_cid compare-twice test ${TEST_NAME[$i]}"
+		./param_test_ns_cid_compare_twice ${TEST_LIST[$i]} -r ${REPS} -t ${NR_THREADS} ${@} ${EXTRA_ARGS}
+		ret=$?; [ $ret -eq 0 ] || [ $ret -eq 4 ] || exit 1
 		let "i++"
 	done
 }
